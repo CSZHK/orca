@@ -138,8 +138,11 @@ export function buildConnectConfig(
       : undefined)
 
   if (explicitKey) {
+    // Why: SSH config imports may have stored the path with surrounding quotes
+    // (OpenSSH allows `IdentityFile "path"`). Strip them before reading.
+    const keyPath = explicitKey.replace(/^"(.+)"$/, '$1').replace(/^~/, homedir())
     try {
-      config.privateKey = readFileSync(explicitKey.replace(/^~/, homedir()))
+      config.privateKey = readFileSync(keyPath)
     } catch {
       // Key unreadable — agent will handle auth if available
     }

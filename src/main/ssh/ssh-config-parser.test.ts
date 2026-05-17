@@ -77,6 +77,16 @@ Host myserver
     expect(hosts[0].identityFile).toBe('/home/testuser/.ssh/id_ed25519')
   })
 
+  it('strips surrounding quotes from IdentityFile paths', () => {
+    const config = `
+Host nucbox
+  HostName 39.105.110.203
+  IdentityFile "G:\\Machine\\nucbox\\nucbox_key"
+`
+    const hosts = parseSshConfig(config)
+    expect(hosts[0].identityFile).toBe('G:\\Machine\\nucbox\\nucbox_key')
+  })
+
   it('parses ProxyCommand and ProxyJump', () => {
     const config = `
 Host internal

@@ -97,10 +97,14 @@ export function parseSshConfig(content: string): SshConfigHost[] {
 }
 
 function resolveHomePath(filepath: string): string {
-  if (filepath.startsWith('~/') || filepath === '~') {
-    return join(homedir(), filepath.slice(1))
+  // Why: OpenSSH config allows quoted paths (e.g. IdentityFile "C:\path with spaces\key")
+  // and strips the quotes internally. We must do the same.
+  const unquoted =
+    filepath.startsWith('"') && filepath.endsWith('"') ? filepath.slice(1, -1) : filepath
+  if (unquoted.startsWith('~/') || unquoted === '~') {
+    return join(homedir(), unquoted.slice(1))
   }
-  return filepath
+  return unquoted
 }
 
 /** Read and parse the user's ~/.ssh/config file. Returns empty array if not found. */

@@ -64,7 +64,7 @@ function buildSshArgs(target: SshTarget): string[] {
   }
 
   if (target.identityFile) {
-    args.push('-i', target.identityFile)
+    args.push('-i', target.identityFile.replace(/^"(.+)"$/, '$1'))
   }
 
   if (target.jumpHost) {
