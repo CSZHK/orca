@@ -187,6 +187,46 @@ export const createAgentStatusSlice: StateCreator<AppState, [], [], AgentStatusS
         // clear on a fresh turn), a missing title means "no update", not "the
         // pane has no title any more".
         const effectiveTitle = terminalTitle ?? existing?.terminalTitle
+        const effectiveAgentType =
+          (payload.agentType && payload.agentType !== 'unknown' ? payload.agentType : existing?.agentType) ??
+          'unknown'
+        // Why: prefer main's authoritative stateStartedAt when provided — main's
+        // attachStatusTiming preserves it across same-state pings (server.ts) and
+        // persists it across restart. Fall back to existing.stateStartedAt only when
+        // main did not send timing (legacy callers / OSC fallback path), and to
+        // updatedAt for a brand-new pane.
+        const stateStartedAt =
+          timing?.stateStartedAt ??
+          (existing && existing.state === payload.state ? existing.stateStartedAt : updatedAt)
+        const hasSuppressor = paneKey in s.retentionSuppressedPaneKeys
+        const migrationUnsupported = pruneMigrationUnsupportedEntries(
+          s.migrationUnsupportedByPtyId,
+          (entry) => entry.paneKey === paneKey
+        )
+        const wasFresh =
+          !!existing && isExplicitAgentStatusFresh(existing, updatedAt, AGENT_STATUS_STALE_AFTER_MS)
+
+        // Why: identical fresh pings carry no visible information. Patch the
+        // freshness timestamp in-place and skip subscriptions, but only when no
+        // cleanup/epoch side effect would be bypassed.
+        if (
+          existing &&
+          wasFresh &&
+          !hasSuppressor &&
+          !migrationUnsupported.changed &&
+          existing.state === payload.state &&
+          existing.toolName === payload.toolName &&
+          existing.toolInput === payload.toolInput &&
+          existing.lastAssistantMessage === payload.lastAssistantMessage &&
+          existing.prompt === payload.prompt &&
+          (existing.agentType ?? 'unknown') === effectiveAgentType &&
+          existing.terminalTitle === effectiveTitle &&
+          existing.stateStartedAt === stateStartedAt &&
+          existing.interrupted === payload.interrupted
+        ) {
+          existing.updatedAt = updatedAt
+          return s
+        }
 
         // Why: build up a rolling log of state transitions so the dashboard can
         // render activity blocks showing what the agent has been doing. Only push
@@ -214,15 +254,6 @@ export const createAgentStatusSlice: StateCreator<AppState, [], [], AgentStatusS
           }
         }
 
-        // Why: prefer main's authoritative stateStartedAt when provided — main's
-        // attachStatusTiming preserves it across same-state pings (server.ts) and
-        // persists it across restart. Fall back to existing.stateStartedAt only when
-        // main did not send timing (legacy callers / OSC fallback path), and to
-        // updatedAt for a brand-new pane.
-        const stateStartedAt =
-          timing?.stateStartedAt ??
-          (existing && existing.state === payload.state ? existing.stateStartedAt : updatedAt)
-
         // Why: tool/assistant fields come pre-merged from the main-process
         // cache (see `resolveToolState` in server.ts), so the payload always
         // carries the authoritative current snapshot — including clears on a
@@ -242,10 +273,7 @@ export const createAgentStatusSlice: StateCreator<AppState, [], [], AgentStatusS
           // identity (e.g. 'claude' learned from an earlier hook ping) isn't
           // stomped by a later ping that lost the identity (e.g. legacy/partial
           // integrations).
-          agentType:
-            (payload.agentType && payload.agentType !== 'unknown'
-              ? payload.agentType
-              : existing?.agentType) ?? 'unknown',
+          agentType: effectiveAgentType,
           paneKey,
           terminalTitle: effectiveTitle,
           stateHistory: history,
@@ -273,8 +301,6 @@ export const createAgentStatusSlice: StateCreator<AppState, [], [], AgentStatusS
         //      updatedAt; in that case the entry is still stored with its true
         //      age, and selectors will immediately decay it if it is already
         //      stale.
-        const wasFresh =
-          !!existing && isExplicitAgentStatusFresh(existing, updatedAt, AGENT_STATUS_STALE_AFTER_MS)
         const sortRelevantChange = !existing || existing.state !== payload.state || !wasFresh
         // Why: a new status event means the agent is live again — lift any
         // one-shot retention suppressor so the row can be retained normally
@@ -283,16 +309,11 @@ export const createAgentStatusSlice: StateCreator<AppState, [], [], AgentStatusS
         // when there is actually a suppressor to remove — otherwise every
         // status ping would churn that map reference and force spurious
         // re-renders in any subscriber selecting on it.
-        const hasSuppressor = paneKey in s.retentionSuppressedPaneKeys
         let nextRetentionSuppressedPaneKeys = s.retentionSuppressedPaneKeys
         if (hasSuppressor) {
           nextRetentionSuppressedPaneKeys = { ...s.retentionSuppressedPaneKeys }
           delete nextRetentionSuppressedPaneKeys[paneKey]
         }
-        const migrationUnsupported = pruneMigrationUnsupportedEntries(
-          s.migrationUnsupportedByPtyId,
-          (entry) => entry.paneKey === paneKey
-        )
         return {
           agentStatusByPaneKey: { ...s.agentStatusByPaneKey, [paneKey]: entry },
           migrationUnsupportedByPtyId: migrationUnsupported.next,

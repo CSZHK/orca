@@ -32,7 +32,8 @@ import {
 } from './ipc-tab-switch'
 import {
   normalizeAgentStatusPayload,
-  type AgentStatusIpcPayload
+  type AgentStatusIpcPayload,
+  type ParsedAgentStatusPayload
 } from '../../../shared/agent-status-types'
 import { isGitRepoKind } from '../../../shared/repo-kind'
 import { TOGGLE_FLOATING_TERMINAL_EVENT } from '@/lib/floating-terminal'
@@ -48,6 +49,7 @@ import { collectLeafIdsInOrder } from '@/components/terminal-pane/layout-seriali
 import { track } from '@/lib/telemetry'
 import { singlePaneLayoutSnapshot } from '@/store/slices/terminal-helpers'
 import { buildWorkspaceSessionPayload } from '@/lib/workspace-session'
+import { AgentStatusCoalescer } from './agent-status-coalescer'
 
 export { resolveZoomTarget } from './resolve-zoom-target'
 
@@ -1454,13 +1456,21 @@ export function useIpcEvents(): void {
     // hook callback or an OSC fallback path. Startup pushes are ignored until
     // workspace session hydration finishes; the snapshot pull below replays the
     // main-process cache after tab identity is available.
-    const applyAgentStatus = (
+    type ResolvedAgentStatusUpdate = {
+      paneKey: string
+      payload: ParsedAgentStatusPayload
+      terminalTitle: string | undefined
+      updatedAt: number
+      stateStartedAt: number
+    }
+
+    const resolveAgentStatusUpdate = (
       data: AgentStatusIpcPayload,
       options?: { replay?: boolean }
-    ): void => {
+    ): ResolvedAgentStatusUpdate | null => {
       const store = useAppStore.getState()
       if (!store.workspaceSessionReady) {
-        return
+        return null
       }
       const payload = normalizeAgentStatusPayload({
         state: data.state,
@@ -1472,7 +1482,7 @@ export function useIpcEvents(): void {
         interrupted: data.interrupted
       })
       if (!payload) {
-        return
+        return null
       }
       const { exists, title, repoConnectionId, repoConnectionResolved, owningWorktreeId } =
         resolvePaneKey(store, data.paneKey)
@@ -1486,7 +1496,7 @@ export function useIpcEvents(): void {
         if (options?.replay !== true) {
           track('agent_hook_unattributed', { reason: 'unknown_tab_id' })
         }
-        return
+        return null
       }
       // Why: drop in-flight events from a connection that no longer owns
       // this pane. After an SSH disconnect (or tab destroy/recreate during
@@ -1513,11 +1523,28 @@ export function useIpcEvents(): void {
         data.connectionId !== repoConnectionId &&
         !canAcceptPendingRemoteOwnership
       ) {
-        return
+        return null
       }
-      store.setAgentStatus(data.paneKey, payload, title, {
+      return {
+        paneKey: data.paneKey,
+        payload,
+        terminalTitle: title,
         updatedAt: data.receivedAt,
         stateStartedAt: data.stateStartedAt
+      }
+    }
+
+    const applyAgentStatus = (
+      data: AgentStatusIpcPayload,
+      options?: { replay?: boolean }
+    ): void => {
+      const update = resolveAgentStatusUpdate(data, options)
+      if (!update) {
+        return
+      }
+      useAppStore.getState().setAgentStatus(update.paneKey, update.payload, update.terminalTitle, {
+        updatedAt: update.updatedAt,
+        stateStartedAt: update.stateStartedAt
       })
     }
 
@@ -1579,11 +1606,44 @@ export function useIpcEvents(): void {
         })
     }
 
+    // Why: coalesce rapid agent-status IPC events per paneKey so the store
+    // receives at most one update per pane per animation frame. Without this,
+    // agents that fire high-frequency hook pings (e.g. codex reporting tool
+    // usage within the same "working" state) can push 50-70+ IPC events/s,
+    // each creating a new state object and scheduling a React update. The
+    // pending-update queue grows faster than React can flush it, retaining
+    // intermediate state snapshots and eventually OOM-ing the renderer.
+    const pendingAgentStatus = new AgentStatusCoalescer<
+      AgentStatusIpcPayload,
+      ResolvedAgentStatusUpdate
+    >()
+    let agentStatusRafId = 0
+
+    const flushPendingAgentStatus = (): void => {
+      agentStatusRafId = 0
+      pendingAgentStatus.flush(resolveAgentStatusUpdate, (update) => {
+        useAppStore.getState().setAgentStatus(update.paneKey, update.payload, update.terminalTitle, {
+          updatedAt: update.updatedAt,
+          stateStartedAt: update.stateStartedAt
+        })
+      })
+    }
+
     unsubs.push(
       window.api.agentStatus.onSet((data) => {
-        applyAgentStatus(data)
+        pendingAgentStatus.enqueue(data.paneKey, data)
+        if (agentStatusRafId === 0) {
+          agentStatusRafId = requestAnimationFrame(flushPendingAgentStatus)
+        }
       })
     )
+    unsubs.push(() => {
+      if (agentStatusRafId !== 0) {
+        cancelAnimationFrame(agentStatusRafId)
+        agentStatusRafId = 0
+      }
+      pendingAgentStatus.clear()
+    })
     const unsubscribeMigrationUnsupported = window.api.agentStatus.onMigrationUnsupported?.(
       (entry) => {
         const store = useAppStore.getState()

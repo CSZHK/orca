@@ -225,6 +225,133 @@ describe('agent status tool + assistant fields', () => {
     expect(store.getState().agentStatusEpoch).toBe(firstEpoch + 1)
     expect(store.getState().sortEpoch).toBe(firstSortEpoch + 1)
   })
+
+  it('bumps global epochs when an identical stale same-state entry refreshes', () => {
+    vi.useFakeTimers()
+    const store = createTestStore()
+    store
+      .getState()
+      .setAgentStatus(
+        'tab-1:1',
+        { state: 'working', prompt: 'same prompt', agentType: 'claude', toolName: 'Read' },
+        'claude',
+        { updatedAt: 1_000, stateStartedAt: 1_000 }
+      )
+    const firstEpoch = store.getState().agentStatusEpoch
+    const firstSortEpoch = store.getState().sortEpoch
+
+    store
+      .getState()
+      .setAgentStatus(
+        'tab-1:1',
+        { state: 'working', prompt: 'same prompt', agentType: 'claude', toolName: 'Read' },
+        'claude',
+        {
+          updatedAt: 1_000 + AGENT_STATUS_STALE_AFTER_MS + 1,
+          stateStartedAt: 1_000
+        }
+      )
+
+    const refreshedEntry = store.getState().agentStatusByPaneKey['tab-1:1']
+    expect(refreshedEntry.updatedAt).toBe(1_000 + AGENT_STATUS_STALE_AFTER_MS + 1)
+    expect(store.getState().agentStatusEpoch).toBe(firstEpoch + 1)
+    expect(store.getState().sortEpoch).toBe(firstSortEpoch + 1)
+  })
+
+  it('does not treat interrupted changes as no-op same-state pings', () => {
+    vi.useFakeTimers()
+    const store = createTestStore()
+    store
+      .getState()
+      .setAgentStatus(
+        'tab-1:1',
+        { state: 'done', prompt: 'p1', agentType: 'claude' },
+        'claude',
+        { updatedAt: 1_000, stateStartedAt: 1_000 }
+      )
+    const entriesBefore = store.getState().agentStatusByPaneKey
+
+    store
+      .getState()
+      .setAgentStatus(
+        'tab-1:1',
+        { state: 'done', prompt: 'p1', agentType: 'claude', interrupted: true },
+        'claude',
+        { updatedAt: 2_000, stateStartedAt: 1_000 }
+      )
+
+    const state = store.getState()
+    expect(state.agentStatusByPaneKey).not.toBe(entriesBefore)
+    expect(state.agentStatusByPaneKey['tab-1:1'].interrupted).toBe(true)
+    expect(state.agentStatusByPaneKey['tab-1:1'].updatedAt).toBe(2_000)
+  })
+
+  it('keeps fresh identical working pings silent while patching updatedAt', () => {
+    vi.useFakeTimers()
+    const store = createTestStore()
+    store
+      .getState()
+      .setAgentStatus(
+        'tab-1:1',
+        { state: 'working', prompt: 'p1', agentType: 'claude', toolName: 'Read' },
+        'claude',
+        { updatedAt: 1_000, stateStartedAt: 1_000 }
+      )
+    const entriesBefore = store.getState().agentStatusByPaneKey
+    const firstEpoch = store.getState().agentStatusEpoch
+    const firstSortEpoch = store.getState().sortEpoch
+    const subscriber = vi.fn()
+    const unsubscribe = store.subscribe(subscriber)
+
+    store
+      .getState()
+      .setAgentStatus(
+        'tab-1:1',
+        { state: 'working', prompt: 'p1', agentType: 'claude', toolName: 'Read' },
+        'claude',
+        { updatedAt: 2_000, stateStartedAt: 1_000 }
+      )
+    unsubscribe()
+
+    const state = store.getState()
+    expect(state.agentStatusByPaneKey).toBe(entriesBefore)
+    expect(state.agentStatusByPaneKey['tab-1:1'].updatedAt).toBe(2_000)
+    expect(state.agentStatusEpoch).toBe(firstEpoch)
+    expect(state.sortEpoch).toBe(firstSortEpoch)
+    expect(subscriber).not.toHaveBeenCalled()
+  })
+
+  it('does not no-op a fresh identical ping that corrects stateStartedAt', () => {
+    vi.useFakeTimers()
+    const store = createTestStore()
+    store
+      .getState()
+      .setAgentStatus(
+        'tab-1:1',
+        { state: 'working', prompt: 'p1', agentType: 'claude', toolName: 'Read' },
+        'claude',
+        { updatedAt: 2_000, stateStartedAt: 2_000 }
+      )
+    const entriesBefore = store.getState().agentStatusByPaneKey
+    const subscriber = vi.fn()
+    const unsubscribe = store.subscribe(subscriber)
+
+    store
+      .getState()
+      .setAgentStatus(
+        'tab-1:1',
+        { state: 'working', prompt: 'p1', agentType: 'claude', toolName: 'Read' },
+        'claude',
+        { updatedAt: 3_000, stateStartedAt: 1_000 }
+      )
+    unsubscribe()
+
+    const state = store.getState()
+    expect(state.agentStatusByPaneKey).not.toBe(entriesBefore)
+    expect(state.agentStatusByPaneKey['tab-1:1'].stateStartedAt).toBe(1_000)
+    expect(state.agentStatusByPaneKey['tab-1:1'].updatedAt).toBe(3_000)
+    expect(subscriber).toHaveBeenCalledOnce()
+  })
 })
 
 describe('agent status stateStartedAt', () => {

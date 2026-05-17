@@ -2121,6 +2121,96 @@ describe('useIpcEvents agent status snapshot integration', () => {
     expect(setAgentStatus).not.toHaveBeenCalled()
   })
 
+  it('keeps a valid same-frame status update when a later stale connection event is rejected', async () => {
+    const setAgentStatus = vi.fn()
+    let frameCallback: FrameRequestCallback | null = null
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      frameCallback = callback
+      return 1
+    })
+    vi.stubGlobal('cancelAnimationFrame', vi.fn())
+    const onSetListenerRef: { current: ((data: AgentStatusSetData) => void) | null } = {
+      current: null
+    }
+    const storeState: StoreLike = buildStoreState({
+      setAgentStatus,
+      workspaceSessionReady: true,
+      tabsByWorktree: {
+        'wt-1': [{ id: 'tab-future', ptyId: 'pty-1', worktreeId: 'wt-1', title: 'Local Tab' }]
+      },
+      terminalLayoutsByTabId: {
+        'tab-future': {
+          root: { type: 'leaf', leafId: FUTURE_LEAF_ID },
+          activeLeafId: FUTURE_LEAF_ID,
+          expandedLeafId: null
+        }
+      },
+      repos: [{ id: 'repo-1', connectionId: null }],
+      worktreesByRepo: { 'repo-1': [{ id: 'wt-1', repoId: 'repo-1' }] }
+    })
+
+    stubReactSyncEffect()
+    vi.doMock('../store', () => ({
+      useAppStore: {
+        subscribe: vi.fn(() => () => {}),
+        getState: () => storeState
+      }
+    }))
+    stubAuxiliaryModules()
+    vi.stubGlobal(
+      'window',
+      buildWindowApi({
+        onSet: (cb) => {
+          onSetListenerRef.current = cb
+          return () => {}
+        }
+      })
+    )
+
+    const { useIpcEvents } = await import('./useIpcEvents')
+
+    useIpcEvents()
+    await Promise.resolve()
+    if (typeof onSetListenerRef.current !== 'function') {
+      throw new Error('Expected agentStatus.onSet listener to be registered')
+    }
+
+    onSetListenerRef.current({
+      paneKey: FUTURE_PANE_KEY,
+      state: 'working',
+      prompt: 'valid local',
+      agentType: 'claude',
+      connectionId: null,
+      receivedAt: 1_700_000_000_000,
+      stateStartedAt: 1_699_999_999_000
+    })
+    onSetListenerRef.current({
+      paneKey: FUTURE_PANE_KEY,
+      state: 'working',
+      prompt: 'stale ssh',
+      agentType: 'codex',
+      worktreeId: 'wt-1',
+      connectionId: 'ssh-stale',
+      receivedAt: 1_700_000_000_100,
+      stateStartedAt: 1_699_999_999_100
+    })
+
+    expect(setAgentStatus).not.toHaveBeenCalled()
+    const runFrame = frameCallback as FrameRequestCallback | null
+    if (!runFrame) {
+      throw new Error('Expected status update to schedule a frame')
+    }
+    runFrame(0)
+
+    expect(setAgentStatus).toHaveBeenCalledTimes(1)
+    expect(setAgentStatus).toHaveBeenCalledWith(
+      FUTURE_PANE_KEY,
+      expect.objectContaining({ state: 'working', prompt: 'valid local', agentType: 'claude' }),
+      'Local Tab',
+      { updatedAt: 1_700_000_000_000, stateStartedAt: 1_699_999_999_000 }
+    )
+  })
+
   it('tracks ready push events whose paneKey does not resolve to a renderer tab', async () => {
     const setAgentStatus = vi.fn()
     const track = vi.fn()

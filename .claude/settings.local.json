@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-ChildItem -Path \"G:\\\\apps\\\\coding-agent\\\\orca\\\\src\" -Directory)",
+      "Bash(Select-Object Name)",
+      "Bash(xargs grep -l \"agentStatus:set\")"
+    ]
+  }
+}
