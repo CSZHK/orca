@@ -27,6 +27,7 @@ import {
   markClaudePtySpawned
 } from '../claude-accounts/live-pty-gate'
 import { applyTerminalAttributionEnv } from '../attribution/terminal-attribution'
+import { findEnvPathKey } from '../pty/env-path-key'
 import { registerPty, unregisterPty } from '../memory/pty-registry'
 import { track } from '../telemetry/client'
 import { classifyError } from '../telemetry/classify-error'
@@ -341,7 +342,12 @@ export function buildPtyHostEnv(
     // treat an empty segment as `.`, which would let commands resolve from
     // the current working directory (a foot-gun we don't want to create
     // for dev terminals).
-    baseEnv.PATH = baseEnv.PATH ? `${devCliBin}${delimiter}${baseEnv.PATH}` : devCliBin
+    // Why: Windows stores the PATH variable as `Path` (mixed case) in the
+    // registry. Spreading process.env into a plain object preserves that
+    // casing, so reading baseEnv.PATH yields undefined and would create a
+    // duplicate key. Use the actual key present in the env object.
+    const pathKey = findEnvPathKey(baseEnv)
+    baseEnv[pathKey] = baseEnv[pathKey] ? `${devCliBin}${delimiter}${baseEnv[pathKey]}` : devCliBin
   }
 
   // Why: GitHub attribution should only affect commands launched from
