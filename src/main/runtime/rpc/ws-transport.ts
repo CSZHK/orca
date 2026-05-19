@@ -149,8 +149,10 @@ export class WebSocketTransport implements RpcTransport {
     try {
       await this.tryListen(port)
     } catch (error: unknown) {
-      if (isEAddressInUse(error) && port !== 0) {
-        console.warn(`[ws-transport] Port ${port} is in use, falling back to OS-assigned port`)
+      if (isPortUnbindable(error) && port !== 0) {
+        console.warn(
+          `[ws-transport] Port ${port} is unbindable (${error.code}), falling back to OS-assigned port`
+        )
         port = 0
         await this.tryListen(port)
       } else {
@@ -174,13 +176,21 @@ export class WebSocketTransport implements RpcTransport {
   private async tryListen(port: number): Promise<void> {
     const httpServer = this.createHttpServer()
 
-    await new Promise<void>((resolve, reject) => {
-      httpServer.once('error', reject)
-      httpServer.listen(port, this.host, () => {
-        httpServer.off('error', reject)
-        resolve()
+    try {
+      await new Promise<void>((resolve, reject) => {
+        httpServer.once('error', reject)
+        httpServer.listen(port, this.host, () => {
+          httpServer.off('error', reject)
+          resolve()
+        })
       })
-    })
+    } catch (error) {
+      // Why: a failed listen leaves an unbound httpServer instance holding
+      // any partially-allocated socket. Release it before rethrowing so
+      // fallback retries don't accumulate leaked server objects.
+      httpServer.close()
+      throw error
+    }
 
     const wss = new WebSocketServer({
       server: httpServer,
@@ -357,6 +367,15 @@ export class WebSocketTransport implements RpcTransport {
   }
 }
 
-function isEAddressInUse(error: unknown): boolean {
-  return error instanceof Error && 'code' in error && error.code === 'EADDRINUSE'
+// Why: EADDRINUSE means another process holds the port. EACCES on Windows
+// fires when the port lies in a kernel-reserved exclusion range
+// (Hyper-V/WSL/Docker NAT pool) — bind is refused even with no owner. Both
+// should fall back to an OS-assigned port. EADDRNOTAVAIL is intentionally
+// excluded (bad host, not bad port). Assumes dev ports >1024; below that
+// EACCES means "needs privilege" and must fail loudly instead.
+function isPortUnbindable(error: unknown): error is Error & { code: string } {
+  if (!(error instanceof Error) || !('code' in error)) {
+    return false
+  }
+  return error.code === 'EADDRINUSE' || error.code === 'EACCES'
 }

@@ -34,12 +34,15 @@ export function loadOrCreateTlsCertificate(userDataPath: string): TlsCertificate
   const keyPath_ = join(userDataPath, TLS_KEY_FILENAME)
   const certPath_ = join(userDataPath, TLS_CERT_FILENAME)
 
-  // Why: openssl is available on macOS, Linux, and Windows (via Git Bash).
-  // Using it avoids hand-rolling ASN.1 DER encoding which is error-prone.
+  // Why: openssl is available on macOS, Linux, and Windows. Using it avoids
+  // hand-rolling ASN.1 DER encoding which is error-prone. stdio:'ignore'
+  // suppresses openssl's stderr cross-platform (the previous `2>/dev/null`
+  // shell redirect broke under Windows cmd.exe).
   execSync(
     `openssl req -new -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 ` +
       `-nodes -days 3650 -subj "/CN=Orca Runtime" ` +
-      `-keyout "${keyPath_}" -out "${certPath_}" 2>/dev/null`
+      `-keyout "${keyPath_}" -out "${certPath_}"`,
+    { stdio: 'ignore' }
   )
 
   chmodSync(keyPath_, 0o600)

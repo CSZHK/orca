@@ -1,10 +1,12 @@
 /* eslint-disable max-lines -- Why: these tests exercise one stateful transport
    boundary across connection lifecycle, heartbeat, pre-auth timeout, and
    shutdown behavior; splitting the setup would obscure the shared invariants. */
+import { EventEmitter } from 'events'
 import { mkdtempSync } from 'fs'
+import type { Server as HttpServer } from 'http'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { describe, expect, it, afterEach } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import WebSocket from 'ws'
 import { WebSocketTransport } from './ws-transport'
 import { loadOrCreateTlsCertificate } from '../tls-certificate'
@@ -338,6 +340,54 @@ describe('WebSocketTransport', () => {
     expect(second.resolvedPort).toBeGreaterThan(0)
 
     const ws = await connectWs(second.resolvedPort)
+    ws.close()
+  })
+
+  it('falls back to OS-assigned port when bind returns EACCES', async () => {
+    // Why: Windows kernel-reserved TCP exclusion ranges (Hyper-V/WSL/Docker
+    // NAT pool) make bind() fail with EACCES even when no process owns the
+    // port. The transport must treat EACCES the same as EADDRINUSE.
+    // Use a non-zero preferred port so the fallback condition (port !== 0) holds.
+    const tls = makeTls()
+    const transport = new WebSocketTransport({
+      host: '127.0.0.1',
+      port: 6769,
+      tlsCert: tls.cert,
+      tlsKey: tls.key
+    })
+    transports.push(transport)
+
+    // Why: spy the private createHttpServer factory. The first listen attempt
+    // gets a fake server that emits EACCES; the fallback (port = 0) delegates
+    // to the real factory and binds normally.
+    const internals = transport as unknown as { createHttpServer: () => HttpServer }
+    const realFactory = internals.createHttpServer.bind(transport)
+    let attempt = 0
+    vi.spyOn(internals, 'createHttpServer').mockImplementation(() => {
+      attempt += 1
+      if (attempt === 1) {
+        const fake = new EventEmitter() as unknown as HttpServer
+        fake.listen = ((..._args: unknown[]) => {
+          process.nextTick(() => {
+            fake.emit('error', Object.assign(new Error('listen EACCES'), { code: 'EACCES' }))
+          })
+          return fake
+        }) as HttpServer['listen']
+        fake.close = ((cb?: () => void) => {
+          cb?.()
+          return fake
+        }) as HttpServer['close']
+        return fake
+      }
+      return realFactory()
+    })
+
+    await transport.start()
+    expect(transport.resolvedPort).toBeGreaterThan(0)
+    expect(transport.resolvedPort).not.toBe(6769)
+    expect(attempt).toBe(2)
+
+    const ws = await connectWs(transport.resolvedPort)
     ws.close()
   })
 
