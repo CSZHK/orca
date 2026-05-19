@@ -1,5 +1,5 @@
 /* eslint-disable max-lines */
-import { ipcMain, shell } from 'electron'
+import { app, ipcMain, shell } from 'electron'
 import { readdir, readFile, writeFile, stat, lstat, open } from 'fs/promises'
 import { extname, join } from 'path'
 import type { ChildProcess } from 'child_process'
@@ -75,6 +75,7 @@ import {
   prepareLocalCommitMessageAgentEnv,
   type CommitMessageAgentEnvironmentResolvers
 } from '../text-generation/commit-message-agent-environment'
+import { ensureShellPathHydrated } from '../startup/hydrate-shell-path'
 
 // Why: Monaco has large-file optimizations like VS Code; blocking at 5MB makes
 // ordinary JSON/log files inaccessible before the editor can degrade features.
@@ -647,6 +648,7 @@ export function registerFilesystemHandlers(
         })
       }
       const worktreePath = await resolveRegisteredWorktreePath(args.worktreePath, store)
+      await ensureShellPathHydrated(app.isPackaged)
       let context
       try {
         context = await getStagedCommitContext(worktreePath)

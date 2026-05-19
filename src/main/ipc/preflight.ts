@@ -1,10 +1,14 @@
-import { ipcMain } from 'electron'
+import { app, ipcMain } from 'electron'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
 import path from 'path'
 import { TUI_AGENT_CONFIG } from '../../shared/tui-agent-config'
 import type { PathSource, ShellHydrationFailureReason } from '../../shared/types'
-import { hydrateShellPath, mergePathSegments } from '../startup/hydrate-shell-path'
+import {
+  ensureShellPathHydrated,
+  hydrateShellPath,
+  mergePathSegments
+} from '../startup/hydrate-shell-path'
 import { getAzureDevOpsAuthStatus } from '../azure-devops/client'
 import { getBitbucketAuthStatus } from '../bitbucket/client'
 import { getGiteaAuthStatus } from '../gitea/client'
@@ -78,6 +82,7 @@ const KNOWN_AGENT_COMMANDS = Object.entries(TUI_AGENT_CONFIG).map(([id, config])
 }))
 
 export async function detectInstalledAgents(): Promise<string[]> {
+  await ensureShellPathHydrated(app.isPackaged)
   const checks = await Promise.all(
     KNOWN_AGENT_COMMANDS.map(async ({ id, cmd }) => ({
       id,

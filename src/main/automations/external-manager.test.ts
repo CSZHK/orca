@@ -19,6 +19,12 @@ const execFileMock = vi.hoisted(() =>
   })
 )
 
+vi.mock('electron', () => ({ app: { isPackaged: false } }))
+
+vi.mock('../startup/hydrate-shell-path', () => ({
+  ensureShellPathHydrated: vi.fn()
+}))
+
 vi.mock('child_process', () => ({ execFile: execFileMock }))
 
 vi.mock('../ipc/ssh', () => ({

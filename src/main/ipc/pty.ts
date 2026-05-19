@@ -27,7 +27,8 @@ import {
   markClaudePtySpawned
 } from '../claude-accounts/live-pty-gate'
 import { applyTerminalAttributionEnv } from '../attribution/terminal-attribution'
-import { findEnvPathKey } from '../pty/env-path-key'
+import { findEnvPathKey, normalizeWindowsEnvPathKey } from '../pty/env-path-key'
+import { hydrateShellPath, mergePathSegments } from '../startup/hydrate-shell-path'
 import { registerPty, unregisterPty } from '../memory/pty-registry'
 import { track } from '../telemetry/client'
 import { classifyError } from '../telemetry/classify-error'
@@ -210,6 +211,16 @@ function finishPtyShutdown(
   markClaudePtyExited(id)
 }
 
+async function hydrateLocalSpawnPath(): Promise<void> {
+  if (process.platform !== 'win32' && !app.isPackaged) {
+    return
+  }
+  const hydration = await hydrateShellPath()
+  if (hydration.ok) {
+    mergePathSegments(hydration.segments)
+  }
+}
+
 // ─── Host PTY env assembly ──────────────────────────────────────────
 // Why: both the LocalPtyProvider.buildSpawnEnv closure and the daemon-active
 // fallback in pty:spawn need the same set of host-local env injections
@@ -246,6 +257,18 @@ export function buildPtyHostEnv(
   baseEnv: Record<string, string>,
   opts: BuildPtyHostEnvOptions
 ): Record<string, string> {
+  // Why: on Windows, process.env is case-insensitive but plain objects are not.
+  // The daemon path may introduce both PATH and Path keys — normalizeWindowsEnvPathKey
+  // at the end of this function collapses them into one.
+  const basePathKey = findEnvPathKey(baseEnv)
+  if (!baseEnv[basePathKey]) {
+    const processPathKey = findEnvPathKey(process.env as Record<string, string>)
+    const processPath = process.env[processPathKey]
+    if (processPath) {
+      baseEnv[processPathKey] = processPath
+    }
+  }
+
   // Why: the Local path passes a baseEnv that already includes process.env
   // (LocalPtyProvider.spawn merges it before calling buildSpawnEnv). The
   // daemon path passes only args.env since process.env propagates to the
@@ -365,6 +388,7 @@ export function buildPtyHostEnv(
     enabled: opts.githubAttributionEnabled,
     userDataPath: opts.userDataPath
   })
+  normalizeWindowsEnvPathKey(baseEnv)
 
   return baseEnv
 }
@@ -825,6 +849,9 @@ export function registerPtyHandlers(
           'This Claude launch defines explicit Anthropic auth environment variables. Remove those overrides before using a managed Claude account.'
         )
       }
+      if (!args.connectionId) {
+        await hydrateLocalSpawnPath()
+      }
 
       const isDaemonHostSpawn = !args.connectionId && !(provider instanceof LocalPtyProvider)
       const sessionId = isDaemonHostSpawn ? mintPtySessionId(args.worktreeId) : undefined
@@ -1077,6 +1104,9 @@ export function registerPtyHandlers(
         throw new Error(
           'This Claude launch defines explicit Anthropic auth environment variables. Remove those overrides before using a managed Claude account.'
         )
+      }
+      if (!args.connectionId) {
+        await hydrateLocalSpawnPath()
       }
       // Why: the daemon-backed provider replaces LocalPtyProvider and therefore
       // never runs its buildSpawnEnv closure. We must assemble the same

@@ -1,10 +1,12 @@
 /* eslint-disable max-lines -- Why: keeping both Codex RPC and PTY fallback
 paths together in one file makes it easier to audit the protocol/parsing
 differences and ensure account-scoped env handling stays identical. */
+import { app } from 'electron'
 import type { ProviderRateLimits, RateLimitWindow } from '../../shared/rate-limit-types'
 import { spawn } from 'node:child_process'
 import { resolveCodexCommand } from '../codex-cli/command'
 import { getCmdExePath, getSpawnArgsForWindows } from '../win32-utils'
+import { ensureShellPathHydrated } from '../startup/hydrate-shell-path'
 
 const RPC_TIMEOUT_MS = 10_000
 const PTY_TIMEOUT_MS = 15_000
@@ -86,6 +88,7 @@ function mapRpcWindow(
 // ---------------------------------------------------------------------------
 
 async function fetchViaRpc(options?: FetchCodexRateLimitsOptions): Promise<ProviderRateLimits> {
+  await ensureShellPathHydrated(app.isPackaged)
   return new Promise<ProviderRateLimits>((resolve) => {
     let buffer = ''
     let resolved = false
@@ -305,6 +308,7 @@ function parsePtyStatus(output: string): {
 }
 
 async function fetchViaPty(options?: FetchCodexRateLimitsOptions): Promise<ProviderRateLimits> {
+  await ensureShellPathHydrated(app.isPackaged)
   const pty = await import('node-pty')
   const codexCommand = resolveCodexCommand()
 

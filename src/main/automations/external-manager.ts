@@ -1,5 +1,6 @@
 /* eslint-disable max-lines -- Why: external automation discovery, pagination,
  * and lifecycle routing share provider/target validation and remote relay fallbacks. */
+import { app } from 'electron'
 import { execFile } from 'child_process'
 import { existsSync } from 'fs'
 import { readFile } from 'fs/promises'
@@ -19,6 +20,7 @@ import type {
 import type { SshTarget } from '../../shared/ssh-types'
 import type { Store } from '../persistence'
 import { getActiveMultiplexer } from '../ipc/ssh'
+import { ensureShellPathHydrated } from '../startup/hydrate-shell-path'
 import { mapHermesJobs, mapOpenClawJobs } from './external-job-mappers'
 import { readHermesCronOutputRunsPage } from './hermes-cron-output'
 
@@ -34,6 +36,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 async function isCommandOnPath(command: string): Promise<boolean> {
+  await ensureShellPathHydrated(app.isPackaged)
   const finder = process.platform === 'win32' ? 'where' : 'which'
   try {
     await execFileAsync(finder, [command], { encoding: 'utf-8' })

@@ -1,7 +1,9 @@
+import { app } from 'electron'
 import type { ProviderRateLimits, RateLimitWindow } from '../../shared/rate-limit-types'
 import { resolveClaudeCommand } from '../codex-cli/command'
 import type { ClaudeRuntimeAuthPreparation } from '../claude-accounts/runtime-auth-service'
 import { applyClaudeEnvPatch } from '../claude-accounts/environment'
+import { ensureShellPathHydrated } from '../startup/hydrate-shell-path'
 
 const PTY_TIMEOUT_MS = 25_000
 const MAX_OUTPUT_LENGTH = 100_000 // 100KB buffer limit
@@ -132,6 +134,7 @@ export async function fetchViaPty(options?: {
   authPreparation?: ClaudeRuntimeAuthPreparation
 }): Promise<ProviderRateLimits> {
   const pty = await import('node-pty')
+  await ensureShellPathHydrated(app.isPackaged)
 
   return new Promise<ProviderRateLimits>((resolve) => {
     let output = ''

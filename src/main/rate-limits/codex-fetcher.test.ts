@@ -7,6 +7,12 @@ const { childSpawnMock, resolveCodexCommandMock, ptySpawnMock } = vi.hoisted(() 
   ptySpawnMock: vi.fn()
 }))
 
+vi.mock('electron', () => ({ app: { isPackaged: false } }))
+
+vi.mock('../startup/hydrate-shell-path', () => ({
+  ensureShellPathHydrated: vi.fn()
+}))
+
 vi.mock('node:child_process', () => ({
   spawn: childSpawnMock
 }))

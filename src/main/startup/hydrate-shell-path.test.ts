@@ -81,6 +81,32 @@ describe('hydrateShellPath', () => {
     expect(result).toEqual({ segments: [], ok: false, failureReason: 'no_shell' })
   })
 
+  it('reads Windows User/Machine PATH through the Windows reader', async () => {
+    const result = await hydrateShellPath({
+      platform: 'win32',
+      windowsReader: async () => ({
+        segments: [
+          'C:\\Program Files\\nodejs',
+          'C:\\Users\\tester\\AppData\\Local\\Programs\\reclaude\\bin'
+        ],
+        ok: true,
+        failureReason: 'none'
+      }),
+      spawner: async () => {
+        throw new Error('posix spawner must not run on Windows')
+      }
+    })
+
+    expect(result).toEqual({
+      segments: [
+        'C:\\Program Files\\nodejs',
+        'C:\\Users\\tester\\AppData\\Local\\Programs\\reclaude\\bin'
+      ],
+      ok: true,
+      failureReason: 'none'
+    })
+  })
+
   // Why: each failure mode tagged independently so dashboards can pick the
   // right fix (lengthen timeout vs investigate shell-invocation strategy vs
   // surface a UX error). Spawner override stands in for the four resolve
@@ -125,7 +151,9 @@ describe('mergePathSegments', () => {
   it('prepends new segments ahead of existing PATH entries', () => {
     process.env.PATH = '/usr/bin:/bin'
 
-    const added = mergePathSegments(['/Users/tester/.opencode/bin', '/Users/tester/.cargo/bin'])
+    const added = mergePathSegments(['/Users/tester/.opencode/bin', '/Users/tester/.cargo/bin'], {
+      platform: 'linux'
+    })
 
     expect(added).toEqual(['/Users/tester/.opencode/bin', '/Users/tester/.cargo/bin'])
     expect(process.env.PATH).toBe(
@@ -136,7 +164,9 @@ describe('mergePathSegments', () => {
   it('skips segments already on PATH so re-hydration is a no-op', () => {
     process.env.PATH = '/Users/tester/.cargo/bin:/usr/bin'
 
-    const added = mergePathSegments(['/Users/tester/.cargo/bin', '/Users/tester/.opencode/bin'])
+    const added = mergePathSegments(['/Users/tester/.cargo/bin', '/Users/tester/.opencode/bin'], {
+      platform: 'linux'
+    })
 
     expect(added).toEqual(['/Users/tester/.opencode/bin'])
     expect(process.env.PATH).toBe('/Users/tester/.opencode/bin:/Users/tester/.cargo/bin:/usr/bin')
@@ -147,5 +177,40 @@ describe('mergePathSegments', () => {
 
     expect(mergePathSegments([])).toEqual([])
     expect(process.env.PATH).toBe('/usr/bin:/bin')
+  })
+
+  it('uses Windows path casing and semicolon delimiters without duplicating entries', () => {
+    const originalUpperPath = process.env.PATH
+    const originalMixedPath = process.env.Path
+    delete process.env.PATH
+    process.env.Path = 'C:\\Windows\\System32;C:\\Tools\\Node'
+
+    try {
+      const added = mergePathSegments(
+        [
+          'c:/tools/node/',
+          'C:\\Users\\tester\\AppData\\Local\\Programs\\reclaude\\bin',
+          'C:\\Users\\tester\\AppData\\Local\\Programs\\reclaude\\bin'
+        ],
+        { platform: 'win32' }
+      )
+
+      expect(added).toEqual(['C:\\Users\\tester\\AppData\\Local\\Programs\\reclaude\\bin'])
+      expect(process.env.Path).toBe(
+        'C:\\Users\\tester\\AppData\\Local\\Programs\\reclaude\\bin;C:\\Windows\\System32;C:\\Tools\\Node'
+      )
+      expect(Object.keys(process.env).find((k) => k === 'PATH')).toBeUndefined()
+    } finally {
+      if (originalUpperPath === undefined) {
+        delete process.env.PATH
+      } else {
+        process.env.PATH = originalUpperPath
+      }
+      if (originalMixedPath === undefined) {
+        delete process.env.Path
+      } else {
+        process.env.Path = originalMixedPath
+      }
+    }
   })
 })

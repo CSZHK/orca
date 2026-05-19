@@ -23,6 +23,7 @@ const {
 }))
 
 vi.mock('electron', () => ({
+  app: { isPackaged: false },
   ipcMain: {
     handle: handleMock
   }
@@ -40,7 +41,8 @@ vi.mock('child_process', () => {
 
 vi.mock('../startup/hydrate-shell-path', () => ({
   hydrateShellPath: hydrateShellPathMock,
-  mergePathSegments: mergePathSegmentsMock
+  mergePathSegments: mergePathSegmentsMock,
+  ensureShellPathHydrated: vi.fn()
 }))
 
 vi.mock('../bitbucket/client', () => ({

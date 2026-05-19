@@ -16,6 +16,7 @@ import type {
 import type { CodexRuntimeHomeService } from './runtime-home-service'
 import { writeFileAtomically } from './fs-utils'
 import { resolveCodexCommand } from '../codex-cli/command'
+import { ensureShellPathHydrated } from '../startup/hydrate-shell-path'
 import type { Store } from '../persistence'
 import type { RateLimitService } from '../rate-limits/service'
 
@@ -404,6 +405,7 @@ export class CodexAccountService {
   }
 
   private async runCodexLogin(managedHomePath: string): Promise<void> {
+    await ensureShellPathHydrated(app.isPackaged)
     await new Promise<void>((resolvePromise, rejectPromise) => {
       const codexCommand = resolveCodexCommand()
       // Why: on Windows, resolveCodexCommand() may return a .cmd/.bat file

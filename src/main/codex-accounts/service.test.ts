@@ -11,8 +11,13 @@ const testState = { userDataDir: '', fakeHomeDir: '' }
 
 vi.mock('electron', () => ({
   app: {
+    isPackaged: false,
     getPath: () => testState.userDataDir
   }
+}))
+
+vi.mock('../startup/hydrate-shell-path', () => ({
+  ensureShellPathHydrated: vi.fn()
 }))
 
 vi.mock('node:os', async () => {

@@ -1,5 +1,6 @@
 /* eslint-disable max-lines -- Why: Claude managed accounts need one audited owner
 for login, credential capture, Keychain storage, selection, and rate-limit refresh. */
+import { app } from 'electron'
 import { randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
@@ -13,6 +14,7 @@ import type {
 import type { Store } from '../persistence'
 import type { RateLimitService } from '../rate-limits/service'
 import { resolveClaudeCommand } from '../codex-cli/command'
+import { ensureShellPathHydrated } from '../startup/hydrate-shell-path'
 import type { ClaudeRuntimeAuthService } from './runtime-auth-service'
 import {
   getClaudeManagedAccountsRoot,
@@ -565,12 +567,13 @@ export class ClaudeAccountService {
     await deleteManagedClaudeKeychainCredentials(accountId)
   }
 
-  private runClaudeCommand(
+  private async runClaudeCommand(
     args: string[],
     configDir: string,
     timeoutMs: number,
     options?: { allowFailure?: boolean }
   ): Promise<string> {
+    await ensureShellPathHydrated(app.isPackaged)
     return new Promise((resolvePromise, rejectPromise) => {
       const claudeCommand = resolveClaudeCommand()
       const child = spawn(claudeCommand, args, {

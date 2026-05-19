@@ -32,7 +32,9 @@ const {
   setMigrationUnsupportedPtyMock,
   clearMigrationUnsupportedPtyMock,
   clearMigrationUnsupportedPtysForPaneKeyMock,
-  clearPaneKeyAliasesForPtyMock
+  clearPaneKeyAliasesForPtyMock,
+  hydrateShellPathMock,
+  mergePathSegmentsMock
 } = vi.hoisted(() => ({
   handleMock: vi.fn(),
   onMock: vi.fn(),
@@ -62,7 +64,9 @@ const {
   setMigrationUnsupportedPtyMock: vi.fn(),
   clearMigrationUnsupportedPtyMock: vi.fn(),
   clearMigrationUnsupportedPtysForPaneKeyMock: vi.fn(),
-  clearPaneKeyAliasesForPtyMock: vi.fn()
+  clearPaneKeyAliasesForPtyMock: vi.fn(),
+  hydrateShellPathMock: vi.fn(),
+  mergePathSegmentsMock: vi.fn()
 }))
 
 vi.mock('electron', () => ({
@@ -139,6 +143,11 @@ vi.mock('../agent-hooks/migration-unsupported-pty-state', () => ({
   setMigrationUnsupportedPty: setMigrationUnsupportedPtyMock,
   clearMigrationUnsupportedPty: clearMigrationUnsupportedPtyMock,
   clearMigrationUnsupportedPtysForPaneKey: clearMigrationUnsupportedPtysForPaneKeyMock
+}))
+
+vi.mock('../startup/hydrate-shell-path', () => ({
+  hydrateShellPath: hydrateShellPathMock,
+  mergePathSegments: mergePathSegmentsMock
 }))
 import { LocalPtyProvider } from '../providers/local-pty-provider'
 import { makePaneKey } from '../../shared/stable-pane-id'
@@ -224,6 +233,8 @@ describe('registerPtyHandlers', () => {
     clearMigrationUnsupportedPtyMock.mockReset()
     clearMigrationUnsupportedPtysForPaneKeyMock.mockReset()
     clearPaneKeyAliasesForPtyMock.mockReset()
+    hydrateShellPathMock.mockReset()
+    mergePathSegmentsMock.mockReset()
     mainWindow.webContents.on.mockReset()
     mainWindow.webContents.send.mockReset()
 
@@ -252,6 +263,8 @@ describe('registerPtyHandlers', () => {
         : '/tmp/orca-pi-agent-overlay'
     }))
     isPwshAvailableMock.mockReturnValue(false)
+    hydrateShellPathMock.mockResolvedValue({ ok: false, segments: [], failureReason: 'no_shell' })
+    mergePathSegmentsMock.mockReturnValue([])
     spawnMock.mockReturnValue({
       onData: vi.fn(() => makeDisposable()),
       onExit: vi.fn(() => makeDisposable()),
@@ -768,6 +781,46 @@ describe('registerPtyHandlers', () => {
         }))
         expect(env.ORCA_ENABLE_GIT_ATTRIBUTION).toBe('1')
         expect(env.PATH).toContain('/tmp/orca-user-data/orca-terminal-attribution/posix')
+      })
+
+      it('carries main-process PATH into daemon-backed local PTYs', async () => {
+        const env = await daemonSpawnAndGetEnv({}, undefined, undefined, {
+          PATH: 'C:\\Users\\tester\\AppData\\Local\\Programs\\reclaude\\bin;C:\\Windows\\System32'
+        })
+        expect(env.PATH).toContain('C:\\Users\\tester\\AppData\\Local\\Programs\\reclaude\\bin')
+      })
+
+      it('hydrates PATH before daemon-backed local PTY spawn', async () => {
+        const daemonSpawn = setupDaemonAdapter()
+        hydrateShellPathMock.mockResolvedValueOnce({
+          ok: true,
+          segments: ['C:\\Users\\tester\\AppData\\Local\\Programs\\reclaude\\bin'],
+          failureReason: 'none'
+        })
+        mergePathSegmentsMock.mockReturnValueOnce([
+          'C:\\Users\\tester\\AppData\\Local\\Programs\\reclaude\\bin'
+        ])
+
+        handlers.clear()
+        registerPtyHandlers(mainWindow as never)
+        await handlers.get('pty:spawn')!(null, {
+          cols: 80,
+          rows: 24,
+          env: {}
+        })
+
+        expect(hydrateShellPathMock).toHaveBeenCalled()
+        expect(mergePathSegmentsMock).toHaveBeenCalledWith([
+          'C:\\Users\\tester\\AppData\\Local\\Programs\\reclaude\\bin'
+        ])
+        expect(daemonSpawn).toHaveBeenCalled()
+      })
+
+      it('does not overwrite caller-provided daemon PATH', async () => {
+        const env = await daemonSpawnAndGetEnv({ PATH: 'C:\\Custom\\Bin' }, undefined, undefined, {
+          PATH: 'C:\\Users\\tester\\AppData\\Local\\Programs\\reclaude\\bin;C:\\Windows\\System32'
+        })
+        expect(env.PATH).toBe('C:\\Custom\\Bin')
       })
 
       it('injects dev-mode ORCA_USER_DATA_PATH + dev CLI PATH on the daemon path', async () => {

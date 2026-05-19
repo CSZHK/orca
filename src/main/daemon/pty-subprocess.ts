@@ -18,6 +18,7 @@ import { resolveWindowsShellLaunchArgs } from '../providers/windows-shell-args'
 import { resolveEffectiveWindowsPowerShell } from '../providers/windows-powershell'
 import { isPwshAvailable } from '../pwsh'
 import { removeInheritedNoColor } from '../pty/terminal-color-env'
+import { normalizeWindowsEnvPathKey } from '../pty/env-path-key'
 
 export type PtySubprocessOptions = {
   sessionId: string
@@ -149,6 +150,7 @@ export function createPtySubprocess(opts: PtySubprocessOptions): SubprocessHandl
     // restores clickable refs like `owner/repo#123` / `PR#123`.
     FORCE_HYPERLINK: '1'
   } as Record<string, string>
+  normalizeWindowsEnvPathKey(env)
   removeInheritedNoColor(env)
 
   env.LANG ??= 'en_US.UTF-8'

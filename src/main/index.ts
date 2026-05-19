@@ -120,9 +120,10 @@ patchPackagedProcessPath()
 // parallel for packaged runs — when it resolves, its PATH is prepended and
 // detectInstalledAgents picks up whatever the user's rc files put on PATH
 // (cargo/pyenv/volta/custom tool install dirs) without hardcoding each one.
-// Dev runs already inherit a complete PATH from the launching terminal, so
-// the spawn cost is only paid where it's needed.
-if (app.isPackaged && process.platform !== 'win32') {
+// Dev runs already inherit a complete PATH from the launching terminal on
+// macOS/Linux. Windows also refreshes PATH from the registry here so new
+// terminals see user-scoped CLI installs added after Orca started.
+if (app.isPackaged || process.platform === 'win32') {
   void hydrateShellPath().then((result) => {
     if (result.ok) {
       mergePathSegments(result.segments)

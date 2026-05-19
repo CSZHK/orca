@@ -14,8 +14,13 @@ import {
 
 vi.mock('electron', () => ({
   app: {
+    isPackaged: false,
     getPath: () => '/tmp/orca-claude-service-test'
   }
+}))
+
+vi.mock('../startup/hydrate-shell-path', () => ({
+  ensureShellPathHydrated: vi.fn()
 }))
 
 vi.mock('../codex-cli/command', () => ({

@@ -62,12 +62,17 @@ const {
 }))
 
 vi.mock('electron', () => ({
+  app: { isPackaged: false },
   ipcMain: {
     handle: handleMock
   },
   shell: {
     trashItem: trashItemMock
   }
+}))
+
+vi.mock('../startup/hydrate-shell-path', () => ({
+  ensureShellPathHydrated: vi.fn()
 }))
 
 vi.mock('fs/promises', () => ({
