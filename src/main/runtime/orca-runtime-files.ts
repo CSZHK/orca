@@ -15,6 +15,7 @@ import {
   writeFile
 } from 'fs/promises'
 import { basename, dirname, extname, join } from 'path'
+import { auditedRm } from '../fs-safety/audited-rm'
 import type {
   DirEntry,
   FsChangeEvent,
@@ -566,7 +567,9 @@ export class RuntimeFileCommands {
     })
     // Why: a non-local runtime has no client OS Trash/Recycling Bin; server-side
     // file mutations are permanent and the renderer confirms before calling this.
-    await rm(targetPath, { recursive: recursive === true, force: true })
+    await (recursive === true
+      ? auditedRm(targetPath, 'runtime file delete: user-initiated recursive rm')
+      : rm(targetPath, { force: true }))
     return { ok: true }
   }
 

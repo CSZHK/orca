@@ -11,6 +11,7 @@ import { DEFAULT_REPO_BADGE_COLOR } from '../../shared/constants'
 import { invalidateAuthorizedRootsCache } from './filesystem-auth'
 import type { ChildProcess } from 'child_process'
 import { access, mkdir, readdir, rm } from 'fs/promises'
+import { auditedRm } from '../fs-safety/audited-rm'
 import { gitExecFileAsync, gitSpawn } from '../git/runner'
 import { basename, isAbsolute, join } from 'path'
 import {
@@ -365,7 +366,7 @@ export function registerRepoHandlers(mainWindow: BrowserWindow, store: Store): v
           // they left it. Retrying works either way, but leaving a half-init'd
           // repo behind is confusing if they choose to skip the retry.
           if (createdDir) {
-            await rm(targetPath, { recursive: true, force: true }).catch(() => {})
+            await auditedRm(targetPath, 'git init rollback: remove created dir').catch(() => {})
           } else if (step === 'commit') {
             await rm(join(targetPath, '.git'), { recursive: true, force: true }).catch(() => {})
           }
@@ -578,7 +579,7 @@ export function registerRepoHandlers(mainWindow: BrowserWindow, store: Store): v
       // Without cleanup, retrying the same URL/destination fails with
       // "destination path already exists and is not an empty directory".
       if (pathToClean) {
-        await rm(pathToClean, { recursive: true, force: true }).catch(() => {
+        await auditedRm(pathToClean, 'clone abort: remove incomplete clone').catch(() => {
           // Best-effort cleanup — don't fail the abort if removal fails
         })
       }

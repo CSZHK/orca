@@ -11,7 +11,8 @@ import { gitExecFileAsync, wslAwareSpawn } from '../git/runner'
 import { isWslPath, parseWslPath, getWslHome } from '../wsl'
 import { randomUUID } from 'crypto'
 import { basename, isAbsolute, join } from 'path'
-import { mkdir, readdir, rm, stat } from 'fs/promises'
+import { mkdir, readdir, rm, stat, unlink } from 'fs/promises'
+import { auditedRm } from '../fs-safety/audited-rm'
 import { OrchestrationDb } from './orchestration/db'
 import { formatMessagesForInjection } from './orchestration/formatter'
 import type {
@@ -4163,7 +4164,7 @@ export class OrcaRuntimeService {
         })
       } catch (error) {
         if (createdDir) {
-          await rm(targetPath, { recursive: true, force: true }).catch(() => {})
+          await auditedRm(targetPath, 'git init rollback: remove created dir').catch(() => {})
         } else if (step === 'commit') {
           await rm(join(targetPath, '.git'), { recursive: true, force: true }).catch(() => {})
         }
@@ -6082,10 +6083,10 @@ export class OrcaRuntimeService {
     } catch (error) {
       if (isOrphanedWorktreeError(error)) {
         if (await canSafelyRemoveOrphanedWorktreeDirectory(worktree.path, repo.path)) {
-          await rm(worktree.path, { recursive: true, force: true }).catch(() => {})
+          await unlink(join(worktree.path, '.git')).catch(() => {})
         } else {
           console.warn(
-            `[worktrees] Refusing recursive cleanup for unproven worktree directory: ${worktree.path}`
+            `[worktrees] Refusing cleanup for unproven worktree directory: ${worktree.path}`
           )
         }
         // Why: `git worktree remove` failed, so git's internal worktree tracking

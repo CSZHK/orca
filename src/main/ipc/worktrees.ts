@@ -1,7 +1,8 @@
 /* oxlint-disable max-lines */
 import type { BrowserWindow } from 'electron'
 import { ipcMain } from 'electron'
-import { rm } from 'fs/promises'
+import { unlink } from 'fs/promises'
+import { join as pathJoin } from 'path'
 import { randomUUID } from 'crypto'
 import type { Store } from '../persistence'
 import { isFolderRepo } from '../../shared/repo-kind'
@@ -754,13 +755,17 @@ export function registerWorktreeHandlers(
         // If git no longer tracks this worktree, clean up the directory and metadata
         if (isOrphanedWorktreeError(error)) {
           console.warn(
-            `[worktrees] Orphaned worktree detected at ${canonicalWorktreePath}, cleaning up`
+            `[worktrees] Orphaned worktree detected at ${canonicalWorktreePath}, cleaning up metadata only`
           )
           if (await canSafelyRemoveOrphanedWorktreeDirectory(canonicalWorktreePath, repo.path)) {
-            await rm(canonicalWorktreePath, { recursive: true, force: true }).catch(() => {})
+            // Only remove the .git pointer file — never rm -rf the worktree
+            // directory. The user's files must be preserved; they can delete
+            // the directory themselves once they've confirmed nothing important
+            // is inside.
+            await unlink(pathJoin(canonicalWorktreePath, '.git')).catch(() => {})
           } else {
             console.warn(
-              `[worktrees] Refusing recursive cleanup for unproven worktree directory: ${canonicalWorktreePath}`
+              `[worktrees] Refusing cleanup for unproven worktree directory: ${canonicalWorktreePath}`
             )
           }
           // Why: `git worktree remove` failed, so git's internal worktree tracking
