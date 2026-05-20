@@ -62,7 +62,8 @@ import {
   resolveRegisteredWorktreePath,
   validateGitRelativeFilePath,
   isENOENT,
-  authorizeExternalPath
+  authorizeExternalPath,
+  validateExternalPathAuthorization
 } from './filesystem-auth'
 import { listQuickOpenFiles } from './filesystem-list-files'
 import { registerFilesystemMutationHandlers } from './filesystem-mutations'
@@ -331,6 +332,11 @@ export function registerFilesystemHandlers(
   registerFilesystemMutationHandlers(store)
 
   ipcMain.handle('fs:authorizeExternalPath', (_event, args: { targetPath: string }): void => {
+    // Why: the renderer is an untrusted boundary. Without validation a
+    // compromised renderer could authorize '/' and bypass all filesystem
+    // access controls.  Validation rejects roots, shallow paths, home dir,
+    // and system directories before the path enters the authorized set.
+    validateExternalPathAuthorization(args.targetPath)
     authorizeExternalPath(args.targetPath)
   })
 

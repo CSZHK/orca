@@ -34,6 +34,7 @@ type OrcaRuntimeRpcServerOptions = {
   pid?: number
   platform?: NodeJS.Platform
   enableWebSocket?: boolean
+  wsHost?: string
   wsPort?: number
   webClientRoot?: string
   // Why: test-only overrides for the two time-bound constants below.
@@ -185,6 +186,7 @@ export class OrcaRuntimeRpcServer {
   private readonly pid: number
   private readonly platform: NodeJS.Platform
   private readonly enableWebSocket: boolean
+  private readonly wsHost: string
   private readonly wsPort: number
   private readonly webClientRoot: string | undefined
   private readonly authToken = randomBytes(24).toString('hex')
@@ -218,6 +220,7 @@ export class OrcaRuntimeRpcServer {
     pid = process.pid,
     platform = process.platform,
     enableWebSocket = false,
+    wsHost = '127.0.0.1',
     wsPort = DEFAULT_WS_PORT,
     webClientRoot,
     keepaliveIntervalMs = KEEPALIVE_INTERVAL_MS,
@@ -229,6 +232,7 @@ export class OrcaRuntimeRpcServer {
     this.pid = pid
     this.platform = platform
     this.enableWebSocket = enableWebSocket
+    this.wsHost = wsHost
     this.wsPort = wsPort
     this.webClientRoot = webClientRoot
     this.keepaliveIntervalMs = keepaliveIntervalMs
@@ -419,8 +423,11 @@ export class OrcaRuntimeRpcServer {
         this.deviceRegistry = new DeviceRegistry(this.userDataPath)
         this.e2eeKeypair = loadOrCreateE2EEKeypair(this.userDataPath)
 
+        // Why: bind to loopback only — the WebSocket RPC port must not be
+        // reachable from other machines on the network. Mobile/remote pairing
+        // uses the relay (SSH tunnel) rather than a direct LAN connection.
         const wsTransport = new WebSocketTransport({
-          host: '0.0.0.0',
+          host: this.wsHost,
           port: this.wsPort,
           staticRoot: this.webClientRoot
         })
@@ -507,7 +514,7 @@ export class OrcaRuntimeRpcServer {
         activeTransports.push(wsTransport)
         transportsMeta.push({
           kind: 'websocket',
-          endpoint: `ws://0.0.0.0:${wsTransport.resolvedPort}`
+          endpoint: `ws://${this.wsHost}:${wsTransport.resolvedPort}`
         })
       } catch (error) {
         // Why: WebSocket transport is supplementary — the runtime must still

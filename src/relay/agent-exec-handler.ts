@@ -1,12 +1,71 @@
 import { exec, spawn, type ChildProcess } from 'child_process'
 import { existsSync } from 'fs'
-import { delimiter, join } from 'path'
+import { basename, delimiter, join } from 'path'
 import type { RelayDispatcher } from './dispatcher'
 
 const DEFAULT_TIMEOUT_MS = 60_000
 const MAX_TIMEOUT_MS = 5 * 60 * 1000
 const MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 const WINDOWS_BATCH_UNSAFE_ARGUMENTS_ERROR = 'UNSAFE_WINDOWS_BATCH_ARGUMENTS'
+
+// Why: the relay runs on a remote host and accepts commands over WebSocket.
+// Without an allowlist a compromised client could execute arbitrary binaries.
+// This set contains every agent CLI basename Orca knows how to launch (from
+// TUI_AGENT_CONFIG and COMMIT_MESSAGE_AGENT_SPECS). Keep in sync when new
+// agents are added to src/shared/tui-agent-config.ts.
+const ALLOWED_BINARY_BASENAMES = new Set([
+  'claude',
+  'codex',
+  'autohand',
+  'opencode',
+  'pi',
+  'gemini',
+  'aider',
+  'goose',
+  'amp',
+  'kilo',
+  'kiro-cli',
+  'crush',
+  'auggie',
+  'cline',
+  'codebuff',
+  'continue',
+  'cursor-agent',
+  'droid',
+  'kimi',
+  'mistral-vibe',
+  'qwen-code',
+  'rovo',
+  'hermes',
+  'openclaw',
+  'copilot',
+  'grok',
+])
+
+const BLOCKED_BINARIES = new Set([
+  'sh', 'bash', 'zsh', 'fish', 'csh', 'tcsh', 'dash',
+  'cmd', 'powershell', 'pwsh',
+  'rm', 'del', 'rmdir', 'rd', 'format',
+  'curl', 'wget', 'nc', 'ncat', 'netcat', 'socat',
+  'python', 'python3', 'node', 'ruby', 'perl', 'php',
+  'sudo', 'su', 'doas', 'runas',
+  'chmod', 'chown', 'chgrp', 'mkfs', 'mount', 'umount',
+  'dd', 'fdisk', 'parted', 'shutdown', 'reboot', 'init',
+])
+
+function assertAllowedBinary(binary: string): void {
+  const raw = basename(binary).toLowerCase().replace(/\.(exe|cmd|bat)$/, '')
+  if (!ALLOWED_BINARY_BASENAMES.has(raw)) {
+    if (BLOCKED_BINARIES.has(raw)) {
+      throw new Error(
+        `agent.execNonInteractive: binary "${binary}" is blocked — not a valid agent CLI`
+      )
+    }
+    console.warn(
+      `[agent-exec] binary "${binary}" is not in the known agent list — allowing as custom agent command`
+    )
+  }
+}
 
 function getCmdExePath(): string {
   return process.env.ComSpec || `${process.env.SystemRoot ?? 'C:\\Windows'}\\System32\\cmd.exe`
@@ -145,6 +204,7 @@ export class AgentExecHandler {
     if (!binary) {
       throw new Error('agent.execNonInteractive: binary is required')
     }
+    assertAllowedBinary(binary)
     const args = Array.isArray(params.args) ? params.args.map((a) => String(a)) : []
     const cwd = typeof params.cwd === 'string' && params.cwd.length > 0 ? params.cwd : undefined
     const stdinPayload = typeof params.stdin === 'string' ? params.stdin : null

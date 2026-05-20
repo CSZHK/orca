@@ -1478,6 +1478,11 @@ export type GlobalSettings = {
    *  detection, so no visible behavior change. Then we flip this flag to true
    *  and never migrate again. */
   terminalMacOptionAsAltMigrated: boolean
+  /** Which network interface the WebSocket RPC server binds to.
+   *  '127.0.0.1' (default) restricts access to the local machine.
+   *  '0.0.0.0' exposes the port to the local network (required for
+   *  direct mobile pairing without an SSH relay). */
+  rpcBindHost?: '127.0.0.1' | '0.0.0.0'
   experimentalMobile: boolean
   /** Auto-restore window for a phone-fit PTY after the last mobile
    *  subscriber leaves. `null` (default) holds the PTY at phone size

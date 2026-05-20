@@ -913,6 +913,7 @@ app.whenReady().then(async () => {
     runtime,
     userDataPath: app.getPath('userData'),
     enableWebSocket: true,
+    wsHost: store.getSettings().rpcBindHost ?? '127.0.0.1',
     ...(isE2E ? { wsPort: 0 } : {}),
     ...(devWsPort !== undefined ? { wsPort: devWsPort } : {}),
     ...(serveOptions?.wsPort !== undefined ? { wsPort: serveOptions.wsPort } : {}),

@@ -1,11 +1,14 @@
+/* oxlint-disable max-lines */
 import { resolve, relative, dirname, basename, isAbsolute } from 'path'
 import { realpathSync } from 'fs'
 import { realpath } from 'fs/promises'
 import type { Store } from '../persistence'
 import { listRepoWorktrees } from '../repo-worktrees'
+export { validateExternalPathAuthorization } from './filesystem-auth-validation'
 
 export const PATH_ACCESS_DENIED_MESSAGE =
   'Access denied: path resolves outside allowed directories. If this blocks a legitimate workflow, please file a GitHub issue.'
+
 const authorizedExternalPaths = new Set<string>()
 const registeredWorktreeRoots = new Set<string>()
 const registeredWorktreeRootsByRepo = new Map<string, Set<string>>()

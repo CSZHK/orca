@@ -1,7 +1,7 @@
 import { spawn } from 'child_process'
 import type { ChildProcessWithoutNullStreams } from 'child_process'
 import { dirname } from 'path'
-import { ipcMain } from 'electron'
+import { dialog, ipcMain } from 'electron'
 import type { Store } from '../persistence'
 import { resolveAuthorizedPath } from './filesystem-auth'
 
@@ -196,6 +196,29 @@ async function runPythonCell(
   return { stdout: '', stderr: '', exitCode: null, error: lastError }
 }
 
+// Why: renderer-supplied code runs with full system access via Python exec().
+// Gate the first execution behind a native dialog so the user explicitly opts in.
+let notebookExecutionAllowedThisSession = false
+
+async function ensureNotebookExecutionAllowed(): Promise<void> {
+  if (notebookExecutionAllowedThisSession) {
+    return
+  }
+  const { response } = await dialog.showMessageBox({
+    type: 'warning',
+    title: 'Notebook Code Execution',
+    message:
+      'A notebook cell wants to execute Python code. This runs with full system access. Allow notebook execution for this session?',
+    buttons: ['Allow', 'Cancel'],
+    defaultId: 1,
+    cancelId: 1
+  })
+  if (response !== 0) {
+    throw new Error('Notebook execution was not allowed by the user.')
+  }
+  notebookExecutionAllowedThisSession = true
+}
+
 export function registerNotebookHandlers(store: Store): void {
   ipcMain.handle(
     'notebook:runPythonCell',
@@ -211,6 +234,7 @@ export function registerNotebookHandlers(store: Store): void {
           error: 'Notebook execution is currently supported for local files only.'
         }
       }
+      await ensureNotebookExecutionAllowed()
       const filePath = await resolveAuthorizedPath(args.filePath, store)
       // Why: execute relative to the notebook file so local imports and data
       // paths behave the same way users expect from a notebook opened on disk.

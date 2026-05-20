@@ -8,6 +8,7 @@ import type { RelayContext } from './context'
 // Why: RelayContext is accepted in the constructor for protocol back-compat
 // (see docs/relay-fs-allowlist-removal.md), but no longer consulted on FS ops.
 import { expandTilde } from './context'
+import { assertNotSensitivePath } from './fs-handler-path-denylist'
 import {
   DEFAULT_MAX_RESULTS,
   searchWithRg,
@@ -82,6 +83,7 @@ export class FsHandler {
 
   private async readDir(params: Record<string, unknown>) {
     const dirPath = expandTilde(params.dirPath as string)
+    assertNotSensitivePath(dirPath)
     const entries = await readdir(dirPath, { withFileTypes: true })
     const mapped = await Promise.all(
       entries.map(async (entry) => ({
@@ -100,11 +102,13 @@ export class FsHandler {
 
   private async readFile(params: Record<string, unknown>) {
     const filePath = expandTilde(params.filePath as string)
+    assertNotSensitivePath(filePath)
     return readRelayFileContent(filePath)
   }
 
   private async readFileStream(params: Record<string, unknown>, context?: RequestContext) {
     const filePath = expandTilde(params.filePath as string)
+    assertNotSensitivePath(filePath)
     const ctx = context ?? { clientId: 0, isStale: () => false }
     return readRelayFileStreamMetadata(filePath, this.dispatcher, this.streamRegistry, ctx)
   }
@@ -118,6 +122,7 @@ export class FsHandler {
 
   private async writeFile(params: Record<string, unknown>) {
     const filePath = expandTilde(params.filePath as string)
+    assertNotSensitivePath(filePath)
     const content = params.content as string
     try {
       const fileStats = await lstat(filePath)
@@ -134,6 +139,7 @@ export class FsHandler {
 
   private async stat(params: Record<string, unknown>) {
     const filePath = expandTilde(params.filePath as string)
+    assertNotSensitivePath(filePath)
     const stats = await lstat(filePath)
     if (stats.isSymbolicLink()) {
       try {
@@ -158,6 +164,7 @@ export class FsHandler {
 
   private async deletePath(params: Record<string, unknown>) {
     const targetPath = expandTilde(params.targetPath as string)
+    assertNotSensitivePath(targetPath)
     const recursive = params.recursive as boolean | undefined
     const stats = await stat(targetPath)
     if (stats.isDirectory() && !recursive) {
@@ -168,6 +175,7 @@ export class FsHandler {
 
   private async createFile(params: Record<string, unknown>) {
     const filePath = expandTilde(params.filePath as string)
+    assertNotSensitivePath(filePath)
     const { dirname } = await import('path')
     await mkdir(dirname(filePath), { recursive: true })
     await writeFile(filePath, '', { encoding: 'utf-8', flag: 'wx' })
@@ -175,23 +183,29 @@ export class FsHandler {
 
   private async createDir(params: Record<string, unknown>) {
     const dirPath = expandTilde(params.dirPath as string)
+    assertNotSensitivePath(dirPath)
     await mkdir(dirPath, { recursive: true })
   }
 
   private async createDirNoClobber(params: Record<string, unknown>) {
     const dirPath = expandTilde(params.dirPath as string)
+    assertNotSensitivePath(dirPath)
     await mkdir(dirPath, { recursive: false })
   }
 
   private async rename(params: Record<string, unknown>) {
     const oldPath = expandTilde(params.oldPath as string)
     const newPath = expandTilde(params.newPath as string)
+    assertNotSensitivePath(oldPath)
+    assertNotSensitivePath(newPath)
     await rename(oldPath, newPath)
   }
 
   private async copy(params: Record<string, unknown>) {
     const source = expandTilde(params.source as string)
     const destination = expandTilde(params.destination as string)
+    assertNotSensitivePath(source)
+    assertNotSensitivePath(destination)
     try {
       await cp(source, destination, { recursive: true, force: false, errorOnExist: true })
     } catch (error) {
@@ -205,12 +219,14 @@ export class FsHandler {
 
   private async realpath(params: Record<string, unknown>) {
     const filePath = expandTilde(params.filePath as string)
+    assertNotSensitivePath(filePath)
     return await realpath(filePath)
   }
 
   private async search(params: Record<string, unknown>) {
     const query = params.query as string
     const rootPath = expandTilde(params.rootPath as string)
+    assertNotSensitivePath(rootPath)
     const caseSensitive = params.caseSensitive as boolean | undefined
     const wholeWord = params.wholeWord as boolean | undefined
     const useRegex = params.useRegex as boolean | undefined
@@ -245,6 +261,7 @@ export class FsHandler {
 
   private async listFiles(params: Record<string, unknown>): Promise<string[]> {
     const rootPath = expandTilde(params.rootPath as string)
+    assertNotSensitivePath(rootPath)
     // Why: the main-to-relay RPC adds excludePaths so nested linked worktrees
     // don't get double-scanned. The shared helper validates the shape and
     // normalizes into root-relative prefixes; malformed input yields [] so
@@ -281,11 +298,13 @@ export class FsHandler {
 
   private async workspaceSpaceScan(params: Record<string, unknown>, context: RequestContext) {
     const rootPath = expandTilde(params.rootPath as string)
+    assertNotSensitivePath(rootPath)
     return scanWorkspaceSpaceDirectory(rootPath, context)
   }
 
   private async watch(params: Record<string, unknown>, context?: RequestContext) {
     const rootPath = expandTilde(params.rootPath as string)
+    assertNotSensitivePath(rootPath)
 
     this.releaseStaleWatches()
 
