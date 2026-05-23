@@ -44,7 +44,6 @@ import RightSidebar from './components/right-sidebar'
 import { StatusBar } from './components/status-bar/StatusBar'
 import { UpdateCard } from './components/UpdateCard'
 import { StarNagCard } from './components/StarNagCard'
-import { FeatureTourNudge } from './components/feature-wall/FeatureTourNudge'
 import { TelemetryFirstLaunchSurface } from './components/TelemetryFirstLaunchSurface'
 import { ZoomOverlay } from './components/ZoomOverlay'
 import { onOnboardingReopened } from './components/onboarding/show-onboarding-event'
@@ -1697,7 +1696,6 @@ function App(): React.JSX.Element {
             </Suspense>
           ) : null}
           <UpdateCard />
-          <FeatureTourNudge />
           <StarNagCard />
           {/* Why: the existing-user opt-in banner mounts at App root so it
           renders once per renderer session, not per view. It gates

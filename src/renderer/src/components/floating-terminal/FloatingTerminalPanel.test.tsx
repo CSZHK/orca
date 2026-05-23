@@ -491,7 +491,7 @@ describe('FloatingTerminalPanel close behavior', () => {
     mocks.createWebRuntimeSessionTerminal.mockResolvedValue(false)
     mocks.getFloatingMarkdownDirectory.mockResolvedValue('/tmp/orca/floating-notes')
     mocks.getFloatingTerminalCwd.mockResolvedValue('/tmp/orca')
-    mocks.getInstallStatus.mockResolvedValue({ state: 'installed' })
+    mocks.getInstallStatus.mockResolvedValue({ state: 'installed', pathConfigured: true })
     mocks.isWebRuntimeSessionActive.mockReturnValue(false)
     mocks.pickFloatingMarkdownDocument.mockResolvedValue(null)
     vi.stubGlobal('window', {

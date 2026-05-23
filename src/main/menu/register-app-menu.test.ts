@@ -197,7 +197,7 @@ describe('registerAppMenu', () => {
 
     const helpLabels = getSubmenu(template, 'Help').map((item) => item.label)
     expect(helpLabels).toEqual(
-      expect.arrayContaining(['Report Crash...', 'Feature tour', 'Check for Updates...'])
+      expect.arrayContaining(['Report Crash...', 'Explore Orca', 'Check for Updates...'])
     )
   })
 
@@ -216,7 +216,7 @@ describe('registerAppMenu', () => {
     expect(fileLabels).not.toContain(`Settings\t${isMac ? '⌘,' : 'Ctrl+,'}`)
     expect(fileLabels).not.toContain('Exit')
     const helpLabels = getSubmenu(template, 'Help').map((item) => item.label)
-    expect(helpLabels).toEqual(['Report Crash...', undefined, 'Feature tour'])
+    expect(helpLabels).toEqual(['Report Crash...', undefined, 'Explore Orca'])
   })
 
   it('routes Feature tour through its callback', () => {
@@ -224,7 +224,7 @@ describe('registerAppMenu', () => {
     registerAppMenu(options)
 
     const featureTourItem = getSubmenu(getTemplate(), 'Help').find(
-      (entry) => entry.label === 'Feature tour'
+      (entry) => entry.label === 'Explore Orca'
     )
     expect(featureTourItem?.accelerator).toBeUndefined()
 

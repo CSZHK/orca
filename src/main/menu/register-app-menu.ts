@@ -102,7 +102,7 @@ function buildAndApplyMenu(options: RegisterAppMenuOptions): void {
   }
 
   const featureTourItem: Electron.MenuItemConstructorOptions = {
-    label: 'Feature tour',
+    label: 'Explore Orca',
     click: (_menuItem, window) => onOpenFeatureTour(window)
   }
 
@@ -278,9 +278,6 @@ function buildAndApplyMenu(options: RegisterAppMenuOptions): void {
     submenu: [{ role: 'minimize' }, { role: 'zoom' }]
   }
 
-  // Why: the feature tour is product education, so it belongs under Help on
-  // every platform. macOS still keeps About/Updates in the app menu, while
-  // Windows/Linux keep those entries here because they have no app menu.
   const helpMenu: Electron.MenuItemConstructorOptions = {
     label: 'Help',
     submenu: [

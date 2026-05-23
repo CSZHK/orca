@@ -399,6 +399,7 @@ export type UISlice = {
   settingsNavigationTarget: {
     pane:
       | 'general'
+      | 'integrations'
       | 'browser'
       | 'appearance'
       | 'input'
@@ -415,6 +416,7 @@ export type UISlice = {
       | 'experimental'
       | 'servers'
       | 'mobile'
+      | 'notifications'
       | 'ssh'
     repoId: string | null
     sectionId?: string
@@ -443,9 +445,6 @@ export type UISlice = {
   closeModal: () => void
   featureTipsSeenIds: FeatureTipId[]
   markFeatureTipsSeen: (ids: FeatureTipId[]) => void
-  featureTourNudgeVisible: boolean
-  showFeatureTourNudge: () => void
-  dismissFeatureTourNudge: () => void
   trustedOrcaHooks: PersistedTrustedOrcaHooks
   markOrcaHookScriptConfirmed: (
     repoId: string,
@@ -854,13 +853,12 @@ export const createUISlice: StateCreator<AppState, [], [], UISlice> = (set, get)
 
   activeModal: 'none',
   modalData: {},
-  openModal: (modal, data = {}) =>
-    set((state) => ({
+  openModal: (modal, data = {}) => {
+    set({
       activeModal: modal,
-      modalData: data,
-      featureTourNudgeVisible:
-        modal === 'feature-wall' || modal === 'feature-tips' ? false : state.featureTourNudgeVisible
-    })),
+      modalData: data
+    })
+  },
   closeModal: () => set({ activeModal: 'none', modalData: {} }),
   featureTipsSeenIds: [],
   markFeatureTipsSeen: (ids) =>
@@ -883,15 +881,6 @@ export const createUISlice: StateCreator<AppState, [], [], UISlice> = (set, get)
       window.api.ui.set({ featureTipsSeenIds: next }).catch(console.error)
       return { featureTipsSeenIds: next }
     }),
-  featureTourNudgeVisible: false,
-  showFeatureTourNudge: () => {
-    const activeModal = get().activeModal
-    if (activeModal !== 'feature-wall' && activeModal !== 'feature-tips') {
-      set({ featureTourNudgeVisible: true })
-    }
-  },
-  dismissFeatureTourNudge: () => set({ featureTourNudgeVisible: false }),
-
   trustedOrcaHooks: {},
   markOrcaHookScriptConfirmed: (repoId, kind, contentHash) =>
     set((s) => {

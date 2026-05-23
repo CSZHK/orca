@@ -18,6 +18,10 @@ import {
   COMPUTER_USE_SKILL_NAME
 } from '@/lib/agent-feature-install-commands'
 import {
+  AGENT_SKILL_CLI_PREREQUISITE_NOTICE,
+  ensureOrcaCliAvailableForAgentSkillTerminal
+} from '@/lib/agent-skill-cli-prerequisite'
+import {
   GLOBAL_AGENT_SKILL_SOURCE_KINDS,
   useInstalledAgentSkill
 } from '@/hooks/useInstalledAgentSkills'
@@ -224,17 +228,19 @@ export function ComputerUsePane(): React.JSX.Element {
 
       <AgentSkillSetupPanel
         title="Computer Use skill"
-        detectedDescription="Detected on this machine. Agents can use Orca's computer controls."
-        missingDescription="Agents need this skill before they can use Orca's computer controls. If you already installed it, click Re-check instead of running the installer again."
+        description="Enables agents to inspect and operate local desktop apps."
         command={COMPUTER_USE_SKILL_INSTALL_COMMAND}
         terminalTitle="Computer Use setup"
         terminalAriaLabel="Computer Use skill install terminal"
         terminalWorktreeId="settings-computer-use-skill-terminal"
         installed={computerUseSkillDetected}
-        detected={computerUseSkillDetected}
         loading={computerUseSkillLoading}
         error={computerUseSkillError}
         icon={<MonitorCog className="size-5" />}
+        preInstallNotice={AGENT_SKILL_CLI_PREREQUISITE_NOTICE}
+        onBeforeOpenTerminal={async () => {
+          await ensureOrcaCliAvailableForAgentSkillTerminal()
+        }}
         onRecheck={refreshComputerUseSkill}
       />
     </div>

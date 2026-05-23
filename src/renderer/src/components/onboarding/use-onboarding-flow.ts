@@ -102,6 +102,7 @@ export function useOnboardingFlow(
   const [cloneUrl, setCloneUrl] = useState('')
   const [serverPath, setServerPath] = useState('')
   const [cloneDestination, setCloneDestination] = useState('')
+  const [tourStarted, setTourStarted] = useState(false)
   const [busyLabel, setBusyLabel] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
 
@@ -613,6 +614,7 @@ export function useOnboardingFlow(
         trackTaskSourcesSnapshot('skip_to_project_setup', durationMs, 'button')
       }
       setStepIndex(repoStepIndex)
+      setTourStarted(false)
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       setError(message)
@@ -629,6 +631,84 @@ export function useOnboardingFlow(
     trackTaskSourcesSnapshot,
     updateSettings
   ])
+
+  const startTour = useCallback(() => {
+    if (busyLabel) {
+      return
+    }
+    setError(null)
+    setTourStarted(true)
+  }, [busyLabel])
+
+  const completeTour = useCallback(async () => {
+    if (busyLabel || currentStep.id !== 'tour') {
+      return
+    }
+    setError(null)
+    const repoStepIndex = STEPS.findIndex((step) => step.id === 'repo')
+    const repoStep = STEPS[repoStepIndex]
+    if (!repoStep) {
+      return
+    }
+    const durationMs = consumeStepDurationMs()
+    setBusyLabel('Saving…')
+    try {
+      const nextState = await persistStep(repoStep.stepNumber - 1)
+      onOnboardingChange(nextState)
+      track('onboarding_step_completed', {
+        step: currentStep.stepNumber,
+        value_kind: currentStep.valueKind,
+        duration_ms: durationMs,
+        advanced_via: 'button'
+      })
+      setTourStarted(false)
+      setStepIndex(repoStepIndex)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      setError(message)
+      toast.error('Could not continue to project setup', { description: message })
+    } finally {
+      setBusyLabel(null)
+    }
+  }, [
+    busyLabel,
+    consumeStepDurationMs,
+    currentStep.id,
+    currentStep.stepNumber,
+    currentStep.valueKind,
+    onOnboardingChange
+  ])
+
+  const skipTourToRepo = useCallback(async () => {
+    if (busyLabel || currentStep.id !== 'tour') {
+      return
+    }
+    setError(null)
+    const repoStepIndex = STEPS.findIndex((step) => step.id === 'repo')
+    const repoStep = STEPS[repoStepIndex]
+    if (!repoStep) {
+      return
+    }
+    const durationMs = consumeStepDurationMs()
+    setBusyLabel('Saving…')
+    try {
+      const nextState = await persistStep(repoStep.stepNumber - 1)
+      onOnboardingChange(nextState)
+      track('onboarding_step_skipped', {
+        step: currentStep.stepNumber,
+        duration_ms: durationMs,
+        advanced_via: 'button'
+      })
+      setTourStarted(false)
+      setStepIndex(repoStepIndex)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      setError(message)
+      toast.error('Could not continue to project setup', { description: message })
+    } finally {
+      setBusyLabel(null)
+    }
+  }, [busyLabel, consumeStepDurationMs, currentStep.id, currentStep.stepNumber, onOnboardingChange])
 
   const skipAgentSetup = useCallback(async () => {
     if (busyLabel || currentStep.id !== 'agentSetup') {
@@ -688,10 +768,12 @@ export function useOnboardingFlow(
   ])
 
   const back = useCallback(() => {
+    setTourStarted(false)
     setStepIndex((idx) => Math.max(idx - 1, 0))
   }, [])
 
   const jumpToStep = useCallback((idx: number) => {
+    setTourStarted(false)
     setStepIndex(Math.min(Math.max(idx, 0), STEPS.length - 1))
   }, [])
 
@@ -715,6 +797,7 @@ export function useOnboardingFlow(
     setServerPath,
     cloneDestination,
     setCloneDestination,
+    tourStarted,
     busyLabel,
     error,
     detectedSet,
@@ -722,6 +805,9 @@ export function useOnboardingFlow(
     next,
     skipAgentSetup,
     skipToRepo,
+    startTour,
+    completeTour,
+    skipTourToRepo,
     back,
     jumpToStep,
     openFolder,

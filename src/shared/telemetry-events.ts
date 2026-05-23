@@ -168,8 +168,17 @@ export const featureWallTileIdSchema = z.enum([
 ])
 export type FeatureWallTileIdTelemetry = z.infer<typeof featureWallTileIdSchema>
 
-export const featureWallOpenSourceSchema = z.enum(['help_menu', 'popup', 'unknown'])
+export const featureWallOpenSourceSchema = z.enum(['help_menu', 'popup', 'onboarding', 'unknown'])
 export type FeatureWallOpenSourceTelemetry = z.infer<typeof featureWallOpenSourceSchema>
+
+export const featureWallWorkflowIdSchema = z.enum([
+  'tasks',
+  'workspaces',
+  'agents-orchestration',
+  'workbench',
+  'review'
+])
+export type FeatureWallWorkflowIdTelemetry = z.infer<typeof featureWallWorkflowIdSchema>
 
 // `env_var` is deliberately absent — env-var and CI paths override consent at
 // runtime only (see consent.ts); they never mutate `optedIn` and therefore
@@ -292,6 +301,26 @@ const featureWallTileFocusedSchema = z
 const featureWallTileClickedSchema = z
   .object({
     tile_id: featureWallTileIdSchema
+  })
+  .strict()
+const featureWallGroupSelectedSchema = z
+  .object({
+    group_id: featureWallWorkflowIdSchema,
+    source: featureWallOpenSourceSchema
+  })
+  .strict()
+const featureWallFeatureSelectedSchema = z
+  .object({
+    group_id: featureWallWorkflowIdSchema,
+    tile_id: featureWallTileIdSchema,
+    source: featureWallOpenSourceSchema
+  })
+  .strict()
+const featureWallDocsClickedSchema = z
+  .object({
+    group_id: featureWallWorkflowIdSchema,
+    tile_id: featureWallTileIdSchema,
+    source: featureWallOpenSourceSchema
   })
   .strict()
 
@@ -443,6 +472,7 @@ const onboardingValueKindSchema = z.enum([
   'notifications',
   'agent_setup',
   'integrations',
+  'tour',
   'repo'
 ])
 const onboardingTaskSourcesGithubStatusSchema = z.enum([
@@ -815,6 +845,9 @@ export const eventSchemas = {
   feature_wall_closed: featureWallClosedSchema,
   feature_wall_tile_focused: featureWallTileFocusedSchema,
   feature_wall_tile_clicked: featureWallTileClickedSchema,
+  feature_wall_group_selected: featureWallGroupSelectedSchema,
+  feature_wall_feature_selected: featureWallFeatureSelectedSchema,
+  feature_wall_docs_clicked: featureWallDocsClickedSchema,
 
   onboarding_started: onboardingStartedSchema,
   onboarding_step_viewed: onboardingStepViewedSchema,

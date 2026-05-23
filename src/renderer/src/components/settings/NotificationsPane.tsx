@@ -403,7 +403,7 @@ export function NotificationsPane({
   )
 }
 
-type SettingToggleProps = {
+export type SettingToggleProps = {
   label: string
   description: string
   checked: boolean
@@ -412,7 +412,7 @@ type SettingToggleProps = {
   icon?: ReactNode
 }
 
-function SettingToggle({
+export function SettingToggle({
   label,
   description,
   checked,
