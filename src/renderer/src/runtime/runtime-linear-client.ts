@@ -1,11 +1,19 @@
+/* eslint-disable max-lines -- Why: the renderer Linear client mirrors the
+   preload/RPC Linear namespace so local and remote runtime routing stays in
+   one auditable boundary. */
 import type {
   GlobalSettings,
   LinearComment,
+  LinearCollectionResult,
   LinearConnectionStatus,
+  LinearCustomViewModel,
+  LinearCustomViewSummary,
   LinearIssue,
   LinearIssueUpdate,
   LinearLabel,
   LinearMember,
+  LinearProjectDetail,
+  LinearProjectSummary,
   LinearTeam,
   LinearViewer,
   LinearWorkspaceSelection,
@@ -21,7 +29,7 @@ export type RuntimeLinearSettings =
 export type LinearIssueFilter = 'assigned' | 'created' | 'all' | 'completed'
 export type LinearConnectResult = { ok: true; viewer: LinearViewer } | { ok: false; error: string }
 export type LinearCreateIssueResult =
-  | { ok: true; id: string; identifier: string; url: string }
+  | { ok: true; id: string; identifier: string; title: string; url: string }
   | { ok: false; error: string }
 export type LinearMutationResult = { ok: true } | { ok: false; error: string }
 export type LinearCommentResult = { ok: true; id: string } | { ok: false; error: string }
@@ -143,7 +151,18 @@ export async function linearListIssues(
 
 export async function linearCreateIssue(
   settings: RuntimeLinearSettings,
-  args: { teamId: string; title: string; description?: string; workspaceId?: string }
+  args: {
+    teamId: string
+    title: string
+    description?: string
+    workspaceId?: string
+    parentIssueId?: string
+    projectId?: string | null
+    stateId?: string
+    priority?: number
+    assigneeId?: string | null
+    labelIds?: string[]
+  }
 ): Promise<LinearCreateIssueResult> {
   const target = getActiveRuntimeTarget(settings)
   return target.kind === 'environment'
@@ -151,6 +170,20 @@ export async function linearCreateIssue(
         timeoutMs: 30_000
       })
     : window.api.linear.createIssue(args)
+}
+
+export async function linearCreateSubIssue(
+  settings: RuntimeLinearSettings,
+  args: {
+    parentIssueId: string
+    teamId: string
+    title: string
+    description?: string
+    workspaceId?: string
+    projectId?: string | null
+  }
+): Promise<LinearCreateIssueResult> {
+  return linearCreateIssue(settings, args)
 }
 
 export async function linearGetIssue(
@@ -232,6 +265,126 @@ export async function linearListTeams(
         { timeoutMs: 30_000 }
       )
     : window.api.linear.listTeams(workspaceId ? { workspaceId } : undefined)
+}
+
+export async function linearListProjects(
+  settings: RuntimeLinearSettings,
+  query?: string,
+  limit?: number,
+  workspaceId?: LinearWorkspaceSelection | null
+): Promise<LinearCollectionResult<LinearProjectSummary>> {
+  const target = getActiveRuntimeTarget(settings)
+  return target.kind === 'environment'
+    ? callRuntimeRpc<LinearCollectionResult<LinearProjectSummary>>(
+        target,
+        'linear.listProjects',
+        { query, limit, workspaceId: workspaceId ?? undefined },
+        { timeoutMs: 30_000 }
+      )
+    : typeof window.api.linear.listProjects === 'function'
+      ? window.api.linear.listProjects({ query, limit, workspaceId: workspaceId ?? undefined })
+      : { items: [] }
+}
+
+export async function linearGetProject(
+  settings: RuntimeLinearSettings,
+  id: string,
+  workspaceId: string
+): Promise<LinearProjectDetail | null> {
+  const target = getActiveRuntimeTarget(settings)
+  return target.kind === 'environment'
+    ? callRuntimeRpc<LinearProjectDetail | null>(
+        target,
+        'linear.getProject',
+        { id, workspaceId },
+        { timeoutMs: 30_000 }
+      )
+    : window.api.linear.getProject({ id, workspaceId })
+}
+
+export async function linearListProjectIssues(
+  settings: RuntimeLinearSettings,
+  projectId: string,
+  limit: number | undefined,
+  workspaceId: string
+): Promise<LinearCollectionResult<LinearIssue>> {
+  const target = getActiveRuntimeTarget(settings)
+  return target.kind === 'environment'
+    ? callRuntimeRpc<LinearCollectionResult<LinearIssue>>(
+        target,
+        'linear.listProjectIssues',
+        { projectId, limit, workspaceId },
+        { timeoutMs: 30_000 }
+      )
+    : window.api.linear.listProjectIssues({ projectId, limit, workspaceId })
+}
+
+export async function linearListCustomViews(
+  settings: RuntimeLinearSettings,
+  model: LinearCustomViewModel,
+  limit?: number,
+  workspaceId?: LinearWorkspaceSelection | null
+): Promise<LinearCollectionResult<LinearCustomViewSummary>> {
+  const target = getActiveRuntimeTarget(settings)
+  return target.kind === 'environment'
+    ? callRuntimeRpc<LinearCollectionResult<LinearCustomViewSummary>>(
+        target,
+        'linear.listCustomViews',
+        { model, limit, workspaceId: workspaceId ?? undefined },
+        { timeoutMs: 30_000 }
+      )
+    : window.api.linear.listCustomViews({ model, limit, workspaceId: workspaceId ?? undefined })
+}
+
+export async function linearGetCustomView(
+  settings: RuntimeLinearSettings,
+  viewId: string,
+  model: LinearCustomViewModel,
+  workspaceId: string
+): Promise<LinearCustomViewSummary | null> {
+  const target = getActiveRuntimeTarget(settings)
+  return target.kind === 'environment'
+    ? callRuntimeRpc<LinearCustomViewSummary | null>(
+        target,
+        'linear.getCustomView',
+        { viewId, model, workspaceId },
+        { timeoutMs: 30_000 }
+      )
+    : window.api.linear.getCustomView({ viewId, model, workspaceId })
+}
+
+export async function linearListCustomViewIssues(
+  settings: RuntimeLinearSettings,
+  viewId: string,
+  limit: number | undefined,
+  workspaceId: string
+): Promise<LinearCollectionResult<LinearIssue>> {
+  const target = getActiveRuntimeTarget(settings)
+  return target.kind === 'environment'
+    ? callRuntimeRpc<LinearCollectionResult<LinearIssue>>(
+        target,
+        'linear.listCustomViewIssues',
+        { viewId, limit, workspaceId },
+        { timeoutMs: 30_000 }
+      )
+    : window.api.linear.listCustomViewIssues({ viewId, limit, workspaceId })
+}
+
+export async function linearListCustomViewProjects(
+  settings: RuntimeLinearSettings,
+  viewId: string,
+  limit: number | undefined,
+  workspaceId: string
+): Promise<LinearCollectionResult<LinearProjectSummary>> {
+  const target = getActiveRuntimeTarget(settings)
+  return target.kind === 'environment'
+    ? callRuntimeRpc<LinearCollectionResult<LinearProjectSummary>>(
+        target,
+        'linear.listCustomViewProjects',
+        { viewId, limit, workspaceId },
+        { timeoutMs: 30_000 }
+      )
+    : window.api.linear.listCustomViewProjects({ viewId, limit, workspaceId })
 }
 
 export async function linearTeamStates(

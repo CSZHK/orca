@@ -9,13 +9,15 @@ import {
   TextInput
 } from 'react-native'
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context'
-import { useLocalSearchParams, useRouter } from 'expo-router'
+import { useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router'
 import {
   Search,
   X,
   Pin,
   Bell,
+  GitBranch,
   GitPullRequest,
+  List,
   SlidersHorizontal,
   Layers,
   ChevronDown,
@@ -52,6 +54,7 @@ import { BottomDrawer } from '../../../src/components/BottomDrawer'
 import { ProtocolBlockScreen } from '../../../src/components/ProtocolBlockScreen'
 import { getCachedWorktrees } from '../../../src/cache/worktree-cache'
 import { colors, radii, spacing, typography } from '../../../src/theme/mobile-theme'
+import { useResponsiveLayout } from '../../../src/layout/responsive-layout'
 import { evaluateCompat, type CompatVerdict } from '../../../src/transport/protocol-compat'
 import {
   loadPinnedIds,
@@ -59,6 +62,11 @@ import {
   loadPreferences,
   savePreferences
 } from '../../../src/storage/preferences'
+import {
+  createInitialHostRouteActionState,
+  resolveHostRouteActionState,
+  setHostRouteNewWorktreeVisible
+} from '../../../src/host-route-action-state'
 
 // Why: locally-typed subset of the desktop's RuntimeStatus we read from
 // `status.get`. Only the version fields matter to mobile today; everything
@@ -89,9 +97,14 @@ type Worktree = {
   status?: 'working' | 'active' | 'permission' | 'done' | 'inactive'
 }
 
-type SortMode = 'smart' | 'name' | 'recent'
+type RepoSummary = {
+  displayName: string
+  badgeColor?: string
+}
+
+type SortMode = 'smart' | 'name' | 'recent' | 'repo'
 type _FilterMode = 'all' | 'active'
-type GroupMode = 'none' | 'repo' | 'prStatus'
+type GroupMode = 'none' | 'workspaceStatus' | 'repo' | 'prStatus'
 
 type FilterState = {
   activeOnly: boolean
@@ -105,11 +118,13 @@ function isErrorVerdict(v: ConnectionVerdict): boolean {
 const SORT_OPTIONS: PickerOption<SortMode>[] = [
   { value: 'smart', label: 'Smart', subtitle: 'Unread and active first' },
   { value: 'name', label: 'Name', subtitle: 'Alphabetical by name' },
-  { value: 'recent', label: 'Recent', subtitle: 'Most recent output first' }
+  { value: 'recent', label: 'Recent', subtitle: 'Most recent output first' },
+  { value: 'repo', label: 'Repo', subtitle: 'Repository, then workspace name' }
 ]
 
 const GROUP_OPTIONS: PickerOption<GroupMode>[] = [
   { value: 'none', label: 'No Grouping' },
+  { value: 'workspaceStatus', label: 'Status' },
   { value: 'repo', label: 'Repository' },
   { value: 'prStatus', label: 'PR Status' }
 ]
@@ -130,10 +145,30 @@ function isWorktreeActive(w: Worktree): boolean {
   return false
 }
 
+const WORKSPACE_STATUS_LABELS: Record<ReturnType<typeof getWorktreeStatus>, string> = {
+  permission: 'Needs Permission',
+  working: 'Working',
+  done: 'Done',
+  active: 'Active',
+  inactive: 'Inactive'
+}
+
+const WORKSPACE_STATUS_ORDER: ReturnType<typeof getWorktreeStatus>[] = [
+  'permission',
+  'working',
+  'done',
+  'active',
+  'inactive'
+]
+
 function sortWorktrees(worktrees: Worktree[], mode: SortMode): Worktree[] {
   return [...worktrees].sort((a, b) => {
     if (mode === 'name') return (a.displayName || a.repo).localeCompare(b.displayName || b.repo)
     if (mode === 'recent') return (b.lastOutputAt ?? 0) - (a.lastOutputAt ?? 0)
+    if (mode === 'repo') {
+      const repoComparison = a.repo.localeCompare(b.repo, undefined, { sensitivity: 'base' })
+      return repoComparison || (a.displayName || a.repo).localeCompare(b.displayName || b.repo)
+    }
     // 'smart' — attention-first
     if (a.unread !== b.unread) return a.unread ? -1 : 1
     const aStatus = getWorktreeStatus(a)
@@ -236,6 +271,20 @@ function buildSections(
     for (const [repo, items] of byRepo) {
       sections.push({ title: repo, data: items })
     }
+  } else if (groupMode === 'workspaceStatus') {
+    const byStatus = new Map<ReturnType<typeof getWorktreeStatus>, Worktree[]>()
+    for (const w of unpinned) {
+      const key = getWorktreeStatus(w)
+      const list = byStatus.get(key)
+      if (list) list.push(w)
+      else byStatus.set(key, [w])
+    }
+    for (const status of WORKSPACE_STATUS_ORDER) {
+      const items = byStatus.get(status)
+      if (items && items.length > 0) {
+        sections.push({ title: WORKSPACE_STATUS_LABELS[status], data: items })
+      }
+    }
   } else if (groupMode === 'prStatus') {
     const byGroup = new Map<PRGroupKey, Worktree[]>()
     for (const w of unpinned) {
@@ -259,6 +308,9 @@ export default function HostScreen() {
   const { hostId, action } = useLocalSearchParams<{ hostId: string; action?: string }>()
   const router = useRouter()
   const insets = useSafeAreaInsets()
+  // Why: cap and center the worktree list on wide/tablet canvases; on phones
+  // isWideLayout is false so the list stays edge-to-edge as before.
+  const { isWideLayout, contentMaxWidth } = useResponsiveLayout()
   const [initialCache] = useState(() =>
     hostId ? (getCachedWorktrees(hostId) as Worktree[] | null) : null
   )
@@ -272,18 +324,19 @@ export default function HostScreen() {
   const forceReconnectHost = useForceReconnect()
   const [worktrees, setWorktrees] = useState<Worktree[]>(initialCache ?? [])
   const [worktreesLoaded, setWorktreesLoaded] = useState(initialCache != null)
+  const [repoColorsByName, setRepoColorsByName] = useState<Map<string, string>>(new Map())
   const [hostName, setHostName] = useState('')
   const [error, setError] = useState('')
   const [compatVerdict, setCompatVerdict] = useState<CompatVerdict>({ kind: 'ok' })
   const [lastKnownWorktrees, setLastKnownWorktrees] = useState<Worktree[]>(initialCache ?? [])
   const [search, setSearch] = useState('')
   const [showSearch, setShowSearch] = useState(false)
-  const [sortMode, setSortMode] = useState<SortMode>('smart')
+  const [sortMode, setSortMode] = useState<SortMode>('recent')
   const [filters, setFilters] = useState<FilterState>({
     activeOnly: false,
     selectedRepos: new Set()
   })
-  const [groupMode, setGroupMode] = useState<GroupMode>('none')
+  const [groupMode, setGroupMode] = useState<GroupMode>('repo')
 
   // Modals
   const [showSortPicker, setShowSortPicker] = useState(false)
@@ -292,7 +345,9 @@ export default function HostScreen() {
   const [actionTarget, setActionTarget] = useState<Worktree | null>(null)
   const [confirmDelete, setConfirmDelete] = useState<Worktree | null>(null)
   const [confirmRemoveHost, setConfirmRemoveHost] = useState(false)
-  const [showNewWorktree, setShowNewWorktree] = useState(false)
+  const [routeActionState, setRouteActionState] = useState(() =>
+    createInitialHostRouteActionState(action)
+  )
   const [sleptIds, setSleptIds] = useState<Set<string>>(new Set())
 
   // Persisted pin state
@@ -300,9 +355,16 @@ export default function HostScreen() {
   const [_prefsLoaded, setPrefsLoaded] = useState(false)
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set())
 
-  useEffect(() => {
-    if (action === 'newWorktree') setShowNewWorktree(true)
-  }, [action])
+  const resolvedRouteActionState = resolveHostRouteActionState(routeActionState, action)
+  // Why: `action=newWorktree` is a route-derived open edge. Resolve it before
+  // commit, but don't reopen after the user closes while the same URL remains.
+  if (resolvedRouteActionState !== routeActionState) {
+    setRouteActionState(resolvedRouteActionState)
+  }
+  const showNewWorktree = resolvedRouteActionState.showNewWorktree
+  const setShowNewWorktreeVisible = useCallback((visible: boolean) => {
+    setRouteActionState((current) => setHostRouteNewWorktreeVisible(current, visible))
+  }, [])
 
   // Load persisted pins and preferences
   useEffect(() => {
@@ -337,6 +399,7 @@ export default function HostScreen() {
     setHostName('')
     setError('')
     setCompatVerdict({ kind: 'ok' })
+    setRepoColorsByName(new Map())
     // Why: re-seed from the current host's cache on every hostId change.
     // The useState initializer only runs on first mount, so if Expo Router
     // reuses this screen with a different hostId, we must reset here.
@@ -381,6 +444,23 @@ export default function HostScreen() {
         setLastKnownWorktrees(result.worktrees)
         setWorktreesLoaded(true)
 
+        void requestClient
+          .sendRequest('repo.list')
+          .then((repoResponse) => {
+            if (clientRef.current !== requestClient || hostId !== requestHostId) return
+            if (!repoResponse.ok) return
+            const repoResult = (repoResponse as RpcSuccess).result as { repos: RepoSummary[] }
+            setRepoColorsByName(
+              new Map(
+                repoResult.repos.map((repo) => [
+                  repo.displayName,
+                  repo.badgeColor || repoColor(repo.displayName)
+                ])
+              )
+            )
+          })
+          .catch(() => null)
+
         // Clear optimistic sleep overrides once the server confirms the
         // worktree is actually inactive (liveTerminalCount dropped to 0).
         setSleptIds((prev) => {
@@ -414,12 +494,6 @@ export default function HostScreen() {
       // Will retry on reconnect
     }
   }, [client, connState, hostId])
-
-  useEffect(() => {
-    if (connState === 'connected') {
-      void fetchWorktrees()
-    }
-  }, [connState, fetchWorktrees])
 
   // Why: read desktop's protocol version from status.get on every connect
   // and re-evaluate compatibility. If the desktop declares this mobile
@@ -462,13 +536,18 @@ export default function HostScreen() {
     }
   }, [connState, client])
 
-  useEffect(() => {
-    if (connState !== 'connected') return
-    const interval = setInterval(() => {
+  useFocusEffect(
+    useCallback(() => {
+      if (connState !== 'connected') return
       void fetchWorktrees()
-    }, 3000)
-    return () => clearInterval(interval)
-  }, [connState, fetchWorktrees])
+      // Why: React Navigation keeps previous stack screens mounted; only
+      // poll the host list while this route is visible.
+      const interval = setInterval(() => {
+        void fetchWorktrees()
+      }, 3000)
+      return () => clearInterval(interval)
+    }, [connState, fetchWorktrees])
+  )
 
   const updateLocalPins = useCallback(
     (worktreeId: string, pinned: boolean) => {
@@ -637,10 +716,15 @@ export default function HostScreen() {
   const uniqueRepos = useMemo(() => {
     const repos = new Map<string, string>()
     for (const w of displayWorktrees) {
-      if (!repos.has(w.repo)) repos.set(w.repo, repoColor(w.repo))
+      if (!repos.has(w.repo)) repos.set(w.repo, repoColorsByName.get(w.repo) ?? repoColor(w.repo))
     }
     return [...repos.entries()].map(([name, color]) => ({ name, color }))
-  }, [displayWorktrees])
+  }, [displayWorktrees, repoColorsByName])
+
+  const uniqueRepoColors = useMemo(
+    () => new Map(uniqueRepos.map((repo) => [repo.name, repo.color])),
+    [uniqueRepos]
+  )
 
   const toggleCollapsed = useCallback(
     (title: string) => {
@@ -751,14 +835,26 @@ export default function HostScreen() {
           <Pressable style={styles.sortButton} onPress={() => setShowSortPicker(true)}>
             <SlidersHorizontal size={14} color={colors.textSecondary} />
             <Text style={styles.sortLabel}>
-              {sortMode === 'smart' ? 'Smart' : sortMode === 'name' ? 'Name' : 'Recent'}
+              {sortMode === 'smart'
+                ? 'Smart'
+                : sortMode === 'name'
+                  ? 'Name'
+                  : sortMode === 'repo'
+                    ? 'Repo'
+                    : 'Recent'}
             </Text>
           </Pressable>
 
           <Pressable style={styles.groupButton} onPress={() => setShowGroupPicker(true)}>
             <Layers size={14} color={colors.textSecondary} />
             <Text style={styles.sortLabel}>
-              {groupMode === 'none' ? 'Group' : groupMode === 'repo' ? 'Repo' : 'PR'}
+              {groupMode === 'none'
+                ? 'Group'
+                : groupMode === 'workspaceStatus'
+                  ? 'Status'
+                  : groupMode === 'repo'
+                    ? 'Repo'
+                    : 'PR'}
             </Text>
           </Pressable>
 
@@ -776,8 +872,19 @@ export default function HostScreen() {
           </Pressable>
 
           <Pressable
+            style={styles.searchToggle}
+            onPress={() => router.push(`/h/${hostId}/tasks`)}
+            disabled={connState !== 'connected'}
+          >
+            <List
+              size={16}
+              color={connState === 'connected' ? colors.textSecondary : colors.textMuted}
+            />
+          </Pressable>
+
+          <Pressable
             style={styles.newButton}
-            onPress={() => setShowNewWorktree(true)}
+            onPress={() => setShowNewWorktreeVisible(true)}
             disabled={connState !== 'connected'}
           >
             <Plus
@@ -866,12 +973,18 @@ export default function HostScreen() {
           // Why: edge-to-edge — the list scrolls under the system nav bar
           // while reserving insets.bottom keeps the last worktree row reachable
           // above the Samsung 3-button nav / iOS home indicator.
-          contentContainerStyle={[styles.list, { paddingBottom: spacing.lg + insets.bottom }]}
+          contentContainerStyle={[
+            styles.list,
+            { paddingBottom: spacing.lg + insets.bottom },
+            isWideLayout && { maxWidth: contentMaxWidth, width: '100%', alignSelf: 'center' }
+          ]}
           renderSectionHeader={({ section }) => {
             if (!section.title) return null
             const isCollapsed = collapsedGroups.has(section.title)
             const rawSection = rawSections.find((s) => s.title === section.title)
             const count = rawSection?.data.length ?? 0
+            const repoSectionColor =
+              groupMode === 'repo' ? uniqueRepoColors.get(section.title) : null
             return (
               <Pressable
                 style={styles.sectionHeader}
@@ -885,6 +998,9 @@ export default function HostScreen() {
                 {section.icon === 'pin' && (
                   <Pin size={12} color={colors.textMuted} style={styles.sectionIcon} />
                 )}
+                {repoSectionColor ? (
+                  <View style={[styles.sectionRepoDot, { backgroundColor: repoSectionColor }]} />
+                ) : null}
                 <Text style={styles.sectionTitle}>{section.title}</Text>
                 <Text style={styles.sectionCount}>{count}</Text>
               </Pressable>
@@ -932,7 +1048,12 @@ export default function HostScreen() {
                   )}
                 </View>
                 <View style={styles.worktreeMetaRow}>
-                  <View style={[styles.repoDot, { backgroundColor: repoColor(item.repo) }]} />
+                  <View
+                    style={[
+                      styles.repoDot,
+                      { backgroundColor: uniqueRepoColors.get(item.repo) ?? repoColor(item.repo) }
+                    ]}
+                  />
                   <Text style={styles.repoName} numberOfLines={1}>
                     {item.repo}
                   </Text>
@@ -1071,6 +1192,20 @@ export default function HostScreen() {
               actionTarget
                 ? [
                     {
+                      label: 'Source Control',
+                      icon: GitBranch,
+                      onPress: () => {
+                        const params = new URLSearchParams({
+                          name: actionTarget.displayName || actionTarget.repo,
+                          origin: 'host'
+                        })
+                        router.push(
+                          `/h/${hostId}/source-control/${encodeURIComponent(actionTarget.worktreeId)}?${params.toString()}`
+                        )
+                        setActionTarget(null)
+                      }
+                    },
+                    {
                       label: 'Sleep',
                       icon: Moon,
                       onPress: () => {
@@ -1124,7 +1259,7 @@ export default function HostScreen() {
           const params = new URLSearchParams({ name: worktreeName, created: '1' })
           router.push(`/h/${hostId}/session/${encodeURIComponent(worktreeId)}?${params.toString()}`)
         }}
-        onClose={() => setShowNewWorktree(false)}
+        onClose={() => setShowNewWorktreeVisible(false)}
       />
     </SafeAreaView>
   )
@@ -1313,6 +1448,12 @@ const styles = StyleSheet.create({
     paddingBottom: spacing.xs
   },
   sectionIcon: {
+    marginRight: spacing.xs
+  },
+  sectionRepoDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
     marginRight: spacing.xs
   },
   sectionTitle: {

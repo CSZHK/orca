@@ -1,4 +1,4 @@
-import { useEffect, useMemo } from 'react'
+import { useCallback, useEffect, useMemo, useRef } from 'react'
 import type { Dispatch, RefObject, SetStateAction } from 'react'
 import type { Virtualizer } from '@tanstack/react-virtual'
 import { useAppStore } from '@/store'
@@ -20,8 +20,8 @@ type UseFileExplorerRevealParams = {
   rootCache: DirCache | undefined
   rowsByPath: Map<string, TreeNode>
   flatRows: TreeNode[]
-  loadDir: (dirPath: string, depth: number, options?: { force?: boolean }) => Promise<void>
-  setSelectedPath: Dispatch<SetStateAction<string | null>>
+  loadDir: (dirPath: string, depth: number, options?: { force?: boolean }) => Promise<boolean>
+  setSelectedPath: (path: string | null) => void
   setFlashingPath: Dispatch<SetStateAction<string | null>>
   flashTimeoutRef: RefObject<number | null>
   virtualizer: Virtualizer<HTMLDivElement, Element>
@@ -42,7 +42,29 @@ export function useFileExplorerReveal({
   setFlashingPath,
   flashTimeoutRef,
   virtualizer
-}: UseFileExplorerRevealParams): void {
+}: UseFileExplorerRevealParams): () => void {
+  const revealScrollFrameRef = useRef<number | null>(null)
+  const revealScrollTimeoutRef = useRef<number | null>(null)
+
+  const cancelRevealScroll = useCallback((): void => {
+    if (revealScrollFrameRef.current !== null) {
+      cancelAnimationFrame(revealScrollFrameRef.current)
+      revealScrollFrameRef.current = null
+    }
+    if (revealScrollTimeoutRef.current !== null) {
+      window.clearTimeout(revealScrollTimeoutRef.current)
+      revealScrollTimeoutRef.current = null
+    }
+  }, [])
+
+  const cancelRevealTimers = useCallback((): void => {
+    cancelRevealScroll()
+    if (flashTimeoutRef.current !== null) {
+      window.clearTimeout(flashTimeoutRef.current)
+      flashTimeoutRef.current = null
+    }
+  }, [cancelRevealScroll, flashTimeoutRef])
+
   const pendingRevealAncestorDirs = useMemo(() => {
     if (
       !pendingExplorerReveal ||
@@ -91,10 +113,16 @@ export function useFileExplorerReveal({
     })
 
     void (async () => {
-      await loadDir(worktreePath, -1)
+      const rootLoaded = await loadDir(worktreePath, -1)
+      if (!rootLoaded) {
+        return
+      }
 
       for (let depth = 0; depth < pendingRevealAncestorDirs.length; depth += 1) {
-        await loadDir(pendingRevealAncestorDirs[depth], depth)
+        const ancestorLoaded = await loadDir(pendingRevealAncestorDirs[depth], depth)
+        if (!ancestorLoaded) {
+          return
+        }
       }
     })()
   }, [
@@ -164,8 +192,11 @@ export function useFileExplorerReveal({
       }, 2000)
     }
 
-    requestAnimationFrame(() => {
-      window.setTimeout(() => {
+    cancelRevealScroll()
+    revealScrollFrameRef.current = requestAnimationFrame(() => {
+      revealScrollFrameRef.current = null
+      revealScrollTimeoutRef.current = window.setTimeout(() => {
+        revealScrollTimeoutRef.current = null
         const targetIndex = flatRows.findIndex((row) => row.path === revealPath)
         if (targetIndex !== -1) {
           virtualizer.scrollToIndex(targetIndex, { align: 'center' })
@@ -174,6 +205,7 @@ export function useFileExplorerReveal({
     })
   }, [
     activeWorktreeId,
+    cancelRevealScroll,
     clearPendingExplorerReveal,
     dirCache,
     expanded,
@@ -188,4 +220,6 @@ export function useFileExplorerReveal({
     virtualizer,
     worktreePath
   ])
+
+  return cancelRevealTimers
 }

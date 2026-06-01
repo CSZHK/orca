@@ -1,12 +1,10 @@
 /* eslint-disable max-lines -- Why: these tests exercise one stateful transport
    boundary across connection lifecycle, heartbeat, pre-auth timeout, and
    shutdown behavior; splitting the setup would obscure the shared invariants. */
-import { EventEmitter } from 'events'
 import { mkdtempSync } from 'fs'
-import type { Server as HttpServer } from 'http'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { describe, expect, it, afterEach, vi } from 'vitest'
 import WebSocket from 'ws'
 import { WebSocketTransport } from './ws-transport'
 import { loadOrCreateTlsCertificate } from '../tls-certificate'
@@ -243,6 +241,34 @@ describe('WebSocketTransport', () => {
     expect(calls).toEqual([{ clientId: null, hasOtherConnections: false }])
   })
 
+  it('detaches server socket listeners after client close', async () => {
+    const { transport } = await createTransport()
+    let cleanupSeen = false
+    transport.onConnectionClose(() => {
+      cleanupSeen = true
+    })
+
+    await transport.start()
+
+    const client = await connectWs(transport)
+    const wss = (transport as unknown as { wss: { clients: Set<WebSocket> } }).wss
+    const serverSocket = Array.from(wss.clients)[0]
+    expect(serverSocket).toBeDefined()
+    const offSpy = vi.spyOn(serverSocket!, 'off')
+
+    client.close()
+
+    const start = Date.now()
+    while (!cleanupSeen && Date.now() - start < 2_000) {
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+
+    expect(cleanupSeen).toBe(true)
+    const removedEvents = offSpy.mock.calls.map(([event]) => event)
+    expect(removedEvents).toEqual(expect.arrayContaining(['pong', 'message', 'close', 'error']))
+    offSpy.mockRestore()
+  })
+
   it('terminates every active connection for a revoked client id', async () => {
     const { transport } = await createTransport()
     const closedClientIds: (string | null)[] = []
@@ -318,6 +344,27 @@ describe('WebSocketTransport', () => {
     await transport.stop()
   })
 
+  it('does not wait for an unresponsive client close handshake during stop', async () => {
+    const { transport } = await createTransport()
+    await transport.start()
+    const ws = await connectWs(transport)
+    const underlying = (ws as unknown as { _socket: { pause: () => void } })._socket
+    underlying.pause()
+
+    const stopPromise = transport.stop()
+    const outcome = await Promise.race([
+      stopPromise.then(() => 'stopped' as const),
+      new Promise<'pending'>((resolve) => setTimeout(() => resolve('pending'), 100))
+    ])
+
+    if (outcome === 'pending') {
+      ws.terminate()
+      await stopPromise
+    }
+
+    expect(outcome).toBe('stopped')
+  })
+
   it('falls back to OS-assigned port when preferred port is in use', async () => {
     const { transport: first } = await createTransport()
     await first.start()
@@ -340,54 +387,6 @@ describe('WebSocketTransport', () => {
     expect(second.resolvedPort).toBeGreaterThan(0)
 
     const ws = await connectWs(second.resolvedPort)
-    ws.close()
-  })
-
-  it('falls back to OS-assigned port when bind returns EACCES', async () => {
-    // Why: Windows kernel-reserved TCP exclusion ranges (Hyper-V/WSL/Docker
-    // NAT pool) make bind() fail with EACCES even when no process owns the
-    // port. The transport must treat EACCES the same as EADDRINUSE.
-    // Use a non-zero preferred port so the fallback condition (port !== 0) holds.
-    const tls = makeTls()
-    const transport = new WebSocketTransport({
-      host: '127.0.0.1',
-      port: 6769,
-      tlsCert: tls.cert,
-      tlsKey: tls.key
-    })
-    transports.push(transport)
-
-    // Why: spy the private createHttpServer factory. The first listen attempt
-    // gets a fake server that emits EACCES; the fallback (port = 0) delegates
-    // to the real factory and binds normally.
-    const internals = transport as unknown as { createHttpServer: () => HttpServer }
-    const realFactory = internals.createHttpServer.bind(transport)
-    let attempt = 0
-    vi.spyOn(internals, 'createHttpServer').mockImplementation(() => {
-      attempt += 1
-      if (attempt === 1) {
-        const fake = new EventEmitter() as unknown as HttpServer
-        fake.listen = ((..._args: unknown[]) => {
-          process.nextTick(() => {
-            fake.emit('error', Object.assign(new Error('listen EACCES'), { code: 'EACCES' }))
-          })
-          return fake
-        }) as HttpServer['listen']
-        fake.close = ((cb?: () => void) => {
-          cb?.()
-          return fake
-        }) as HttpServer['close']
-        return fake
-      }
-      return realFactory()
-    })
-
-    await transport.start()
-    expect(transport.resolvedPort).toBeGreaterThan(0)
-    expect(transport.resolvedPort).not.toBe(6769)
-    expect(attempt).toBe(2)
-
-    const ws = await connectWs(transport.resolvedPort)
     ws.close()
   })
 

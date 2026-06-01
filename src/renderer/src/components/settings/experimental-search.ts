@@ -16,17 +16,51 @@ export const EXPERIMENTAL_PANE_SEARCH_ENTRIES: SettingsSearchEntry[] = [
     ]
   },
   {
-    title: 'Activity Page',
-    description: 'Slack-style worktree activity feed for agent completions and blocking states.',
+    title: 'Agents View',
+    description: 'Threaded left-sidebar feed for agent completions and blocking states.',
     keywords: [
       'experimental',
+      'agents',
+      'agents view',
       'activity',
       'notifications',
-      'agents',
       'worktrees',
       'timeline',
       'unread',
-      'bell'
+      'bell',
+      'sidebar'
+    ]
+  },
+  {
+    title: 'Terminal attention',
+    description: 'Persistent pane highlight for terminal bell and agent-completion events.',
+    keywords: [
+      'experimental',
+      'terminal',
+      'attention',
+      'highlight',
+      'pane',
+      'bell',
+      'notification',
+      'agent',
+      'completion',
+      'unread'
+    ]
+  },
+  {
+    title: 'Compact worktree cards',
+    description: 'Use one-line worktree cards instead of the detailed metadata row.',
+    keywords: [
+      'experimental',
+      'worktree',
+      'worktrees',
+      'workspace',
+      'workspaces',
+      'compact',
+      'sidebar',
+      'cards',
+      'branch',
+      'metadata'
     ]
   },
   {
@@ -45,6 +79,26 @@ export const EXPERIMENTAL_PANE_SEARCH_ENTRIES: SettingsSearchEntry[] = [
       'env',
       'node_modules'
     ]
+  },
+  {
+    title: 'Smart New Tab menu',
+    description:
+      'Type in the New Tab menu to open a terminal, launch an agent, visit a URL, or open/create a file.',
+    keywords: [
+      'experimental',
+      'smart',
+      'new tab',
+      'new tab menu',
+      'launcher',
+      'unified',
+      'plus',
+      'terminal',
+      'agents',
+      'claude',
+      'codex',
+      'url',
+      'file'
+    ]
   }
 ]
 
@@ -61,6 +115,9 @@ function findEntry(title: string): SettingsSearchEntry {
 
 export const EXPERIMENTAL_SEARCH_ENTRY = {
   pet: findEntry('Pet'),
-  activity: findEntry('Activity Page'),
-  symlinks: findEntry('Symlinks on worktrees')
+  activity: findEntry('Agents View'),
+  terminalAttention: findEntry('Terminal attention'),
+  compactWorktreeCards: findEntry('Compact worktree cards'),
+  symlinks: findEntry('Symlinks on worktrees'),
+  unifiedNewTabLauncher: findEntry('Smart New Tab menu')
 } as const

@@ -1,5 +1,5 @@
 import { spawn } from 'child_process'
-import { findEnvPathKey } from '../pty/env-path-key'
+import { delimiter } from 'path'
 import type { ShellHydrationFailureReason } from '../../shared/types'
 
 // Why: GUI-launched Electron on macOS/Linux inherits a minimal PATH from launchd
@@ -7,10 +7,6 @@ import type { ShellHydrationFailureReason } from '../../shared/types'
 // ~/.bashrc). Tools installed into ~/.opencode/bin, ~/.cargo/bin, pyenv/volta
 // shims, and countless other user-local locations end up invisible to our
 // `which` probe even though they work fine from Terminal (see stablyai/orca#829).
-// Windows has the same stale-PATH class after installers update the user PATH:
-// already-running Electron processes do not see those registry edits, so new
-// PTYs inherit a PATH that PowerShell launched later from Start/Terminal does
-// not.
 //
 // Rather than play whack-a-mole adding every agent's install dir to a hardcoded
 // list, we spawn the user's login shell once per app session and read the PATH
@@ -44,36 +40,18 @@ export function _resetHydrateShellPathCache(): void {
   cached = null
 }
 
-function pathDelimiter(platform = process.platform): string {
-  return platform === 'win32' ? ';' : ':'
-}
-
-function splitPathValue(value: string, platform = process.platform): string[] {
-  return value
-    .split(pathDelimiter(platform))
-    .map((s) => s.trim())
-    .filter(Boolean)
-}
-
-function normalizePathSegmentForDedup(value: string, platform = process.platform): string {
-  if (platform !== 'win32') {
-    return value
-  }
-  return value.replaceAll('/', '\\').replace(/\\+$/, '').toLowerCase()
-}
-
-function pickShell(platform = process.platform): string | null {
-  if (platform === 'win32') {
+function pickShell(): string | null {
+  if (process.platform === 'win32') {
     return null
   }
   const shell = process.env.SHELL
   if (shell && shell.length > 0) {
     return shell
   }
-  return platform === 'darwin' ? '/bin/zsh' : '/bin/bash'
+  return process.platform === 'darwin' ? '/bin/zsh' : '/bin/bash'
 }
 
-function parseCapturedPath(stdout: string, platform = process.platform): string[] {
+function parseCapturedPath(stdout: string): string[] {
   const cleaned = stdout.replace(ANSI_RE, '')
   const first = cleaned.indexOf(DELIMITER)
   if (first < 0) {
@@ -89,13 +67,17 @@ function parseCapturedPath(stdout: string, platform = process.platform): string[
   }
   // Why: Set preserves insertion order, and PATH resolution is first-match-wins,
   // so de-duping this way keeps the user's rc-file ordering intact.
-  return [...new Set(splitPathValue(value, platform))]
+  return [
+    ...new Set(
+      value
+        .split(delimiter)
+        .map((s) => s.trim())
+        .filter(Boolean)
+    )
+  ]
 }
 
-function spawnShellAndReadPath(
-  shell: string,
-  platform = process.platform
-): Promise<HydrationResult> {
+function spawnShellAndReadPath(shell: string): Promise<HydrationResult> {
   return new Promise((resolve) => {
     // Why: printing $PATH between delimiters is resilient to rc-file banners,
     // MOTDs, and `echo` invocations that shells like fish print unprompted.
@@ -104,6 +86,7 @@ function spawnShellAndReadPath(
     const command = `printf '%s' '${DELIMITER}'; printf '%s' "$PATH"; printf '%s' '${DELIMITER}'`
     let finished = false
     let stdout = ''
+    let timer: ReturnType<typeof setTimeout> | null = null
 
     const child = spawn(shell, ['-ilc', command], {
       // Why: inherit current env so the shell sees the same baseline, then let
@@ -115,11 +98,25 @@ function spawnShellAndReadPath(
       detached: false
     })
 
-    const timer = setTimeout(() => {
+    const cleanup = (): void => {
+      if (timer) {
+        clearTimeout(timer)
+        timer = null
+      }
+      child.stdout.off('data', onStdoutData)
+      child.off('error', onError)
+      child.off('close', onClose)
+    }
+    const finish = (result: HydrationResult): void => {
       if (finished) {
         return
       }
       finished = true
+      cleanup()
+      resolve(result)
+    }
+
+    timer = setTimeout(() => {
       // Why: slow rc files (corporate env setup, nvm eager init) can exceed
       // our budget. Kill the shell and fall back to process.env rather than
       // blocking the Agents pane indefinitely.
@@ -128,99 +125,29 @@ function spawnShellAndReadPath(
       } catch {
         // ignore
       }
-      resolve({ segments: [], ok: false, failureReason: 'timeout' })
+      finish({ segments: [], ok: false, failureReason: 'timeout' })
     }, SPAWN_TIMEOUT_MS)
 
-    child.stdout.on('data', (chunk: Buffer) => {
+    const onStdoutData = (chunk: Buffer): void => {
       stdout += chunk.toString('utf8')
-    })
+    }
 
-    child.on('error', () => {
-      if (finished) {
-        return
-      }
-      finished = true
-      clearTimeout(timer)
-      resolve({ segments: [], ok: false, failureReason: 'spawn_error' })
-    })
+    const onError = (): void => {
+      finish({ segments: [], ok: false, failureReason: 'spawn_error' })
+    }
 
-    child.on('close', () => {
-      if (finished) {
-        return
-      }
-      finished = true
-      clearTimeout(timer)
-      const segments = parseCapturedPath(stdout, platform)
+    const onClose = (): void => {
+      const segments = parseCapturedPath(stdout)
       if (segments.length === 0) {
-        resolve({ segments: [], ok: false, failureReason: 'empty_path' })
+        finish({ segments: [], ok: false, failureReason: 'empty_path' })
         return
       }
-      resolve({ segments, ok: true, failureReason: 'none' })
-    })
-  })
-}
+      finish({ segments, ok: true, failureReason: 'none' })
+    }
 
-function spawnWindowsAndReadPath(): Promise<HydrationResult> {
-  return new Promise((resolve) => {
-    const command = [
-      "$ErrorActionPreference = 'Stop'",
-      '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8',
-      "$machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')",
-      "$user = [Environment]::GetEnvironmentVariable('Path', 'User')",
-      "$value = (($machine, $user) | Where-Object { $_ }) -join ';'",
-      '$expanded = [Environment]::ExpandEnvironmentVariables($value)',
-      `[Console]::Write('${DELIMITER}')`,
-      '[Console]::Write($expanded)',
-      `[Console]::Write('${DELIMITER}')`
-    ].join('; ')
-    let finished = false
-    let stdout = ''
-
-    const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', command], {
-      env: process.env,
-      stdio: ['ignore', 'pipe', 'ignore'],
-      detached: false
-    })
-
-    const timer = setTimeout(() => {
-      if (finished) {
-        return
-      }
-      finished = true
-      try {
-        child.kill()
-      } catch {
-        // ignore
-      }
-      resolve({ segments: [], ok: false, failureReason: 'timeout' })
-    }, SPAWN_TIMEOUT_MS)
-
-    child.stdout.on('data', (chunk: Buffer) => {
-      stdout += chunk.toString('utf8')
-    })
-
-    child.on('error', () => {
-      if (finished) {
-        return
-      }
-      finished = true
-      clearTimeout(timer)
-      resolve({ segments: [], ok: false, failureReason: 'spawn_error' })
-    })
-
-    child.on('close', () => {
-      if (finished) {
-        return
-      }
-      finished = true
-      clearTimeout(timer)
-      const segments = parseCapturedPath(stdout, 'win32')
-      if (segments.length === 0) {
-        resolve({ segments: [], ok: false, failureReason: 'empty_path' })
-        return
-      }
-      resolve({ segments, ok: true, failureReason: 'none' })
-    })
+    child.stdout.on('data', onStdoutData)
+    child.on('error', onError)
+    child.on('close', onClose)
   })
 }
 
@@ -230,10 +157,6 @@ type HydrateOptions = {
   spawner?: (shell: string) => Promise<HydrationResult>
   /** Override for tests — defaults to `pickShell()`. */
   shellOverride?: string | null
-  /** Override for tests — defaults to `process.platform`. */
-  platform?: NodeJS.Platform
-  /** Override for tests — defaults to reading Windows User/Machine PATH. */
-  windowsReader?: () => Promise<HydrationResult>
 }
 
 /**
@@ -246,17 +169,14 @@ export function hydrateShellPath(options: HydrateOptions = {}): Promise<Hydratio
   if (cached && !options.force) {
     return cached
   }
-  const platform = options.platform ?? process.platform
-  if (platform === 'win32' && options.shellOverride === undefined) {
-    cached = (options.windowsReader ?? spawnWindowsAndReadPath)()
-    return cached
-  }
-  const shell = options.shellOverride !== undefined ? options.shellOverride : pickShell(platform)
+  const shell = options.shellOverride !== undefined ? options.shellOverride : pickShell()
   if (!shell) {
+    // Windows uses cmd/PowerShell rather than a POSIX login shell — the
+    // `patchPackagedProcessPath` static list is sufficient there.
     cached = Promise.resolve({ segments: [], ok: false, failureReason: 'no_shell' })
     return cached
   }
-  cached = options.spawner ? options.spawner(shell) : spawnShellAndReadPath(shell, platform)
+  cached = (options.spawner ?? spawnShellAndReadPath)(shell)
   return cached
 }
 
@@ -265,56 +185,21 @@ export function hydrateShellPath(options: HydrateOptions = {}): Promise<Hydratio
  * existing ordering and avoiding duplicates. Returns the segments that were
  * actually added so callers can log/telemetry on nontrivial hydrations.
  */
-export function mergePathSegments(
-  segments: string[],
-  options: { platform?: NodeJS.Platform } = {}
-): string[] {
+export function mergePathSegments(segments: string[]): string[] {
   if (segments.length === 0) {
     return []
   }
-  const platform = options.platform ?? process.platform
-  const pathKey = findEnvPathKey(process.env as Record<string, string>)
-  const current = process.env[pathKey] ?? ''
-  const currentSegments = splitPathValue(current, platform)
-  const existing = new Set(
-    currentSegments.map((entry) => normalizePathSegmentForDedup(entry, platform))
-  )
-  // Why: keep the shell/registry ordering intact (first-match-wins) while
-  // deduping Windows paths case-insensitively and slash-insensitively.
-  const added: string[] = []
-  for (const segment of segments) {
-    const key = normalizePathSegmentForDedup(segment, platform)
-    if (existing.has(key)) {
-      continue
-    }
-    existing.add(key)
-    added.push(segment)
-  }
+  const current = process.env.PATH ?? ''
+  const existing = new Set(current.split(delimiter).filter(Boolean))
+  // Why: Node 22+ Set.prototype.difference preserves insertion order of the
+  // receiver, so [...incoming.difference(existing)] gives us the new entries
+  // in the order the shell provided them (first-match-wins on PATH).
+  const added = [...new Set(segments).difference(existing)]
   if (added.length === 0) {
     return []
   }
   // Why: prepend so shell-provided entries win over the hardcoded fallbacks.
   // The user's rc files are the source of truth for `which`-style resolution.
-  process.env[pathKey] = [...added, ...currentSegments].join(pathDelimiter(platform))
+  process.env.PATH = [...added, ...current.split(delimiter).filter(Boolean)].join(delimiter)
   return added
-}
-
-/**
- * Ensure process.env.PATH reflects the user's login shell before spawning
- * an external binary. Awaits the cached hydration promise kicked off at app
- * startup — a no-op if it already resolved.
- *
- * @param isPackaged — pass `app.isPackaged` from the electron `app` module.
- *   Dev runs on macOS/Linux inherit a complete PATH from the launching
- *   terminal and skip hydration. Windows always hydrates because the
- *   registry PATH can diverge from the running process.
- */
-export async function ensureShellPathHydrated(isPackaged: boolean): Promise<void> {
-  if (!isPackaged && process.platform !== 'win32') {
-    return
-  }
-  const result = await hydrateShellPath()
-  if (result.ok) {
-    mergePathSegments(result.segments)
-  }
 }

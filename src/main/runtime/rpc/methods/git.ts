@@ -1,112 +1,27 @@
-import { z } from 'zod'
+/* eslint-disable max-lines -- Why: this table is the runtime git RPC contract; splitting it would make method coverage harder to audit. */
 import { defineMethod, type RpcMethod } from '../core'
 import type { GlobalSettings } from '../../../../shared/types'
-
-const WorktreeSelector = z.object({
-  worktree: z
-    .unknown()
-    .transform((v) => (typeof v === 'string' ? v : ''))
-    .pipe(z.string().min(1, 'Missing worktree selector'))
-})
-
-const GitStatusParams = WorktreeSelector.extend({
-  includeIgnored: z.boolean().optional()
-})
-
-const GitFilePath = WorktreeSelector.extend({
-  filePath: z
-    .unknown()
-    .transform((v) => (typeof v === 'string' ? v : ''))
-    .pipe(z.string().min(1, 'Missing file path'))
-})
-
-const GitDiff = GitFilePath.extend({
-  staged: z.boolean(),
-  compareAgainstHead: z.boolean().optional()
-})
-
-const GitBranchCompare = WorktreeSelector.extend({
-  baseRef: z
-    .unknown()
-    .transform((v) => (typeof v === 'string' ? v : ''))
-    .pipe(
-      z
-        .string()
-        .min(1, 'Missing base ref')
-        .refine((value) => !value.startsWith('-'), 'Base ref must not start with -')
-    )
-})
-
-const FullGitObjectId = z
-  .string()
-  .regex(/^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$/, 'Expected a full git object id')
-
-const GitCommitCompare = WorktreeSelector.extend({
-  commitId: z
-    .unknown()
-    .transform((v) => (typeof v === 'string' ? v : ''))
-    .pipe(FullGitObjectId)
-})
-
-const GitHistory = WorktreeSelector.extend({
-  limit: z.number().int().min(1).max(200).optional(),
-  baseRef: z.string().nullable().optional()
-})
-
-const GitBranchDiff = GitFilePath.extend({
-  compare: z.object({
-    baseRef: z.string().optional(),
-    baseOid: FullGitObjectId.optional(),
-    headOid: FullGitObjectId,
-    mergeBase: FullGitObjectId
-  }),
-  oldPath: z.string().optional()
-})
-
-const GitCommitDiff = GitFilePath.extend({
-  commitOid: FullGitObjectId,
-  parentOid: FullGitObjectId.nullable().optional(),
-  oldPath: z.string().optional()
-})
-
-const GitCommit = WorktreeSelector.extend({
-  message: z
-    .unknown()
-    .transform((v) => (typeof v === 'string' ? v : ''))
-    .pipe(z.string().min(1, 'Missing commit message'))
-})
-
-const CommitMessageAiSettings = z.object({
-  enabled: z.boolean(),
-  agentId: z.string().nullable(),
-  selectedModelByAgent: z.record(z.string(), z.string()),
-  selectedThinkingByModel: z.record(z.string(), z.string()),
-  customPrompt: z.string(),
-  customAgentCommand: z.string()
-})
-
-const GitGenerateCommitMessage = WorktreeSelector.extend({
-  commitMessageAi: CommitMessageAiSettings.optional(),
-  agentCmdOverrides: z.record(z.string(), z.string()).optional(),
-  enableGitHubAttribution: z.boolean().optional()
-})
-
-const GitBulkPaths = WorktreeSelector.extend({
-  filePaths: z.array(z.string().min(1, 'Missing file path'))
-})
-
-const GitPush = WorktreeSelector.extend({
-  publish: z.boolean().optional(),
-  pushTarget: z.unknown().optional()
-})
-
-const GitRemoteFileUrl = WorktreeSelector.extend({
-  relativePath: z
-    .unknown()
-    .transform((v) => (typeof v === 'string' ? v : ''))
-    .pipe(z.string().min(1, 'Missing relative path')),
-  line: z.number().int().min(1)
-})
+import {
+  GitBranchCompare,
+  GitBranchDiff,
+  GitBulkPaths,
+  GitCheckIgnored,
+  GitCommit,
+  GitCommitCompare,
+  GitCommitDiff,
+  GitDiscoverCommitMessageModels,
+  GitDiff,
+  GitFilePath,
+  GitGenerateCommitMessage,
+  GitGeneratePullRequestFields,
+  GitHistory,
+  GitPush,
+  GitRebaseFromBase,
+  GitRemoteFileUrl,
+  GitStatusParams,
+  GitTargetedRemote,
+  WorktreeSelector
+} from './git-params'
 
 export const GIT_METHODS: RpcMethod[] = [
   defineMethod({
@@ -116,6 +31,12 @@ export const GIT_METHODS: RpcMethod[] = [
       params.includeIgnored === undefined
         ? runtime.getRuntimeGitStatus(params.worktree)
         : runtime.getRuntimeGitStatus(params.worktree, { includeIgnored: params.includeIgnored })
+  }),
+  defineMethod({
+    name: 'git.checkIgnored',
+    params: GitCheckIgnored,
+    handler: async (params, { runtime }) =>
+      runtime.checkRuntimeGitIgnoredPaths(params.worktree, params.paths)
   }),
   defineMethod({
     name: 'git.history',
@@ -130,6 +51,16 @@ export const GIT_METHODS: RpcMethod[] = [
     name: 'git.conflictOperation',
     params: WorktreeSelector,
     handler: async (params, { runtime }) => runtime.getRuntimeGitConflictOperation(params.worktree)
+  }),
+  defineMethod({
+    name: 'git.abortMerge',
+    params: WorktreeSelector,
+    handler: async (params, { runtime }) => runtime.abortRuntimeGitMerge(params.worktree)
+  }),
+  defineMethod({
+    name: 'git.abortRebase',
+    params: WorktreeSelector,
+    handler: async (params, { runtime }) => runtime.abortRuntimeGitRebase(params.worktree)
   }),
   defineMethod({
     name: 'git.diff',
@@ -156,24 +87,52 @@ export const GIT_METHODS: RpcMethod[] = [
   }),
   defineMethod({
     name: 'git.upstreamStatus',
-    params: WorktreeSelector,
-    handler: async (params, { runtime }) => runtime.getRuntimeGitUpstreamStatus(params.worktree)
+    params: GitTargetedRemote,
+    handler: async (params, { runtime }) =>
+      params.pushTarget === undefined
+        ? runtime.getRuntimeGitUpstreamStatus(params.worktree)
+        : runtime.getRuntimeGitUpstreamStatus(params.worktree, params.pushTarget)
   }),
   defineMethod({
     name: 'git.fetch',
-    params: WorktreeSelector,
-    handler: async (params, { runtime }) => runtime.fetchRuntimeGit(params.worktree)
+    params: GitTargetedRemote,
+    handler: async (params, { runtime }) =>
+      params.pushTarget === undefined
+        ? runtime.fetchRuntimeGit(params.worktree)
+        : runtime.fetchRuntimeGit(params.worktree, params.pushTarget)
   }),
   defineMethod({
     name: 'git.pull',
-    params: WorktreeSelector,
-    handler: async (params, { runtime }) => runtime.pullRuntimeGit(params.worktree)
+    params: GitTargetedRemote,
+    handler: async (params, { runtime }) =>
+      params.pushTarget === undefined
+        ? runtime.pullRuntimeGit(params.worktree)
+        : runtime.pullRuntimeGit(params.worktree, params.pushTarget)
+  }),
+  defineMethod({
+    name: 'git.fastForward',
+    params: GitTargetedRemote,
+    handler: async (params, { runtime }) =>
+      params.pushTarget === undefined
+        ? runtime.fastForwardRuntimeGit(params.worktree)
+        : runtime.fastForwardRuntimeGit(params.worktree, params.pushTarget)
+  }),
+  defineMethod({
+    name: 'git.rebaseFromBase',
+    params: GitRebaseFromBase,
+    handler: async (params, { runtime }) =>
+      runtime.rebaseRuntimeGitFromBase(params.worktree, params.baseRef)
   }),
   defineMethod({
     name: 'git.push',
     params: GitPush,
     handler: async (params, { runtime }) =>
-      runtime.pushRuntimeGit(params.worktree, params.publish, params.pushTarget as never)
+      runtime.pushRuntimeGit(
+        params.worktree,
+        params.publish,
+        params.pushTarget,
+        params.forceWithLease
+      )
   }),
   defineMethod({
     name: 'git.branchDiff',
@@ -209,14 +168,19 @@ export const GIT_METHODS: RpcMethod[] = [
     handler: async (params, { runtime }) => {
       if (
         params.commitMessageAi === undefined &&
+        params.sourceControlAi === undefined &&
         params.agentCmdOverrides === undefined &&
-        params.enableGitHubAttribution === undefined
+        params.enableGitHubAttribution === undefined &&
+        params.commitMessageDiscoveryHostKey === undefined
       ) {
         return runtime.generateRuntimeCommitMessage(params.worktree)
       }
       return runtime.generateRuntimeCommitMessage(params.worktree, {
         ...(params.commitMessageAi !== undefined
           ? { commitMessageAi: params.commitMessageAi as GlobalSettings['commitMessageAi'] }
+          : {}),
+        ...(params.sourceControlAi !== undefined
+          ? { sourceControlAi: params.sourceControlAi as GlobalSettings['sourceControlAi'] }
           : {}),
         ...(params.agentCmdOverrides !== undefined
           ? {
@@ -225,15 +189,78 @@ export const GIT_METHODS: RpcMethod[] = [
           : {}),
         ...(params.enableGitHubAttribution !== undefined
           ? { enableGitHubAttribution: params.enableGitHubAttribution }
+          : {}),
+        ...(params.commitMessageDiscoveryHostKey !== undefined
+          ? { commitMessageDiscoveryHostKey: params.commitMessageDiscoveryHostKey }
           : {})
       })
     }
+  }),
+  defineMethod({
+    name: 'git.discoverCommitMessageModels',
+    params: GitDiscoverCommitMessageModels,
+    handler: async (params, { runtime }) =>
+      runtime.discoverRuntimeCommitMessageModels(
+        params.worktree,
+        params.agentId,
+        params.agentCmdOverrides !== undefined
+          ? {
+              agentCmdOverrides: params.agentCmdOverrides as GlobalSettings['agentCmdOverrides']
+            }
+          : {}
+      )
   }),
   defineMethod({
     name: 'git.cancelGenerateCommitMessage',
     params: WorktreeSelector,
     handler: async (params, { runtime }) =>
       runtime.cancelRuntimeGenerateCommitMessage(params.worktree)
+  }),
+  defineMethod({
+    name: 'git.generatePullRequestFields',
+    params: GitGeneratePullRequestFields,
+    handler: async (params, { runtime }) => {
+      const input = {
+        base: params.base,
+        title: params.title,
+        body: params.body,
+        draft: params.draft
+      }
+      if (
+        params.commitMessageAi === undefined &&
+        params.sourceControlAi === undefined &&
+        params.agentCmdOverrides === undefined &&
+        params.enableGitHubAttribution === undefined &&
+        params.commitMessageDiscoveryHostKey === undefined
+      ) {
+        return runtime.generateRuntimePullRequestFields(params.worktree, input)
+      }
+      return runtime.generateRuntimePullRequestFields(params.worktree, input, {
+        ...(params.commitMessageAi !== undefined
+          ? { commitMessageAi: params.commitMessageAi as GlobalSettings['commitMessageAi'] }
+          : {}),
+        ...(params.sourceControlAi !== undefined
+          ? { sourceControlAi: params.sourceControlAi as GlobalSettings['sourceControlAi'] }
+          : {}),
+        ...(params.agentCmdOverrides !== undefined
+          ? {
+              agentCmdOverrides: params.agentCmdOverrides as GlobalSettings['agentCmdOverrides']
+            }
+          : {}),
+        ...(params.enableGitHubAttribution !== undefined
+          ? { enableGitHubAttribution: params.enableGitHubAttribution }
+          : {}),
+        ...(params.commitMessageDiscoveryHostKey !== undefined
+          ? { commitMessageDiscoveryHostKey: params.commitMessageDiscoveryHostKey }
+          : {})
+      })
+    }
+  }),
+  defineMethod({
+    name: 'git.cancelGeneratePullRequestFields',
+    params: WorktreeSelector,
+    handler: async (params, { runtime }) =>
+      runtime.cancelRuntimeGeneratePullRequestFields(params.worktree)
   }),
   defineMethod({
     name: 'git.stage',

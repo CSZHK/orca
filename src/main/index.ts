@@ -19,17 +19,29 @@ import { killAllPty } from './ipc/pty'
 import { initDaemonPtyProvider, disconnectDaemon } from './daemon/daemon-init'
 import { closeAllWatchers } from './ipc/filesystem-watcher'
 import { registerCoreHandlers } from './ipc/register-core-handlers'
+import { initObservability, shutdownObservability } from './observability'
+import { startSpan } from './observability/tracer'
 import { registerMobileHandlers } from './ipc/mobile'
 import { initTelemetry, shutdownTelemetry, trackAppOpenedOnce } from './telemetry/client'
 import { runManagedHookInstallers } from './agent-hooks/install-telemetry'
+import {
+  isAgentStatusHooksEnabled,
+  MANAGED_AGENT_HOOK_INSTALLERS,
+  removeManagedAgentHooks
+} from './agent-hooks/managed-agent-hook-controls'
 import { initCohortClassifier } from './telemetry/cohort-classifier'
 import { initOnboardingCohortClassifier } from './telemetry/onboarding-cohort-classifier'
 import { resolveConsent } from './telemetry/consent'
 import { triggerStartupNotificationRegistration } from './ipc/notifications'
 import { OrcaRuntimeService } from './runtime/orca-runtime'
 import { OrcaRuntimeRpcServer } from './runtime/runtime-rpc'
+import { awaitRuntimeFileWatcherUnsubscribes } from './runtime/orca-runtime-files'
 import { clearRuntimeMetadataIfOwned } from './runtime/runtime-metadata'
-import { registerAppMenu, rebuildAppMenu } from './menu/register-app-menu'
+import {
+  getNextDefaultOnAppearanceSettingValue,
+  registerAppMenu,
+  rebuildAppMenu
+} from './menu/register-app-menu'
 import { checkForUpdatesFromMenu, isQuittingForUpdate } from './updater'
 import {
   configureDevUserDataPath,
@@ -37,29 +49,39 @@ import {
   installDevParentDisconnectQuit,
   installDevParentWatchdog,
   installUncaughtPipeErrorGuard,
-  patchPackagedProcessPath
+  patchPackagedProcessPath,
+  shouldInstallManagedHooks
 } from './startup/configure-process'
+import { maybeRedirectAppImageCliLaunch } from './startup/appimage-cli-redirect'
 import { startFirstWindowStartupServices } from './startup/first-window-startup-services'
 import { getDevInstanceIdentity } from './startup/dev-instance-identity'
 import { hydrateShellPath, mergePathSegments } from './startup/hydrate-shell-path'
-import { acquireSingleInstanceLock } from './startup/single-instance-lock'
+import {
+  acquireSingleInstanceLock,
+  logSingleInstanceLockBypass,
+  logSingleInstanceLockFailure,
+  shouldBypassSingleInstanceLock
+} from './startup/single-instance-lock'
+import { isStartupDiagnosticsEnabled, logStartupDiagnostic } from './startup/startup-diagnostics'
 import { RateLimitService } from './rate-limits/service'
+import { getInitialClaudeRateLimitTarget } from './rate-limits/claude-rate-limit-target'
+import { getInitialCodexRateLimitTarget } from './rate-limits/codex-rate-limit-target'
 import { attachMainWindowServices } from './window/attach-main-window-services'
 import { createMainWindow, loadMainWindow } from './window/createMainWindow'
 import { CodexAccountService } from './codex-accounts/service'
 import { CodexRuntimeHomeService } from './codex-accounts/runtime-home-service'
+import {
+  normalizeCodexRuntimeSelection,
+  type CodexAccountSelectionTarget
+} from './codex-accounts/runtime-selection'
+import { normalizeClaudeRuntimeSelection } from './claude-accounts/runtime-selection'
+import { codexHookService } from './codex/hook-service'
 import { ClaudeAccountService } from './claude-accounts/service'
 import { ClaudeRuntimeAuthService } from './claude-accounts/runtime-auth-service'
 import { StarNagService } from './star-nag/service'
 import { agentHookServer } from './agent-hooks/server'
+import { maybeAutoRenameBranchOnFirstWork } from './agent-hooks/first-work-branch-rename'
 import { setMigrationUnsupportedPtyListener } from './agent-hooks/migration-unsupported-pty-state'
-import { claudeHookService } from './claude/hook-service'
-import { codexHookService } from './codex/hook-service'
-import { geminiHookService } from './gemini/hook-service'
-import { cursorHookService } from './cursor/hook-service'
-import { droidHookService } from './droid/hook-service'
-import { grokHookService } from './grok/hook-service'
-import { hermesHookService } from './hermes/hook-service'
 import {
   getPtyIdForPaneKey,
   registerPaneKeyTeardownListener,
@@ -69,15 +91,28 @@ import {
 import { AgentBrowserBridge } from './browser/agent-browser-bridge'
 import { browserManager } from './browser/browser-manager'
 import { setUnreadDockBadgeCount } from './dock/unread-badge'
-import { registerFeatureWallFirstAgentTour } from './feature-wall/first-agent-tour'
 import { AutomationService } from './automations/service'
 import { AgentAwakeService } from './agent-awake-service'
 import {
   getCrashBreadcrumbSnapshot,
+  recordCoalescedCrashBreadcrumb,
   recordCrashBreadcrumb
 } from './crash-reporting/crash-breadcrumb-store'
 import { CrashReportStore } from './crash-reporting/crash-report-store'
+import {
+  shouldRecordProcessGoneCrash,
+  shouldRecoverRendererAfterProcessGone,
+  type ExpectedTeardownScope
+} from './crash-reporting/process-gone-classification'
+import { getProcessGoneDedupeKey, processGoneDedupe } from './crash-reporting/process-gone-dedupe'
+import {
+  advanceSyntheticTitleSpinnerEntries,
+  type SyntheticTitleSpinnerEntry
+} from './synthetic-title-spinner'
+import { shouldSendSyntheticTitleFrame } from './synthetic-title-visibility'
 import { isCrashReportReason } from '../shared/crash-reporting'
+import { KeybindingService } from './keybindings/keybinding-service'
+import { applyElectronProxySettings } from './network/proxy-settings'
 
 let mainWindow: BrowserWindow | null = null
 /** Whether a manual app.quit() (Cmd+Q, etc.) is in progress. Shared with the
@@ -100,12 +135,70 @@ let starNag: StarNagService | null = null
 let agentAwakeService: AgentAwakeService | null = null
 let crashReports: CrashReportStore | null = null
 let unsubscribeAgentAwakeStatusChanges: (() => void) | null = null
-let disposeFeatureWallFirstAgentTour: (() => void) | null = null
 let watcherShutdownPromise: Promise<void> | null = null
 let watcherShutdownDone = false
 let automations: AutomationService | null = null
+let keybindings: KeybindingService | null = null
+let expectedRendererReload: { webContentsId: number; until: number } | null = null
+const AGENT_STATE_CRASH_BREADCRUMB_MIN_INTERVAL_MS = 30_000
 const isServeMode = process.argv.includes('--serve')
+const appImageCliRedirect = maybeRedirectAppImageCliLaunch({
+  isPackaged: app.isPackaged,
+  resourcesPath: process.resourcesPath,
+  execPath: process.execPath
+})
+if (appImageCliRedirect.redirected) {
+  app.exit(appImageCliRedirect.status)
+}
+
+// Why: the store/runtime singletons live here in index.ts; injecting them keeps
+// the rename orchestrator free of module-level state and unit-testable.
+function maybeAutoRenameBranchOnFirstWorkFromHook(event: {
+  paneKey: string
+  tabId: string | undefined
+  worktreeId: string | undefined
+  payload: { state: string; prompt?: string; lastAssistantMessage?: string }
+  isReplay: boolean | undefined
+}): void {
+  const currentStore = store
+  const currentRuntime = runtime
+  if (!currentStore || !currentRuntime) {
+    return
+  }
+  void maybeAutoRenameBranchOnFirstWork(
+    {
+      paneKey: event.paneKey,
+      tabId: event.tabId,
+      worktreeId: event.worktreeId,
+      state: event.payload.state,
+      prompt: event.payload.prompt,
+      assistantMessage: event.payload.lastAssistantMessage,
+      isReplay: event.isReplay
+    },
+    {
+      getSettings: () => currentStore.getSettings(),
+      getRepo: (repoId) => currentStore.getRepo(repoId),
+      getAgentEnvResolvers: () => currentRuntime.getCommitMessageAgentEnvironmentResolvers(),
+      getCurrentDisplayName: (worktreeId) => currentStore.getWorktreeMeta(worktreeId)?.displayName,
+      canRenameOrcaCreatedBranch: (worktreeId) => {
+        const meta = currentStore.getWorktreeMeta(worktreeId)
+        // Why: a user/imported branch can coincidentally be named after a creature.
+        // Only worktrees Orca stamped at creation are safe to auto-rename.
+        return !!meta?.orcaCreationSource && meta.preserveBranchOnDelete !== true
+      },
+      setDisplayName: (worktreeId, displayName) => {
+        currentStore.setWorktreeMeta(worktreeId, { displayName })
+      },
+      resolveWorktreeIdForTab: (tabId) => currentStore.getWorktreeIdForTab(tabId),
+      onRenamed: (repoId) => currentRuntime.notifyBranchRenamed(repoId)
+    }
+  )
+}
+
 const devInstanceIdentity = getDevInstanceIdentity(is.dev)
+const devAgentHookEndpointNamespace = devInstanceIdentity.isDev
+  ? devInstanceIdentity.appUserModelId
+  : undefined
 
 installUncaughtPipeErrorGuard()
 // Why: propagate the Orca app version into `process.env` so PTY-env
@@ -120,10 +213,9 @@ patchPackagedProcessPath()
 // parallel for packaged runs — when it resolves, its PATH is prepended and
 // detectInstalledAgents picks up whatever the user's rc files put on PATH
 // (cargo/pyenv/volta/custom tool install dirs) without hardcoding each one.
-// Dev runs already inherit a complete PATH from the launching terminal on
-// macOS/Linux. Windows also refreshes PATH from the registry here so new
-// terminals see user-scoped CLI installs added after Orca started.
-if (app.isPackaged || process.platform === 'win32') {
+// Dev runs already inherit a complete PATH from the launching terminal, so
+// the spawn cost is only paid where it's needed.
+if (app.isPackaged && process.platform !== 'win32') {
   void hydrateShellPath().then((result) => {
     if (result.ok) {
       mergePathSegments(result.segments)
@@ -131,6 +223,20 @@ if (app.isPackaged || process.platform === 'win32') {
   })
 }
 configureDevUserDataPath(is.dev)
+// Why: CLI-shared Codex helpers cannot import Electron. Seed the resolved
+// app userData path once Electron has applied dev/e2e overrides.
+process.env.ORCA_USER_DATA_PATH ??= app.getPath('userData')
+const startupDiagnosticsEnabled = isStartupDiagnosticsEnabled()
+if (startupDiagnosticsEnabled) {
+  logStartupDiagnostic('before-single-instance-lock', {
+    version: app.getVersion(),
+    packaged: app.isPackaged,
+    platform: process.platform,
+    osRelease: os.release(),
+    userData: app.getPath('userData'),
+    e2eUserData: Boolean(process.env.ORCA_E2E_USER_DATA_DIR)
+  })
+}
 
 function focusExistingWindow(): void {
   // Why: the second-instance event fires on the *primary* Electron process
@@ -156,6 +262,44 @@ function focusExistingWindow(): void {
   // openMainWindow() from whenReady(). No action needed here.
 }
 
+function markExpectedRendererReload(webContentsId: number, durationMs = 10_000): void {
+  expectedRendererReload = { webContentsId, until: Date.now() + durationMs }
+}
+
+function clearExpectedRendererReload(webContentsId?: number): void {
+  if (webContentsId === undefined || expectedRendererReload?.webContentsId === webContentsId) {
+    expectedRendererReload = null
+  }
+}
+
+function getExpectedTeardownScope(webContentsId?: number): ExpectedTeardownScope {
+  if (isQuitting || isQuittingForUpdate()) {
+    return 'app-shutdown'
+  }
+  if (!expectedRendererReload) {
+    return 'none'
+  }
+  if (Date.now() > expectedRendererReload.until) {
+    expectedRendererReload = null
+    return 'none'
+  }
+  return webContentsId !== undefined && expectedRendererReload.webContentsId === webContentsId
+    ? 'renderer-reload'
+    : 'none'
+}
+
+function recordAgentStateCrashBreadcrumb(agentType: string, state: string): void {
+  // Why: hook pings can arrive many times per second while an agent works.
+  // Coalescing preserves crash-report room for renderer errors and memory
+  // samples instead of filling all 30 breadcrumbs with identical state pings.
+  recordCoalescedCrashBreadcrumb({
+    name: 'agent_state_changed',
+    data: { agentType, state },
+    coalesceKey: `agent:${agentType}:${state}`,
+    minIntervalMs: AGENT_STATE_CRASH_BREADCRUMB_MIN_INTERVAL_MS
+  })
+}
+
 // Why: the lock must be acquired AFTER configureDevUserDataPath — Electron
 // derives the lock identity from the `userData` path, so this placement lets
 // dev (`orca-dev`) and packaged (`orca`) runs lock in separate namespaces
@@ -163,23 +307,37 @@ function focusExistingWindow(): void {
 //
 // Why skip in dev: engineers routinely run `pnpm dev` in parallel from
 // multiple worktrees while shipping features, and the lock makes the second
-// `pnpm dev` exit silently. In dev we accept that `orca-runtime.json` and
-// `endpoint.env` may race (the bundled `orca-dev` CLI / agent hooks route
-// to whichever instance wrote last). The dev build is not used for real
-// agent work, so that routing ambiguity is acceptable. Packaged Orca keeps
-// the lock to protect against the corruption documented in PR #1326 /
-// issue #1312.
+// `pnpm dev` exit silently. In dev we accept that `orca-runtime.json` may race
+// (the bundled `orca-dev` CLI routes to whichever instance wrote last). Agent
+// hook endpoint files are namespaced per dev instance when the hook server
+// starts below. Packaged Orca keeps the lock to protect against the corruption
+// documented in PR #1326 / issue #1312.
+const bypassSingleInstanceLock = shouldBypassSingleInstanceLock({
+  isDev: is.dev,
+  isServeMode
+})
+if (bypassSingleInstanceLock) {
+  // Why: this is an explicit diagnostic escape hatch for macOS builds where
+  // Electron reports a false lock loss before any normal app logs exist.
+  logSingleInstanceLockBypass()
+}
 const hasSingleInstanceLock =
-  is.dev && !isServeMode ? true : acquireSingleInstanceLock(app, focusExistingWindow)
+  is.dev && !isServeMode
+    ? true
+    : bypassSingleInstanceLock
+      ? true
+      : acquireSingleInstanceLock(app, focusExistingWindow)
+if (startupDiagnosticsEnabled) {
+  logStartupDiagnostic('single-instance-lock-result', {
+    acquired: hasSingleInstanceLock,
+    bypassed: bypassSingleInstanceLock,
+    skippedForDev: is.dev && !isServeMode
+  })
+}
 if (!hasSingleInstanceLock) {
-  if (is.dev) {
-    // Why: packaged runs have no attached console, but dev runs do. Emit a
-    // single line so a `pnpm dev` operator does not mistake a silent exit
-    // for a broken launcher.
-    console.log(
-      '[single-instance] Another Orca instance is already running against this userData path — focusing existing window.'
-    )
-  }
+  // Why: if Electron returns a false negative here, packaged macOS launches
+  // otherwise look like silent crashes. `open --stderr` can capture this line.
+  logSingleInstanceLockFailure()
   app.quit()
 }
 
@@ -211,6 +369,39 @@ if (hasSingleInstanceLock) {
     platform: process.platform
   })
   enableMainProcessGpuFeatures()
+}
+
+function prepareCodexRuntimeHomeForLaunch(target?: CodexAccountSelectionTarget): string | null {
+  const runtimeHomePath = codexRuntimeHome!.prepareForCodexLaunch(target)
+  const hooksEnabled = isAgentStatusHooksEnabled(store?.getSettings())
+  try {
+    // Why: launch prep is reachable after startup via PTY/runtime paths; honor
+    // the persisted off switch so those launches cannot reinstall removed hooks.
+    const status = hooksEnabled
+      ? codexHookService.install()
+      : codexHookService.refreshRuntimeUserHooks()
+    if (status.state === 'error') {
+      console.warn(
+        `[codex-hook-service] failed to ${
+          hooksEnabled ? 'refresh' : 'refresh user'
+        } runtime hooks before launch`,
+        status.detail
+      )
+    }
+  } catch (error) {
+    // Why: hook install/removal is best-effort launch prep. A malformed hooks file
+    // should not block the Codex process from starting with its prepared auth.
+    console.warn(
+      `[codex-hook-service] failed to ${
+        hooksEnabled ? 'refresh' : 'refresh user'
+      } runtime hooks before launch`,
+      error
+    )
+  }
+  if (target?.runtime !== 'wsl') {
+    return codexRuntimeHome!.refreshCurrentHostLaunchHome() ?? runtimeHomePath
+  }
+  return runtimeHomePath
 }
 
 function openMainWindow(): BrowserWindow {
@@ -252,6 +443,9 @@ function openMainWindow(): BrowserWindow {
       'Claude runtime auth service must be initialized before opening the main window'
     )
   }
+  if (!keybindings) {
+    throw new Error('Keybinding service must be initialized before opening the main window')
+  }
 
   // Why: Chromium's BrowserWindow constructor resets the userData DACL to a
   // Protected DACL. Grant explicit Full Control ACEs on all existing children
@@ -270,14 +464,42 @@ function openMainWindow(): BrowserWindow {
     getIsQuitting: () => isQuitting,
     onQuitAborted: () => {
       isQuitting = false
+      clearExpectedRendererReload()
     },
-    onRendererProcessGone: (details) => {
-      recordProcessGoneCrash('renderer', 'renderer', details.reason, details.exitCode ?? null, {
-        processType: 'renderer'
-      })
+    onRendererProcessGone: (details, webContentsId) => {
+      recordProcessGoneCrash(
+        'renderer',
+        'renderer',
+        details.reason,
+        details.exitCode ?? null,
+        {
+          processType: 'renderer'
+        },
+        webContentsId
+      )
     },
+    shouldRecordRendererCrash: (details, webContentsId) =>
+      shouldRecordProcessGoneCrash({
+        source: 'renderer',
+        processType: 'renderer',
+        reason: details.reason,
+        exitCode: details.exitCode ?? null,
+        expectedTeardown: getExpectedTeardownScope(webContentsId)
+      }),
+    shouldRecoverRenderer: (details, webContentsId) =>
+      shouldRecoverRendererAfterProcessGone({
+        reason: details.reason,
+        expectedTeardown: getExpectedTeardownScope(webContentsId)
+      }),
     deferLoad: true,
-    title: devInstanceIdentity.name
+    title: devInstanceIdentity.name,
+    getKeybindings: () => keybindings?.getOverrides(),
+    onBeforeReload: ({ ignoreCache, webContentsId }) => {
+      if (mainWindow?.webContents.id === webContentsId) {
+        markExpectedRendererReload(webContentsId)
+      }
+      recordCrashBreadcrumb('manual_reload_requested', { ignoreCache })
+    }
   })
   recordCrashBreadcrumb('main_window_created')
 
@@ -285,7 +507,9 @@ function openMainWindow(): BrowserWindow {
   // `app_opened` to the first main-window load. Existing users in the
   // pending-banner cohort resolve through telemetry/client.ts; this load
   // path only fires once consent is already enabled.
+  const rendererWebContentsId = window.webContents.id
   const onFirstWindowLoad = (): void => {
+    clearExpectedRendererReload(rendererWebContentsId)
     recordCrashBreadcrumb('main_window_loaded')
     if (!store) {
       return
@@ -308,17 +532,20 @@ function openMainWindow(): BrowserWindow {
     codexAccounts,
     claudeAccounts,
     rateLimits,
-    window.webContents.id,
+    rendererWebContentsId,
     automations,
     {
-      prepareForCodexLaunch: () =>
-        store!.getSettings().activeCodexManagedAccountId
-          ? codexRuntimeHome!.prepareForCodexLaunch()
-          : null,
+      prepareForCodexLaunch: prepareCodexRuntimeHomeForLaunch,
       prepareForClaudeLaunch: () => claudeRuntimeAuth!.prepareForClaudeLaunch()
     },
     agentAwakeService ?? undefined,
-    crashReports ?? undefined
+    crashReports ?? undefined,
+    keybindings,
+    {
+      onBeforeRelaunch: () => {
+        isQuitting = true
+      }
+    }
   )
   automations.setWebContents(window.webContents)
   automations.start()
@@ -326,11 +553,16 @@ function openMainWindow(): BrowserWindow {
     window,
     store,
     runtime,
-    () =>
-      store!.getSettings().activeCodexManagedAccountId
-        ? codexRuntimeHome!.prepareForCodexLaunch()
-        : null,
-    () => claudeRuntimeAuth!.prepareForClaudeLaunch()
+    prepareCodexRuntimeHomeForLaunch,
+    (target) => claudeRuntimeAuth!.prepareForClaudeLaunch(target),
+    {
+      onBeforeRendererReload: ({ ignoreCache, webContentsId }) => {
+        if (window.webContents.id === webContentsId) {
+          markExpectedRendererReload(webContentsId)
+        }
+        recordCrashBreadcrumb('renderer_reload_requested', { ignoreCache })
+      }
+    }
   )
   rateLimits.attach(window)
   rateLimits.start()
@@ -338,6 +570,7 @@ function openMainWindow(): BrowserWindow {
     if (mainWindow === window) {
       mainWindow = null
     }
+    clearExpectedRendererReload(rendererWebContentsId)
     automations?.setWebContents(null)
     // Why: detach the agent hook listener on window close so the server
     // never fires into a destroyed webContents during the gap before
@@ -346,21 +579,33 @@ function openMainWindow(): BrowserWindow {
     // window recreations instead of stacking on top of stale listeners.
     agentHookServer.setListener(null)
     setMigrationUnsupportedPtyListener(null)
-    // Why: any running synthesized-title spinner intervals would fire into a
-    // destroyed webContents; stop them all here instead of deferring to
-    // per-pane teardown, which may never run for restored-but-never-torn-down
-    // panes when the window goes away. stopSyntheticTitleSpinner deletes only
-    // the current entry, which the Map iterator handles safely.
-    for (const paneKey of syntheticTitleSpinnerByPaneKey.keys()) {
-      stopSyntheticTitleSpinner(paneKey)
-    }
+    // Why: any running synthesized-title spinner timer would fire into a
+    // destroyed webContents; stop it here instead of deferring to per-pane
+    // teardown, which may never run for restored-but-never-torn-down panes
+    // when the window goes away.
+    stopAllSyntheticTitleSpinners()
   })
   mainWindow = window
+  window.on('show', resumeSyntheticTitleSpinnerTimer)
+  window.on('restore', resumeSyntheticTitleSpinnerTimer)
+  window.on('hide', stopSyntheticTitleSpinnerTimer)
+  window.on('minimize', stopSyntheticTitleSpinnerTimer)
   agentHookServer.setListener(
-    ({ paneKey, tabId, worktreeId, connectionId, payload, receivedAt, stateStartedAt }) => {
+    ({
+      paneKey,
+      tabId,
+      worktreeId,
+      connectionId,
+      payload,
+      receivedAt,
+      stateStartedAt,
+      isReplay
+    }) => {
       if (mainWindow?.isDestroyed()) {
         return
       }
+      maybeAutoRenameBranchOnFirstWorkFromHook({ paneKey, tabId, worktreeId, payload, isReplay })
+      const orchestration = runtime?.getAgentStatusOrchestrationContextForPaneKey(paneKey)
       mainWindow?.webContents.send('agentStatus:set', {
         ...payload,
         paneKey,
@@ -368,12 +613,10 @@ function openMainWindow(): BrowserWindow {
         worktreeId,
         connectionId,
         receivedAt,
-        stateStartedAt
+        stateStartedAt,
+        ...(orchestration ? { orchestration } : {})
       })
-      recordCrashBreadcrumb('agent_state_changed', {
-        agentType: payload.agentType ?? 'unknown',
-        state: payload.state
-      })
+      recordAgentStateCrashBreadcrumb(payload.agentType ?? 'unknown', payload.state)
       // Why: cursor-agent's OSC title stays "Cursor Agent" for the whole turn,
       // and opencode's stays bare "OpenCode" — neither carries a working/idle
       // signal the title heuristic can read. Synthesize an OSC title update
@@ -416,24 +659,58 @@ function sendOpenCrashReport(targetWindow?: BrowserWindow | null): void {
   webContents?.send('ui:openCrashReport')
 }
 
-const recentCrashKeys = new Map<string, number>()
-
 function recordProcessGoneCrash(
   source: 'renderer' | 'child',
   processType: string,
   reason: string,
   exitCode: number | null,
-  details: Record<string, unknown>
+  details: Record<string, unknown>,
+  webContentsId?: number
 ): void {
   if (!crashReports || !isCrashReportReason(reason)) {
     return
   }
-  const key = `${processType}:${reason}:${exitCode ?? 'null'}`
-  const now = Date.now()
-  if (now - (recentCrashKeys.get(key) ?? 0) < 2_000) {
+  if (
+    !shouldRecordProcessGoneCrash({
+      source,
+      processType,
+      serviceName: typeof details.serviceName === 'string' ? details.serviceName : undefined,
+      reason,
+      exitCode,
+      expectedTeardown: getExpectedTeardownScope(webContentsId)
+    })
+  ) {
+    recordCrashBreadcrumb('process_gone_suppressed', {
+      source,
+      processType,
+      reason,
+      exitCode
+    })
     return
   }
-  recentCrashKeys.set(key, now)
+  const key = getProcessGoneDedupeKey(processType, reason, exitCode)
+  if (!processGoneDedupe.shouldRecord(key)) {
+    return
+  }
+  const span = startSpan('electron.process_gone', {
+    attributes: {
+      'crash.source': source,
+      'crash.process_type': processType,
+      'crash.reason': reason,
+      ...(exitCode !== null ? { 'crash.exit_code': exitCode } : {}),
+      'app.version': app.getVersion(),
+      platform: process.platform,
+      osRelease: os.release(),
+      arch: process.arch,
+      electronVersion: process.versions.electron,
+      chromeVersion: process.versions.chrome,
+      details,
+      breadcrumbs: getCrashBreadcrumbSnapshot()
+    }
+  })
+  // Why: renderer/child crashes belong in the local trace lane so the
+  // diagnostic bundle has the same process-gone signal as the startup prompt.
+  span.fail(`${source} process gone: ${processType} ${reason} (${exitCode ?? 'unknown'})`)
   void crashReports
     .record({
       source,
@@ -522,8 +799,9 @@ const SYNTHETIC_TITLE_PROFILES: Record<string, SyntheticTitleProfile> = {
 
 const syntheticTitleSpinnerByPaneKey = new Map<
   string,
-  { timer: ReturnType<typeof setInterval>; frame: number; profile: SyntheticTitleProfile }
+  SyntheticTitleSpinnerEntry<SyntheticTitleProfile>
 >()
+let syntheticTitleSpinnerTimer: ReturnType<typeof setInterval> | null = null
 
 type ServeOptions = {
   json: boolean
@@ -636,27 +914,105 @@ function installServeSignalHandlers(): void {
   process.once('SIGTERM', quit)
 }
 
-// Why: on PTY teardown the paneKey→ptyId mapping is dropped, so the spinner
-// interval would keep firing but sendSyntheticTitle would no-op forever.
-// Stop the interval explicitly so the process doesn't carry a timer per dead
-// pane.
+// Why: on PTY teardown the paneKey mapping is dropped, so the spinner tick
+// would keep firing but sendSyntheticTitle would no-op forever. Drop the
+// entry explicitly so the shared timer shuts down once no panes are active.
 registerPaneKeyTeardownListener((paneKey) => {
   stopSyntheticTitleSpinner(paneKey)
 })
 
-function sendSyntheticTitle(ptyId: string, data: string): void {
+function sendSyntheticTitle(ptyId: string, data: string, options: { force?: boolean } = {}): void {
   if (!mainWindow || mainWindow.isDestroyed()) {
+    return
+  }
+  // Why: repeated working-spinner frames are decorative and can arrive every
+  // 80ms per agent. Final/permission frames are forced because they drive BEL.
+  if (
+    !shouldSendSyntheticTitleFrame({
+      force: options.force === true,
+      windowVisible: isSyntheticTitleWindowVisible()
+    })
+  ) {
     return
   }
   mainWindow.webContents.send('pty:data', { id: ptyId, data })
 }
 
+function isSyntheticTitleWindowVisible(): boolean {
+  return (
+    mainWindow !== null &&
+    !mainWindow.isDestroyed() &&
+    mainWindow.isVisible() &&
+    !mainWindow.isMinimized()
+  )
+}
+
+function canSendDecorativeSyntheticTitle(): boolean {
+  return shouldSendSyntheticTitleFrame({
+    force: false,
+    windowVisible: isSyntheticTitleWindowVisible()
+  })
+}
+
 function stopSyntheticTitleSpinner(paneKey: string): void {
-  const entry = syntheticTitleSpinnerByPaneKey.get(paneKey)
-  if (entry) {
-    clearInterval(entry.timer)
-    syntheticTitleSpinnerByPaneKey.delete(paneKey)
+  if (syntheticTitleSpinnerByPaneKey.delete(paneKey)) {
+    stopSyntheticTitleSpinnerTimerIfIdle()
   }
+}
+
+function stopAllSyntheticTitleSpinners(): void {
+  syntheticTitleSpinnerByPaneKey.clear()
+  stopSyntheticTitleSpinnerTimer()
+}
+
+function stopSyntheticTitleSpinnerTimer(): void {
+  if (!syntheticTitleSpinnerTimer) {
+    return
+  }
+  clearInterval(syntheticTitleSpinnerTimer)
+  syntheticTitleSpinnerTimer = null
+}
+
+function stopSyntheticTitleSpinnerTimerIfIdle(): void {
+  if (syntheticTitleSpinnerByPaneKey.size === 0) {
+    stopSyntheticTitleSpinnerTimer()
+  }
+}
+
+function tickSyntheticTitleSpinners(): void {
+  if (!canSendDecorativeSyntheticTitle()) {
+    stopSyntheticTitleSpinnerTimer()
+    return
+  }
+  const ticks = advanceSyntheticTitleSpinnerEntries({
+    entries: syntheticTitleSpinnerByPaneKey,
+    frameCount: SPINNER_FRAMES.length,
+    getPtyIdForPaneKey
+  })
+  for (const tick of ticks) {
+    sendSyntheticTitle(
+      tick.ptyId,
+      `\x1b]0;${SPINNER_FRAMES[tick.frame]} ${tick.profile.workingLabel}\x07`
+    )
+  }
+  stopSyntheticTitleSpinnerTimerIfIdle()
+}
+
+function ensureSyntheticTitleSpinnerTimer(): void {
+  if (
+    syntheticTitleSpinnerTimer ||
+    syntheticTitleSpinnerByPaneKey.size === 0 ||
+    !canSendDecorativeSyntheticTitle()
+  ) {
+    return
+  }
+  // Why: a single process timer covers all synthesized title spinners; per-pane
+  // intervals multiplied idle wakeups when several retained agents were working.
+  syntheticTitleSpinnerTimer = setInterval(tickSyntheticTitleSpinners, SPINNER_INTERVAL_MS)
+}
+
+function resumeSyntheticTitleSpinnerTimer(): void {
+  ensureSyntheticTitleSpinnerTimer()
 }
 
 function driveSyntheticTitleFromHook(
@@ -682,23 +1038,8 @@ function driveSyntheticTitleFromHook(
       existing.profile = profile
       return
     }
-    const timer = setInterval(() => {
-      const ptyIdNow = getPtyIdForPaneKey(paneKey)
-      if (!ptyIdNow) {
-        stopSyntheticTitleSpinner(paneKey)
-        return
-      }
-      const cur = syntheticTitleSpinnerByPaneKey.get(paneKey)
-      if (!cur) {
-        return
-      }
-      cur.frame = (cur.frame + 1) % SPINNER_FRAMES.length
-      sendSyntheticTitle(
-        ptyIdNow,
-        `\x1b]0;${SPINNER_FRAMES[cur.frame]} ${cur.profile.workingLabel}\x07`
-      )
-    }, SPINNER_INTERVAL_MS)
-    syntheticTitleSpinnerByPaneKey.set(paneKey, { timer, frame, profile })
+    syntheticTitleSpinnerByPaneKey.set(paneKey, { frame, profile })
+    ensureSyntheticTitleSpinnerTimer()
     return
   }
   // Why: leaving the spinner running after a `blocked`/`waiting`/`done` event
@@ -707,14 +1048,16 @@ function driveSyntheticTitleFromHook(
   // decorated "<Agent> ready" label rather than the bare native title — which
   // for cursor the detector deliberately treats as a no-op so cursor's own
   // per-turn re-emissions cannot clobber our synthesized state. The
-  // done/permission frames also carry a trailing BEL (0x07 outside of any OSC
-  // sequence) so the tab-level unread badge + notification dispatch in
-  // pty-connection lights up — those key off BEL, not the working→idle title
-  // transition.
+  // Permission frames also carry a trailing BEL (0x07 outside of any OSC
+  // sequence) so user-input-required states light up immediately. Done frames
+  // intentionally avoid the extra BEL: hook/status completion notifications
+  // own final-task attention and can cancel milestone noise during loops.
   stopSyntheticTitleSpinner(paneKey)
-  const label =
-    state === 'blocked' || state === 'waiting' ? profile.permissionLabel : profile.idleLabel
-  sendSyntheticTitle(ptyId, `\x1b]0;${label}\x07\x07`)
+  const needsUserInput = state === 'blocked' || state === 'waiting'
+  const label = needsUserInput ? profile.permissionLabel : profile.idleLabel
+  sendSyntheticTitle(ptyId, `\x1b]0;${label}\x07${needsUserInput ? '\x07' : ''}`, {
+    force: true
+  })
 }
 
 app.whenReady().then(async () => {
@@ -727,6 +1070,13 @@ app.whenReady().then(async () => {
   }
 
   store = new Store()
+  try {
+    // Why: Dock/Launchpad launches do not inherit shell proxy env vars, so the
+    // persisted proxy must be applied before any app-owned network fetchers run.
+    await applyElectronProxySettings(store.getSettings())
+  } catch {
+    console.warn('[proxy] Failed to apply network proxy settings')
+  }
   agentAwakeService = new AgentAwakeService()
   agentAwakeService.setEnabled(store.getSettings().keepComputerAwakeWhileAgentsRun)
   // Why: disk-hydrated status rows are UI continuity only. The service starts
@@ -743,6 +1093,13 @@ app.whenReady().then(async () => {
   // the Store reference, seeds common props, and resets per-session burst
   // caps. Actual transport initialization is still gated by both flags.
   initTelemetry(store)
+  // Why: the error-tracking lane (telemetry-error-tracking.md) is its own
+  // composition root — independent of product telemetry — and must
+  // initialize before any IPC handler / runtime span is created so the
+  // tracer's active sink is populated at the moment the first span fires.
+  // Honors DO_NOT_TRACK / ORCA_TELEMETRY_DISABLED / ORCA_DIAGNOSTICS_DISABLED
+  // / CI internally; those gates do not need to be re-checked here.
+  initObservability()
   // Why: cohort-classifier reads the repo count synchronously at every emit
   // for cohort-extended events. The Store has been sync-loaded above, and
   // this init runs before any IPC handler is registered and before any
@@ -760,22 +1117,51 @@ app.whenReady().then(async () => {
   codexAccounts = new CodexAccountService(store, rateLimits, codexRuntimeHome)
   claudeRuntimeAuth = new ClaudeRuntimeAuthService(store)
   claudeAccounts = new ClaudeAccountService(store, rateLimits, claudeRuntimeAuth)
-  rateLimits.setCodexHomePathResolver(() => codexRuntimeHome!.prepareForRateLimitFetch())
-  rateLimits.setClaudeAuthPreparationResolver(() => claudeRuntimeAuth!.prepareForRateLimitFetch())
+  rateLimits.setCodexHomePathResolver((target) =>
+    codexRuntimeHome!.prepareForRateLimitFetch(target)
+  )
+  rateLimits.setCodexFetchTarget(getInitialCodexRateLimitTarget(store.getSettings()))
+  rateLimits.setClaudeFetchTarget(getInitialClaudeRateLimitTarget(store.getSettings()))
+  rateLimits.setClaudeAuthPreparationResolver((target) =>
+    claudeRuntimeAuth!.prepareForRateLimitFetch(target)
+  )
   rateLimits.setSettingsResolver(() => store!.getSettings())
+  keybindings = new KeybindingService({
+    homePath: app.getPath('home'),
+    getLegacyOverrides: () => store!.getSettings().keybindings
+  })
+  browserManager.setSettingsResolver(() => ({ keybindings: keybindings?.getOverrides() }))
   rateLimits.setInactiveClaudeAccountsResolver(() => {
     const settings = store!.getSettings()
+    const activeIds = new Set(
+      [
+        normalizeClaudeRuntimeSelection(settings).host,
+        ...Object.values(normalizeClaudeRuntimeSelection(settings).wsl)
+      ].filter(Boolean)
+    )
     return settings.claudeManagedAccounts
-      .filter((account) => account.id !== settings.activeClaudeManagedAccountId)
-      .map((account) => ({ id: account.id, managedAuthPath: account.managedAuthPath }))
+      .filter((account) => !activeIds.has(account.id))
+      .map((account) => ({
+        id: account.id,
+        managedAuthPath: account.managedAuthPath,
+        managedAuthRuntime: account.managedAuthRuntime,
+        wslDistro: account.wslDistro,
+        wslLinuxAuthPath: account.wslLinuxAuthPath
+      }))
   })
   rateLimits.setInactiveCodexAccountsResolver(() => {
     const settings = store!.getSettings()
+    const activeIds = new Set(
+      [
+        normalizeCodexRuntimeSelection(settings).host,
+        ...Object.values(normalizeCodexRuntimeSelection(settings).wsl)
+      ].filter(Boolean)
+    )
     return settings.codexManagedAccounts
-      .filter((account) => account.id !== settings.activeCodexManagedAccountId)
+      .filter((account) => !activeIds.has(account.id))
       .map((account) => ({ id: account.id, managedHomePath: account.managedHomePath }))
   })
-  runtime = new OrcaRuntimeService(store, stats, {
+  const runtimeService = new OrcaRuntimeService(store, stats, {
     // Why: resolve the PTY provider lazily. initDaemonPtyProvider() runs later
     // inside attachMainWindowServices and calls setLocalPtyProvider(routedAdapter)
     // to swap the in-process provider for the daemon-routed one. Capturing the
@@ -783,38 +1169,35 @@ app.whenReady().then(async () => {
     // and defeat the teardown helper's prefix sweep (design §4.3 wire-up).
     getLocalProvider: () => getLocalPtyProvider()
   })
+  runtime = runtimeService
   automations = new AutomationService(store, { claudeUsage, codexUsage })
-  runtime.setAccountServices({ claudeAccounts, codexAccounts, rateLimits })
-  runtime.setCommitMessageAgentEnvironmentResolvers({
-    prepareForCodexLaunch: () =>
-      store!.getSettings().activeCodexManagedAccountId
-        ? codexRuntimeHome!.prepareForCodexLaunch()
-        : null,
+  runtimeService.setAutomationService(automations)
+  runtimeService.setAccountServices({ claudeAccounts, codexAccounts, rateLimits })
+  runtimeService.setCommitMessageAgentEnvironmentResolvers({
+    // Why: local Codex hooks and auth now live in Orca's managed runtime home
+    // even for the system-default path, so every Orca-launched Codex process
+    // must resolve CODEX_HOME through the runtime-home service.
+    prepareForCodexLaunch: prepareCodexRuntimeHomeForLaunch,
     prepareForClaudeLaunch: () => claudeRuntimeAuth!.prepareForClaudeLaunch()
-  })
-  disposeFeatureWallFirstAgentTour = registerFeatureWallFirstAgentTour({
-    stats,
-    getWindow: () => mainWindow
   })
   starNag = new StarNagService(store, stats)
   starNag.start()
   starNag.registerIpcHandlers()
-  runtime.setAgentBrowserBridge(new AgentBrowserBridge(browserManager))
+  runtimeService.setAgentBrowserBridge(
+    new AgentBrowserBridge(browserManager, {
+      onTabsChanged: (worktreeId) => runtimeService.notifyMobileSessionTabsChanged(worktreeId)
+    })
+  )
   nativeTheme.themeSource = store.getSettings().theme ?? 'system'
-  // Why: managed hook installation mutates user-global agent config. Each
-  // installer runs inside its own try/catch so a malformed local config
-  // (e.g. corrupted ~/.claude/settings.json) cannot brick Orca startup.
-  // The agent label travels with each installer so the catch can attribute
-  // the failure in the `agent_hook_install_failed` telemetry event.
-  runManagedHookInstallers([
-    ['claude', () => claudeHookService.install()],
-    ['codex', () => codexHookService.install()],
-    ['gemini', () => geminiHookService.install()],
-    ['cursor', () => cursorHookService.install()],
-    ['droid', () => droidHookService.install()],
-    ['grok', () => grokHookService.install()],
-    ['hermes', () => hermesHookService.install()]
-  ])
+  if (shouldInstallManagedHooks(is.dev)) {
+    // Why: the persisted off switch must run before any auto-install path so
+    // users who removed Orca-managed hooks do not see them silently reappear on launch.
+    if (isAgentStatusHooksEnabled(store.getSettings())) {
+      runManagedHookInstallers(MANAGED_AGENT_HOOK_INSTALLERS)
+    } else {
+      removeManagedAgentHooks()
+    }
+  }
 
   app.on('child-process-gone', (_event, details) => {
     recordProcessGoneCrash('child', details.type, details.reason, details.exitCode ?? null, {
@@ -826,6 +1209,12 @@ app.whenReady().then(async () => {
 
   registerAppMenu({
     onCheckForUpdates: (options) => checkForUpdatesFromMenu(options),
+    onBeforeReload: ({ ignoreCache, webContentsId }) => {
+      if (mainWindow?.webContents.id === webContentsId) {
+        markExpectedRendererReload(webContentsId)
+      }
+      recordCrashBreadcrumb('manual_reload_requested', { ignoreCache })
+    },
     onOpenSettings: () => {
       recordCrashBreadcrumb('settings_opened')
       mainWindow?.webContents.send('ui:openSettings')
@@ -871,11 +1260,10 @@ app.whenReady().then(async () => {
         return
       }
       const current = store.getSettings()
-      store.updateSettings({ [key]: !current[key] })
-      // Why: settings:get returns the current snapshot; renderer tracks
-      // settings through window.api.settings.get(). Push the new value so
-      // the sidebar/titlebar re-render without waiting for a round-trip.
-      mainWindow?.webContents.send('settings:changed', { [key]: !current[key] })
+      // Why: these appearance settings are default-on for older profiles, so
+      // a missing persisted value must toggle from visible -> hidden.
+      const next = getNextDefaultOnAppearanceSettingValue(current[key])
+      store.updateSettings({ [key]: next }, { notifyListeners: true })
       rebuildAppMenu()
     },
     getAppearanceState: () => {
@@ -883,10 +1271,12 @@ app.whenReady().then(async () => {
       const ui = store?.getUI()
       return {
         showTasksButton: settings?.showTasksButton !== false,
+        showMobileButton: settings?.showMobileButton !== false,
         showTitlebarAppName: settings?.showTitlebarAppName !== false,
         statusBarVisible: ui?.statusBarVisible !== false
       }
-    }
+    },
+    getKeybindings: () => keybindings?.getOverrides()
   })
   // Why: E2E tests launch parallel Electron instances that would all race to
   // bind the default fixed port, crashing on EADDRINUSE. Port 0 lets the OS
@@ -898,8 +1288,7 @@ app.whenReady().then(async () => {
   // a random OS-assigned port — breaking deterministic mobile pairing/repro
   // scripts against the dev instance. Pin the first dev instance to 6769 so
   // ws://127.0.0.1:6769 is stable; a second dev instance still falls back via
-  // ws-transport's port-unbindable handler (also covers Windows EACCES from
-  // kernel-reserved port ranges).
+  // ws-transport's EADDRINUSE handler.
   const devWsPort = is.dev && !isE2E ? 6769 : undefined
   let serveOptions: ServeOptions | null = null
   try {
@@ -913,7 +1302,6 @@ app.whenReady().then(async () => {
     runtime,
     userDataPath: app.getPath('userData'),
     enableWebSocket: true,
-    wsHost: store.getSettings().rpcBindHost ?? '127.0.0.1',
     ...(isE2E ? { wsPort: 0 } : {}),
     ...(devWsPort !== undefined ? { wsPort: devWsPort } : {}),
     ...(serveOptions?.wsPort !== undefined ? { wsPort: serveOptions.wsPort } : {}),
@@ -934,7 +1322,9 @@ app.whenReady().then(async () => {
           env: app.isPackaged ? 'production' : 'development',
           // Why: hooks source this endpoint file at invocation time, so old PTY
           // env still reaches the current Orca process after an app restart.
-          userDataPath: app.getPath('userData')
+          // Dev uses a namespace because all worktrees share `orca-dev`.
+          userDataPath: app.getPath('userData'),
+          endpointNamespace: devAgentHookEndpointNamespace
         }),
       onDaemonError: (error) => {
         console.error('[daemon] Failed to start daemon PTY provider, falling back to local:', error)
@@ -950,9 +1340,9 @@ app.whenReady().then(async () => {
   if (serveOptions) {
     registerHeadlessPtyRuntime(
       runtime,
-      () => codexRuntimeHome!.prepareForCodexLaunch(),
+      prepareCodexRuntimeHomeForLaunch,
       () => store!.getSettings(),
-      () => claudeRuntimeAuth!.prepareForClaudeLaunch(),
+      (target) => claudeRuntimeAuth!.prepareForClaudeLaunch(target),
       store
     )
     // Why: headless servers have no renderer graph publisher. Publish an
@@ -1009,8 +1399,6 @@ app.on('before-quit', () => {
   unsubscribeAgentAwakeStatusChanges = null
   agentAwakeService?.dispose()
   agentAwakeService = null
-  disposeFeatureWallFirstAgentTour?.()
-  disposeFeatureWallFirstAgentTour = null
   // Why: PTY cleanup is deferred to will-quit so the renderer has a chance to
   // capture terminal scrollback buffers before PTY exit events race in and
   // unmount TerminalPane components (removing their capture callbacks).
@@ -1063,6 +1451,7 @@ app.on('will-quit', (e) => {
     const rpcStopAndClear = runtimeRpc
       ? runtimeRpc
           .stop()
+          .then(() => awaitRuntimeFileWatcherUnsubscribes())
           .then(() => {
             if (ownedRuntimeId) {
               clearRuntimeMetadataIfOwned(app.getPath('userData'), ownedPid, ownedRuntimeId)
@@ -1084,6 +1473,7 @@ app.on('will-quit', (e) => {
     // quit chain.
     Promise.allSettled([disconnectDaemon(), rpcStopAndClear, watcherShutdown])
       .then(() => shutdownTelemetry())
+      .then(() => shutdownObservability())
       .catch(() => {
         /* swallow — telemetry must never prevent app.quit() */
       })

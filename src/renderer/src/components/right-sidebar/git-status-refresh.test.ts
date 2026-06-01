@@ -26,7 +26,8 @@ describe('refreshGitStatusForWorktree', () => {
         hasUpstream: true,
         upstreamName: 'origin/feature',
         ahead: 2,
-        behind: 1
+        behind: 1,
+        behindCommitsArePatchEquivalent: false
       }
     }
     const gitStatus = vi.fn().mockResolvedValue(status)
@@ -42,8 +43,7 @@ describe('refreshGitStatusForWorktree', () => {
 
     expect(gitStatus).toHaveBeenCalledWith({
       worktreePath: '/repo',
-      connectionId: 'ssh-1',
-      includeIgnored: true
+      connectionId: 'ssh-1'
     })
     expect(deps.setGitStatus).toHaveBeenCalledWith('wt-1', status)
     expect(deps.updateWorktreeGitIdentity).toHaveBeenCalledWith('wt-1', {
@@ -52,6 +52,31 @@ describe('refreshGitStatusForWorktree', () => {
     })
     expect(deps.setUpstreamStatus).toHaveBeenCalledWith('wt-1', status.upstreamStatus)
     expect(deps.fetchUpstreamStatus).not.toHaveBeenCalled()
+  })
+
+  it('refreshes explicit upstream details without storing diverged porcelain-only status', async () => {
+    const status: GitStatusResult = {
+      entries: [],
+      conflictOperation: 'unknown',
+      upstreamStatus: {
+        hasUpstream: true,
+        upstreamName: 'origin/feature',
+        ahead: 14,
+        behind: 3
+      }
+    }
+    const gitStatus = vi.fn().mockResolvedValue(status)
+    vi.stubGlobal('window', { api: { git: { status: gitStatus } } })
+    const deps = makeDeps()
+
+    await refreshGitStatusForWorktree({
+      worktreeId: 'wt-1',
+      worktreePath: '/repo',
+      deps
+    })
+
+    expect(deps.setUpstreamStatus).not.toHaveBeenCalled()
+    expect(deps.fetchUpstreamStatus).toHaveBeenCalledWith('wt-1', '/repo', undefined)
   })
 
   it('falls back to explicit upstream refresh for legacy status payloads', async () => {
@@ -81,7 +106,7 @@ describe('refreshGitStatusForWorktree', () => {
     expect(deps.fetchUpstreamStatus).toHaveBeenCalledWith('wt-2', '/repo', 'ssh-2')
   })
 
-  it('omits ignored-file status when the setting is disabled', async () => {
+  it('leaves ignored-file discovery to the File Explorer instead of status polling', async () => {
     const status: GitStatusResult = {
       entries: [],
       conflictOperation: 'unknown'
@@ -91,7 +116,7 @@ describe('refreshGitStatusForWorktree', () => {
     const deps = makeDeps()
 
     await refreshGitStatusForWorktree({
-      settings: { activeRuntimeEnvironmentId: null, showGitIgnoredFiles: false },
+      settings: { activeRuntimeEnvironmentId: null },
       worktreeId: 'wt-3',
       worktreePath: '/repo',
       deps

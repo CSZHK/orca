@@ -3,9 +3,8 @@ scripts for both POSIX shells and Windows shells. Keeping the scripts adjacent
 to the env injection code makes the attribution behavior auditable as one unit
 instead of scattering generated shell fragments across files. */
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
-import { join } from 'path'
+import { join, win32 as pathWin32 } from 'path'
 import { ORCA_GIT_COMMIT_TRAILER } from '../../shared/orca-attribution'
-import { findEnvPathKey } from '../pty/env-path-key'
 
 const ATTRIBUTION_ROOT_DIR = 'orca-terminal-attribution'
 const ATTRIBUTION_SHIM_VERSION = '6'
@@ -30,12 +29,39 @@ type AttributionShimPaths = {
   win32Dir: string
 }
 
+export type AttributionShellFamily = 'native-windows' | 'posix'
+
+export function resolveAttributionShellFamily(options: {
+  platform?: NodeJS.Platform
+  shellPath?: string
+  isWsl?: boolean
+}): AttributionShellFamily | undefined {
+  const platform = options.platform ?? process.platform
+  if (platform !== 'win32') {
+    return undefined
+  }
+  const shellName = options.shellPath?.replaceAll('\\', '/').split('/').pop()?.toLowerCase()
+  if (options.isWsl || shellName === 'wsl.exe' || shellName === 'wsl') {
+    return 'posix'
+  }
+  if (shellName === 'bash.exe' || shellName === 'sh.exe' || shellName === 'zsh.exe') {
+    return 'posix'
+  }
+  return 'native-windows'
+}
+
 export function applyTerminalAttributionEnv(
   baseEnv: Record<string, string>,
-  options: { enabled: boolean; userDataPath: string }
+  options: {
+    enabled: boolean
+    userDataPath: string
+    platform?: NodeJS.Platform
+    shellFamily?: AttributionShellFamily
+  }
 ): void {
+  const platform = options.platform ?? process.platform
   if (!options.enabled) {
-    clearTerminalAttributionEnv(baseEnv)
+    clearTerminalAttributionEnv(baseEnv, platform)
     return
   }
 
@@ -46,20 +72,20 @@ export function applyTerminalAttributionEnv(
     return
   }
 
-  const pathDelimiter = process.platform === 'win32' ? ';' : ':'
-  const pathKey = findEnvPathKey(baseEnv)
-  const basePath = baseEnv[pathKey] ?? process.env.PATH ?? ''
+  const pathDelimiter = platform === 'win32' ? ';' : ':'
+  const basePath = baseEnv.PATH ?? process.env.PATH ?? ''
   // Why: resolve real Windows commands before prepending shims so cmd wrappers
   // cannot recursively point ORCA_REAL_* at themselves.
-  const resolvedGit =
-    process.platform === 'win32' ? resolveWindowsExecutable('git', basePath) : null
-  const resolvedGh = process.platform === 'win32' ? resolveWindowsExecutable('gh', basePath) : null
+  const resolvedGit = platform === 'win32' ? resolveWindowsExecutable('git', basePath) : null
+  const resolvedGh = platform === 'win32' ? resolveWindowsExecutable('gh', basePath) : null
   const { posixDir, win32Dir } = shimPaths
-  // Why: Windows terminals may be cmd/PowerShell or Git Bash. Include both shim
-  // families; native shells ignore extensionless POSIX files, Git Bash can use them.
-  const prependDirs = process.platform === 'win32' ? [posixDir, win32Dir] : [posixDir]
+  const shellFamily = options.shellFamily ?? (platform === 'win32' ? 'native-windows' : 'posix')
+  // Why: Windows native shells can try to open extensionless POSIX shims before
+  // PATHEXT reaches git.cmd, which surfaces an "Open With" dialog.
+  const prependDirs =
+    platform === 'win32' && shellFamily === 'native-windows' ? [win32Dir] : [posixDir]
   const prependDirKeys = new Set(
-    prependDirs.map((dir) => (process.platform === 'win32' ? dir.toLowerCase() : dir))
+    prependDirs.map((dir) => (platform === 'win32' ? dir.toLowerCase() : dir))
   )
   const cleanedBasePath = stripAttributionPathEntries(basePath, pathDelimiter)
     .split(pathDelimiter)
@@ -67,7 +93,7 @@ export function applyTerminalAttributionEnv(
       if (!entry) {
         return false
       }
-      const key = process.platform === 'win32' ? entry.toLowerCase() : entry
+      const key = platform === 'win32' ? entry.toLowerCase() : entry
       return !prependDirKeys.has(key)
     })
     .join(pathDelimiter)
@@ -76,14 +102,18 @@ export function applyTerminalAttributionEnv(
   // shim directory here keeps the attribution behavior scoped to Orca's live
   // terminal environment instead of mutating global git/gh config or the
   // user's external shell PATH.
-  baseEnv[pathKey] = [...prependDirs, cleanedBasePath].filter(Boolean).join(pathDelimiter)
+  baseEnv.PATH = [...prependDirs, cleanedBasePath].filter(Boolean).join(pathDelimiter)
   baseEnv.ORCA_ENABLE_GIT_ATTRIBUTION = '1'
   baseEnv.ORCA_GIT_COMMIT_TRAILER = ORCA_GIT_COMMIT_TRAILER
   baseEnv.ORCA_GH_PR_FOOTER = ORCA_GH_FOOTER
   baseEnv.ORCA_GH_ISSUE_FOOTER = ORCA_GH_FOOTER
-  baseEnv.ORCA_ATTRIBUTION_SHIM_DIR = posixDir
+  if (shellFamily === 'posix') {
+    baseEnv.ORCA_ATTRIBUTION_SHIM_DIR = posixDir
+  } else {
+    delete baseEnv.ORCA_ATTRIBUTION_SHIM_DIR
+  }
 
-  if (process.platform === 'win32') {
+  if (platform === 'win32') {
     if (resolvedGit) {
       baseEnv.ORCA_REAL_GIT = resolvedGit
     }
@@ -93,17 +123,19 @@ export function applyTerminalAttributionEnv(
   }
 }
 
-function clearTerminalAttributionEnv(baseEnv: Record<string, string>): void {
+function clearTerminalAttributionEnv(
+  baseEnv: Record<string, string>,
+  platform: NodeJS.Platform
+): void {
   for (const key of ATTRIBUTION_ENV_KEYS) {
     delete baseEnv[key]
   }
-  const pathDelimiter = process.platform === 'win32' ? ';' : ':'
-  const pathKey = findEnvPathKey(baseEnv)
-  const cleanedPath = stripAttributionPathEntries(baseEnv[pathKey] ?? '', pathDelimiter)
+  const pathDelimiter = platform === 'win32' ? ';' : ':'
+  const cleanedPath = stripAttributionPathEntries(baseEnv.PATH ?? '', pathDelimiter)
   if (cleanedPath) {
-    baseEnv[pathKey] = cleanedPath
+    baseEnv.PATH = cleanedPath
   } else {
-    delete baseEnv[pathKey]
+    delete baseEnv.PATH
   }
 }
 
@@ -170,12 +202,12 @@ function resolveWindowsExecutable(command: string, pathValue: string): string | 
 
   for (const dir of searchDirs) {
     for (const ext of pathExt) {
-      const candidate = join(dir, `${command}${ext}`)
+      const candidate = pathWin32.join(dir, `${command}${ext}`)
       if (existsSync(candidate)) {
         return candidate
       }
     }
-    const bareCandidate = join(dir, command)
+    const bareCandidate = pathWin32.join(dir, command)
     if (existsSync(bareCandidate)) {
       return bareCandidate
     }

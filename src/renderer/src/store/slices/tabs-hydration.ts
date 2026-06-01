@@ -4,6 +4,7 @@ import type {
   TabGroupLayoutNode,
   WorkspaceSessionState
 } from '../../../../shared/types'
+import { isValidTerminalTabId } from '../../../../shared/terminal-tab-id'
 import { createBrowserUuid } from '@/lib/browser-uuid'
 import {
   dedupeTabOrder,
@@ -59,12 +60,29 @@ function hydrateUnifiedFormat(
       continue
     }
     const persistedEditFileIds = persistedEditFileIdsByWorktree[worktreeId] ?? new Set<string>()
+    const generatedTitleByTerminalId = new Map(
+      (session.tabsByWorktree[worktreeId] ?? [])
+        .filter((tab) => tab.generatedTitle?.trim())
+        .map((tab) => [tab.id, tab.generatedTitle!.trim()])
+    )
     tabsByWorktree[worktreeId] = [...tabs]
       .map((tab) => ({
         ...tab,
         entityId: tab.entityId ?? tab.id
       }))
+      .map((tab) => {
+        if (tab.contentType !== 'terminal' || tab.generatedLabel?.trim()) {
+          return tab
+        }
+        const generatedLabel = generatedTitleByTerminalId.get(tab.entityId)
+        return generatedLabel ? { ...tab, generatedLabel } : tab
+      })
       .filter((tab) => {
+        if (tab.contentType === 'terminal') {
+          // Why: old web-client sessions could persist host surface ids
+          // containing "::"; those are invalid pane-key tab ids.
+          return isValidTerminalTabId(tab.id) && isValidTerminalTabId(tab.entityId)
+        }
         if (!isTransientEditorContentType(tab.contentType)) {
           return true
         }
@@ -157,7 +175,9 @@ function hydrateLegacyFormat(
   const layoutByWorktree: Record<string, TabGroupLayoutNode> = {}
 
   for (const worktreeId of validWorktreeIds) {
-    const terminalTabs = session.tabsByWorktree[worktreeId] ?? []
+    const terminalTabs = (session.tabsByWorktree[worktreeId] ?? []).filter((tab) =>
+      isValidTerminalTabId(tab.id)
+    )
     const editorFiles = session.openFilesByWorktree?.[worktreeId] ?? []
 
     if (terminalTabs.length === 0 && editorFiles.length === 0) {
@@ -176,6 +196,7 @@ function hydrateLegacyFormat(
         worktreeId,
         contentType: 'terminal',
         label: tt.title,
+        ...(tt.generatedTitle?.trim() ? { generatedLabel: tt.generatedTitle.trim() } : {}),
         customLabel: tt.customTitle,
         color: tt.color,
         sortOrder: tt.sortOrder,

@@ -174,13 +174,25 @@ describe('resolvePrimaryAction', () => {
 
   it('returns Publish Branch on a clean tree when no upstream exists', () => {
     const result = resolvePrimaryAction(
-      inputs({ upstreamStatus: { hasUpstream: false, ahead: 0, behind: 0 } })
+      inputs({ upstreamStatus: { hasUpstream: false, ahead: 0, behind: 0 }, branchCommitsAhead: 1 })
     )
     expect(result).toEqual({
       kind: 'publish',
       label: 'Publish Branch',
       title: 'Publish this branch to origin',
       disabled: false
+    })
+  })
+
+  it('does not offer Publish Branch when an unpublished branch has no commits ahead', () => {
+    const result = resolvePrimaryAction(
+      inputs({ upstreamStatus: { hasUpstream: false, ahead: 0, behind: 0 }, branchCommitsAhead: 0 })
+    )
+    expect(result).toEqual({
+      kind: 'commit',
+      label: 'Commit',
+      title: 'Nothing to commit. Branch has no changes to publish.',
+      disabled: true
     })
   })
 
@@ -202,6 +214,28 @@ describe('resolvePrimaryAction', () => {
       kind: 'sync',
       label: 'Sync',
       title: 'Pull 3, push 2',
+      disabled: false
+    })
+  })
+
+  it('returns Force Push when remote-only commits are patch-equivalent after a rebase', () => {
+    const result = resolvePrimaryAction(
+      inputs({
+        branchCommitsAhead: 4,
+        upstreamStatus: {
+          hasUpstream: true,
+          upstreamName: 'origin/feature',
+          ahead: 14,
+          behind: 3,
+          behindCommitsArePatchEquivalent: true
+        }
+      })
+    )
+    expect(result).toEqual({
+      kind: 'push',
+      label: 'Force Push',
+      title:
+        'Remote only has older copies of local commits. Force push 4 branch commits with lease to update origin/feature.',
       disabled: false
     })
   })
@@ -371,6 +405,27 @@ describe('resolvePrimaryAction', () => {
       kind: 'create_pr',
       label: 'Create PR',
       title: 'Create a pull request for this branch',
+      disabled: false
+    })
+  })
+
+  it('returns Create MR when a clean tracked GitLab branch is eligible for review creation', () => {
+    const result = resolvePrimaryAction(
+      inputs({
+        upstreamStatus: upstreamInSync,
+        hostedReviewCreation: {
+          provider: 'gitlab',
+          review: null,
+          canCreate: true,
+          blockedReason: null,
+          nextAction: null
+        }
+      })
+    )
+    expect(result).toEqual({
+      kind: 'create_pr',
+      label: 'Create MR',
+      title: 'Create a merge request for this branch',
       disabled: false
     })
   })

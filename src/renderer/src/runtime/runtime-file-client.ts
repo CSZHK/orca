@@ -101,6 +101,7 @@ type SharedRuntimeFileWatch = {
   start: Promise<void>
   unsubscribe: (() => void) | null
   remoteSubscriptionId: string | null
+  keepStreamUntilReady: boolean
   closed: boolean
 }
 
@@ -359,6 +360,7 @@ export async function importExternalPathsToRuntime(
       results.push(source)
       continue
     }
+    let createdDirectoryImportRoot: string | null = null
     try {
       const finalName = await deconflictRuntimeImportName(
         context,
@@ -377,6 +379,9 @@ export async function importExternalPathsToRuntime(
             { worktree: context.worktreeId, relativePath: entryRelativePath },
             { timeoutMs: 15_000 }
           )
+          if (source.kind === 'directory' && entry.relativePath === '') {
+            createdDirectoryImportRoot = entryRelativePath
+          }
           continue
         }
         await uploadRuntimeFileWithoutClobber(
@@ -395,6 +400,20 @@ export async function importExternalPathsToRuntime(
         renamed: finalName !== source.name
       })
     } catch (error) {
+      if (createdDirectoryImportRoot) {
+        // Why: match local directory imports by removing the no-clobber root
+        // Orca created when a nested runtime upload fails halfway through.
+        await callRuntimeRpc(
+          target,
+          'files.delete',
+          {
+            worktree: context.worktreeId,
+            relativePath: createdDirectoryImportRoot,
+            recursive: true
+          },
+          { timeoutMs: 15_000 }
+        ).catch(() => {})
+      }
       results.push({
         sourcePath: source.sourcePath,
         status: 'failed',
@@ -635,6 +654,7 @@ function createSharedRuntimeFileWatch(
     start: Promise.resolve(),
     unsubscribe: null,
     remoteSubscriptionId: null,
+    keepStreamUntilReady: isWebRuntimeFileWatchSharedSocket(),
     closed: false
   }
   // Why: editor reloads and the Explorer can watch the same remote worktree.
@@ -664,12 +684,14 @@ function createSharedRuntimeFileWatch(
       }
     )
     .then((subscription) => {
+      shared.unsubscribe = subscription.unsubscribe
       if (shared.closed || sharedRuntimeFileWatches.get(key) !== shared) {
         subscription.unsubscribe()
-        unwatchSharedRuntimeFileWatch(shared)
-        return
+        shared.unsubscribe = null
+        if (!shared.keepStreamUntilReady) {
+          unwatchSharedRuntimeFileWatch(shared)
+        }
       }
-      shared.unsubscribe = subscription.unsubscribe
     })
     .catch((err) => {
       if (sharedRuntimeFileWatches.get(key) === shared) {
@@ -693,6 +715,13 @@ function handleSharedRuntimeFileWatchResponse(
     )
     if (event.type === 'ready') {
       shared.remoteSubscriptionId = event.subscriptionId
+      if (shared.closed) {
+        shared.unsubscribe?.()
+        shared.unsubscribe = null
+        if (!shared.keepStreamUntilReady) {
+          unwatchSharedRuntimeFileWatch(shared)
+        }
+      }
     } else if (event.type === 'changed') {
       for (const listener of Array.from(shared.listeners)) {
         listener.onPayload({ worktreePath, events: event.events })
@@ -715,9 +744,20 @@ function closeSharedRuntimeFileWatch(key: string, shared: SharedRuntimeFileWatch
   }
   shared.closed = true
   sharedRuntimeFileWatches.delete(key)
+  if (shared.keepStreamUntilReady) {
+    // Why: WebRuntimeClient owns shared-socket file-watch cleanup, including
+    // pre-ready fallback timers and late-ready files.unwatch.
+    shared.unsubscribe?.()
+    shared.unsubscribe = null
+    return
+  }
   shared.unsubscribe?.()
   shared.unsubscribe = null
   unwatchSharedRuntimeFileWatch(shared)
+}
+
+function isWebRuntimeFileWatchSharedSocket(): boolean {
+  return Boolean((globalThis as { __ORCA_WEB_CLIENT__?: boolean }).__ORCA_WEB_CLIENT__)
 }
 
 function unwatchSharedRuntimeFileWatch(shared: SharedRuntimeFileWatch): void {

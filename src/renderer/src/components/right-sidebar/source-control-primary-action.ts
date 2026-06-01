@@ -2,6 +2,7 @@
 
 import type { HostedReviewCreationEligibility } from '../../../../shared/hosted-review'
 import type { GitUpstreamStatus, PRState } from '../../../../shared/types'
+import { shouldForcePushWithLeaseForUpstream } from '../../../../shared/git-upstream-status'
 
 // Why: this module owns the pure state-machine logic for the Source Control
 // primary action (split button). Keeping the logic outside the React component
@@ -30,7 +31,14 @@ export type PrimaryActionKind =
 // because Fetch participates in the busy flag, but it is intentionally NOT
 // in PrimaryActionKind — Fetch is dropdown-only, so when fetch is in flight
 // the primary keeps its natural label and CommitArea suppresses the spinner.
-export type RemoteOpKind = 'push' | 'pull' | 'sync' | 'fetch' | 'publish'
+export type RemoteOpKind =
+  | 'push'
+  | 'pull'
+  | 'sync'
+  | 'fetch'
+  | 'fast_forward'
+  | 'publish'
+  | 'rebase'
 
 export type PrimaryAction = {
   kind: PrimaryActionKind
@@ -56,6 +64,10 @@ export type PrimaryActionInputs = {
   // stale label that no longer matches what the slice is doing.
   inFlightRemoteOpKind?: RemoteOpKind | null
   hostedReviewCreation?: HostedReviewCreationEligibility | null
+  // Why: an unpublished branch is only worth publishing when it actually
+  // carries commits beyond the compare base. Undefined preserves the old
+  // behavior while the branch compare request is still unavailable/loading.
+  branchCommitsAhead?: number
 }
 
 const PRIMARY_LABEL_BY_KIND: Record<Exclude<PrimaryActionKind, 'commit'>, string> = {
@@ -65,6 +77,15 @@ const PRIMARY_LABEL_BY_KIND: Record<Exclude<PrimaryActionKind, 'commit'>, string
   sync: 'Sync',
   publish: 'Publish Branch',
   create_pr: 'Create PR'
+}
+
+function reviewCopy(provider: HostedReviewCreationEligibility['provider'] | undefined): {
+  shortLabel: 'PR' | 'MR'
+  reviewLabel: 'pull request' | 'merge request'
+} {
+  return provider === 'gitlab'
+    ? { shortLabel: 'MR', reviewLabel: 'merge request' }
+    : { shortLabel: 'PR', reviewLabel: 'pull request' }
 }
 
 function describePushCount(ahead: number): string {
@@ -77,6 +98,12 @@ function describePullCount(behind: number): string {
 
 function describeSyncCounts(ahead: number, behind: number): string {
   return `Pull ${behind}, push ${ahead}`
+}
+
+function describeForcePushWithLease(count: number | undefined, upstreamName?: string): string {
+  const countText =
+    count && count > 0 ? `${count} branch commit${count === 1 ? '' : 's'}` : 'this branch'
+  return `Remote only has older copies of local commits. Force push ${countText} with lease to update ${upstreamName ?? 'the remote branch'}.`
 }
 
 /**
@@ -112,7 +139,8 @@ export function resolvePrimaryAction(inputs: PrimaryActionInputs): PrimaryAction
     prState,
     isPRStateLoading,
     inFlightRemoteOpKind,
-    hostedReviewCreation
+    hostedReviewCreation,
+    branchCommitsAhead
   } = inputs
 
   // 1. Commit in flight — lock the primary no matter what else is true.
@@ -245,6 +273,15 @@ export function resolvePrimaryAction(inputs: PrimaryActionInputs): PrimaryAction
   }
 
   if (!upstreamStatus.hasUpstream) {
+    if (branchCommitsAhead === 0) {
+      return {
+        kind: 'commit',
+        label: 'Commit',
+        title: 'Nothing to commit. Branch has no changes to publish.',
+        disabled: true
+      }
+    }
+
     if (isPRStateLoading) {
       return {
         kind: 'commit',
@@ -272,6 +309,14 @@ export function resolvePrimaryAction(inputs: PrimaryActionInputs): PrimaryAction
   }
 
   if (upstreamStatus.ahead > 0 && upstreamStatus.behind > 0) {
+    if (shouldForcePushWithLeaseForUpstream(upstreamStatus)) {
+      return {
+        kind: 'push',
+        label: 'Force Push',
+        title: describeForcePushWithLease(branchCommitsAhead, upstreamStatus.upstreamName),
+        disabled: false
+      }
+    }
     return {
       kind: 'sync',
       label: 'Sync',
@@ -297,10 +342,11 @@ export function resolvePrimaryAction(inputs: PrimaryActionInputs): PrimaryAction
   }
 
   if (hostedReviewCreation?.canCreate) {
+    const copy = reviewCopy(hostedReviewCreation.provider)
     return {
       kind: 'create_pr',
-      label: 'Create PR',
-      title: 'Create a pull request for this branch',
+      label: `Create ${copy.shortLabel}`,
+      title: `Create a ${copy.reviewLabel} for this branch`,
       disabled: false
     }
   }

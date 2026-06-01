@@ -19,14 +19,14 @@ import { useEditorPanelContentState } from './useEditorPanelContentState'
 import { useMarkdownPreviewShortcut } from './useMarkdownPreviewShortcut'
 import { useUntitledFileRename } from './useUntitledFileRename'
 
-const isMac = navigator.userAgent.includes('Mac')
-
 function EditorPanelInner({
   activeFileId: activeFileIdProp,
-  activeViewStateId: activeViewStateIdProp
+  activeViewStateId: activeViewStateIdProp,
+  markdownAnnotationsEnabled = true
 }: {
   activeFileId?: string | null
   activeViewStateId?: string | null
+  markdownAnnotationsEnabled?: boolean
 } = {}): React.JSX.Element | null {
   const openFiles = useAppStore((s) => s.openFiles)
   const globalActiveFileId = useAppStore((s) => s.activeFileId)
@@ -48,15 +48,34 @@ function EditorPanelInner({
   const editorDrafts = useAppStore((s) => s.editorDrafts)
   const setEditorDraft = useAppStore((s) => s.setEditorDraft)
   const settings = useAppStore((s) => s.settings)
-  const updateSettings = useAppStore((s) => s.updateSettings)
   const panelRef = useRef<HTMLDivElement>(null)
   const [copiedPathToast, setCopiedPathToast] = useState<{ fileId: string; token: number } | null>(
     null
   )
+  const copiedPathToastResetTimerRef = useRef<number | null>(null)
+  // Why: clipboard IPC can resolve after the editor panel unmounts; skip path
+  // toast feedback instead of starting a reset timer on a stale panel.
+  const pathCopyMountedRef = useRef(false)
+  const clearCopiedPathToastResetTimer = useCallback((): void => {
+    if (copiedPathToastResetTimerRef.current === null) {
+      return
+    }
+    window.clearTimeout(copiedPathToastResetTimerRef.current)
+    copiedPathToastResetTimerRef.current = null
+  }, [])
+  const setPanelRef = useCallback(
+    (node: HTMLDivElement | null) => {
+      panelRef.current = node
+      pathCopyMountedRef.current = node !== null
+      if (!node) {
+        clearCopiedPathToastResetTimer()
+      }
+    },
+    [clearCopiedPathToastResetTimer]
+  )
   const [showMarkdownTableOfContents, setShowMarkdownTableOfContents] = useState(false)
   const [sideBySide, setSideBySide] = useState(settings?.diffDefaultView === 'side-by-side')
   const [prevDiffView, setPrevDiffView] = useState(settings?.diffDefaultView)
-  const markdownReviewToolsEnabled = settings?.markdownReviewToolsEnabled ?? true
 
   if (settings?.diffDefaultView !== prevDiffView) {
     setPrevDiffView(settings?.diffDefaultView)
@@ -92,37 +111,37 @@ function EditorPanelInner({
 
   useEffect(() => acquireExportPdfListener(), [])
   useClosedEditorTabCleanup(openFiles)
-  useMarkdownPreviewShortcut({ activeFile, panelRef, isMac, openMarkdownPreview })
-  useEffect(() => {
-    if (!copiedPathToast) {
-      return
-    }
-    const timeout = window.setTimeout(() => setCopiedPathToast(null), 1500)
-    return () => window.clearTimeout(timeout)
-  }, [copiedPathToast])
+  useMarkdownPreviewShortcut({ activeFile, panelRef, openMarkdownPreview })
 
-  const handleContentChange = useCallback(
-    (content: string) => {
-      if (!activeFile) {
+  const handleContentChangeForFile = useCallback(
+    (file: typeof activeFile, content: string) => {
+      if (!file) {
         return
       }
-      setEditorDraft(activeFile.id, content)
+      setEditorDraft(file.id, content)
       const normalize =
-        activeFile.language === 'markdown'
+        file.language === 'markdown'
           ? (value: string): string => value.trimEnd()
           : (value: string): string => value
-      if (activeFile.mode === 'edit') {
+      if (file.mode === 'edit') {
         markFileDirty(
-          activeFile.id,
-          normalize(content) !== normalize(fileContents[activeFile.id]?.content ?? '')
+          file.id,
+          normalize(content) !== normalize(fileContents[file.id]?.content ?? '')
         )
         return
       }
-      const diffContent = diffContents[activeFile.id]
+      const diffContent = diffContents[file.id]
       const original = diffContent?.kind === 'text' ? diffContent.modifiedContent : ''
-      markFileDirty(activeFile.id, normalize(content) !== normalize(original))
+      markFileDirty(file.id, normalize(content) !== normalize(original))
     },
-    [activeFile, diffContents, fileContents, markFileDirty, setEditorDraft]
+    [diffContents, fileContents, markFileDirty, setEditorDraft]
+  )
+
+  const handleContentChange = useCallback(
+    (content: string) => {
+      handleContentChangeForFile(activeFile, content)
+    },
+    [activeFile, handleContentChangeForFile]
   )
 
   const handleDirtyStateHint = useCallback(
@@ -134,18 +153,18 @@ function EditorPanelInner({
     [activeFile, markFileDirty]
   )
 
-  const handleSave = useCallback(
-    async (content: string) => {
-      if (!activeFile) {
+  const handleSaveForFile = useCallback(
+    async (file: typeof activeFile, content: string) => {
+      if (!file) {
         return
       }
       const saveTargetFile =
-        activeFile.mode === 'markdown-preview'
+        file.mode === 'markdown-preview'
           ? (openFiles.find(
               (openFile) =>
-                openFile.id === activeFile.markdownPreviewSourceFileId && openFile.mode === 'edit'
+                openFile.id === file.markdownPreviewSourceFileId && openFile.mode === 'edit'
             ) ?? null)
-          : activeFile
+          : file
       if (!saveTargetFile) {
         return
       }
@@ -157,27 +176,16 @@ function EditorPanelInner({
         await requestEditorFileSave({ fileId: saveTargetFile.id, fallbackContent: content })
       } catch {}
     },
-    [activeFile, openFiles, requestRenameForFile]
+    [openFiles, requestRenameForFile]
+  )
+
+  const handleSave = useCallback(
+    async (content: string) => {
+      await handleSaveForFile(activeFile, content)
+    },
+    [activeFile, handleSaveForFile]
   )
   useEditorCmdSaveRequest({ activeFile, openFiles, fileContents, handleSave })
-
-  const handleEditorToggleChange = useCallback(
-    (next: EditorToggleValue): void => {
-      const fileId = activeFile?.id
-      if (!fileId) {
-        return
-      }
-      if (next === 'changes') {
-        setEditorViewMode(fileId, 'changes')
-        return
-      }
-      setEditorViewMode(fileId, 'edit')
-      if (next !== 'edit') {
-        setMarkdownViewMode(fileId, next)
-      }
-    },
-    [activeFile?.id, setEditorViewMode, setMarkdownViewMode]
-  )
 
   const handleCopyPath = useCallback(async (): Promise<void> => {
     if (!activeFile) {
@@ -189,11 +197,24 @@ function EditorPanelInner({
     }
     try {
       await window.api.ui.writeClipboardText(copyState.copyText)
-      setCopiedPathToast({ fileId: activeFile.id, token: Date.now() })
+      if (!pathCopyMountedRef.current) {
+        return
+      }
+      clearCopiedPathToastResetTimer()
+      const nextToast = { fileId: activeFile.id, token: Date.now() }
+      setCopiedPathToast(nextToast)
+      copiedPathToastResetTimerRef.current = window.setTimeout(() => {
+        copiedPathToastResetTimerRef.current = null
+        setCopiedPathToast((current) => (current?.token === nextToast.token ? null : current))
+      }, 1500)
     } catch {
+      if (!pathCopyMountedRef.current) {
+        return
+      }
+      clearCopiedPathToastResetTimer()
       setCopiedPathToast(null)
     }
-  }, [activeFile])
+  }, [activeFile, clearCopiedPathToastResetTimer])
 
   if (!activeFile) {
     return null
@@ -221,7 +242,7 @@ function EditorPanelInner({
       sourceGroupId
     })
   }
-  const handleOpenDiffTargetFile = (): void => {
+  const handleOpenDiffTargetFile = (preferredMarkdownViewMode?: 'rich'): void => {
     if (!model.openFileState.canOpen) {
       return
     }
@@ -233,15 +254,37 @@ function EditorPanelInner({
       language: detectLanguage(activeFile.relativePath),
       mode: 'edit'
     })
+    if (preferredMarkdownViewMode) {
+      setEditorViewMode(activeFile.filePath, 'edit')
+      setMarkdownViewMode(activeFile.filePath, preferredMarkdownViewMode)
+    }
+  }
+  const handleEditorToggleChange = (next: EditorToggleValue): void => {
+    const fileId = activeFile.id
+    if (activeFile.mode === 'diff' && model.isMarkdown && next === 'rich') {
+      handleOpenDiffTargetFile('rich')
+      return
+    }
+    if (next === 'changes') {
+      setEditorViewMode(fileId, 'changes')
+      return
+    }
+    setEditorViewMode(fileId, 'edit')
+    if (next !== 'edit') {
+      setMarkdownViewMode(fileId, next)
+    }
   }
   const handleOpenMarkdownPreview = (): void => {
-    openMarkdownPreview({
-      filePath: activeFile.filePath,
-      relativePath: activeFile.relativePath,
-      worktreeId: activeFile.worktreeId,
-      runtimeEnvironmentId: activeFile.runtimeEnvironmentId,
-      language: model.resolvedLanguage
-    })
+    openMarkdownPreview(
+      {
+        filePath: activeFile.filePath,
+        relativePath: activeFile.relativePath,
+        worktreeId: activeFile.worktreeId,
+        runtimeEnvironmentId: activeFile.runtimeEnvironmentId,
+        language: model.resolvedLanguage
+      },
+      { sourceFileId: activeFile.id }
+    )
   }
   const handleOpenContainingFolder = (): void => {
     if (
@@ -254,9 +297,6 @@ function EditorPanelInner({
     }
     window.api.shell.openPath(activeFile.filePath)
   }
-  const handleToggleMarkdownReviewTools = (): void => {
-    void updateSettings({ markdownReviewToolsEnabled: !markdownReviewToolsEnabled })
-  }
   const disableRenameBrowse = Boolean(
     settingsForRuntimeOwner(
       settings,
@@ -267,14 +307,14 @@ function EditorPanelInner({
 
   return (
     <EditorPanelShell
-      panelRef={panelRef}
+      panelRef={setPanelRef}
       activeFile={activeFile}
       activeViewStateId={activeViewStateId}
       model={model}
       copiedPathVisible={copiedPathToast?.fileId === activeFile.id}
       showMarkdownTableOfContents={showMarkdownTableOfContents}
-      markdownReviewToolsEnabled={markdownReviewToolsEnabled}
       sideBySide={sideBySide}
+      openFiles={openFiles}
       fileContents={fileContents}
       diffContents={diffContents}
       editorDrafts={editorDrafts}
@@ -290,15 +330,17 @@ function EditorPanelInner({
       onToggleSideBySide={() => setSideBySide((prev) => !prev)}
       onEditorToggleChange={handleEditorToggleChange}
       onToggleMarkdownTableOfContents={() => setShowMarkdownTableOfContents((shown) => !shown)}
-      onToggleMarkdownReviewTools={handleToggleMarkdownReviewTools}
       onExportMarkdownToPdf={() => void exportActiveMarkdownToPdf()}
       onContentChange={handleContentChange}
+      onContentChangeForFile={handleContentChangeForFile}
       onDirtyStateHint={handleDirtyStateHint}
       onSave={handleSave}
+      onSaveForFile={handleSaveForFile}
       onReloadFileContent={reloadFileContent}
       onCloseMarkdownTableOfContents={() => setShowMarkdownTableOfContents(false)}
       onCloseRenameDialog={closeRenameDialog}
       onRenameConfirm={handleRenameConfirm}
+      markdownAnnotationsEnabled={markdownAnnotationsEnabled}
     />
   )
 }

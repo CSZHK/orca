@@ -1,219 +1,301 @@
-import { afterEach, describe, expect, it } from 'vitest'
-import { execFileSync } from 'child_process'
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync } from 'fs'
-import { join } from 'path'
-import { tmpdir } from 'os'
+import { describe, expect, it, vi } from 'vitest'
+import type { GitWorktreeInfo } from '../shared/types'
 import {
-  isDangerousWorktreeRemovalPath,
-  canSafelyRemoveOrphanedWorktreeDirectory
+  canSafelyRemoveOrphanedWorktreeDirectory,
+  getRegisteredDeletableWorktree
 } from './worktree-removal-safety'
 
-// ─── Part 1: Pure string checks (no filesystem) ───
+function makeGitWorktree(path: string, isMainWorktree = false): GitWorktreeInfo {
+  return {
+    path,
+    head: 'abc123',
+    branch: isMainWorktree ? 'refs/heads/main' : `refs/heads/${path.split('/').at(-1)}`,
+    isBare: false,
+    isMainWorktree
+  }
+}
 
-describe('isDangerousWorktreeRemovalPath', () => {
-  it('rejects empty path', () => {
-    expect(isDangerousWorktreeRemovalPath('', 'C:\\repo')).toBe(true)
-    expect(isDangerousWorktreeRemovalPath('   ', 'C:\\repo')).toBe(true)
-  })
+function missingPath(path: string): Error & { code: string } {
+  return Object.assign(new Error(`missing ${path}`), { code: 'ENOENT' })
+}
 
-  it('rejects path equal to repoPath', () => {
-    expect(isDangerousWorktreeRemovalPath('C:\\repo', 'C:\\repo')).toBe(true)
-  })
-
-  it('rejects filesystem root', () => {
-    expect(isDangerousWorktreeRemovalPath('C:\\', 'C:\\repo')).toBe(true)
-    expect(isDangerousWorktreeRemovalPath('/', '/repo')).toBe(true)
-  })
-
-  it('rejects depth-1 path (e.g. D:\\orca)', () => {
-    expect(isDangerousWorktreeRemovalPath('D:\\orca', 'D:\\repo')).toBe(true)
-  })
-
-  it('rejects depth-2 path (e.g. D:\\apps\\orca)', () => {
-    expect(isDangerousWorktreeRemovalPath('D:\\apps\\orca', 'D:\\repo')).toBe(true)
-  })
-
-  it('rejects cross-drive worktree (the exact data-loss scenario)', () => {
-    expect(
-      isDangerousWorktreeRemovalPath('D:\\workspace\\repo\\wt', 'G:\\repos\\myrepo')
-    ).toBe(true)
-  })
-
-  it('rejects path that contains repoPath', () => {
-    expect(
-      isDangerousWorktreeRemovalPath(
-        'C:\\Users\\dev\\repos',
-        'C:\\Users\\dev\\repos\\myrepo'
-      )
-    ).toBe(true)
-  })
-
-  it('rejects path that contains home directory', () => {
-    const home = process.env.USERPROFILE || process.env.HOME || ''
-    if (home) {
-      expect(isDangerousWorktreeRemovalPath(home, 'C:\\other\\repo')).toBe(true)
+function makeStatPath(filePaths: readonly string[], directoryPaths: readonly string[] = []) {
+  const files = new Set(filePaths)
+  const directories = new Set(directoryPaths)
+  return async (path: string) => {
+    if (files.has(path)) {
+      return { type: 'file' }
     }
+    if (directories.has(path)) {
+      return { type: 'directory' }
+    }
+    throw missingPath(path)
+  }
+}
+
+function makeReadPath(entries: readonly (readonly [string, unknown])[]) {
+  const files = new Map(entries)
+  return async (path: string) => {
+    if (!files.has(path)) {
+      throw missingPath(path)
+    }
+    return files.get(path)
+  }
+}
+
+async function withProcessPlatform<T>(
+  platform: NodeJS.Platform,
+  callback: () => Promise<T>
+): Promise<T> {
+  const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform')
+  Object.defineProperty(process, 'platform', { value: platform })
+  try {
+    return await callback()
+  } finally {
+    if (originalPlatform) {
+      Object.defineProperty(process, 'platform', originalPlatform)
+    }
+  }
+}
+
+describe('getRegisteredDeletableWorktree', () => {
+  it('rejects deleting a worktree that contains another registered worktree', () => {
+    expect(() =>
+      getRegisteredDeletableWorktree('/repo', '/workspaces/parent', [
+        makeGitWorktree('/repo', true),
+        makeGitWorktree('/workspaces/parent'),
+        makeGitWorktree('/workspaces/parent/child')
+      ])
+    ).toThrow(
+      'Refusing to delete worktree because it contains another registered worktree: /workspaces/parent/child'
+    )
   })
 
-  it('allows deep same-drive worktree path', () => {
+  it('does not reject sibling worktree paths that only share a prefix', () => {
     expect(
-      isDangerousWorktreeRemovalPath(
-        'C:\\Users\\dev\\workspaces\\repo\\worktrees\\feature-x',
-        'C:\\Users\\dev\\workspaces\\repo'
-      )
-    ).toBe(false)
+      getRegisteredDeletableWorktree('/repo', '/workspaces/parent', [
+        makeGitWorktree('/repo', true),
+        makeGitWorktree('/workspaces/parent'),
+        makeGitWorktree('/workspaces/parent-copy')
+      ])
+    ).toMatchObject({ path: '/workspaces/parent' })
   })
 
-  it('allows typical worktree sibling path at depth >= 3', () => {
-    expect(
-      isDangerousWorktreeRemovalPath(
-        'C:\\Users\\dev\\worktrees\\repo\\feature-branch',
-        'C:\\Users\\dev\\repos\\myrepo'
-      )
-    ).toBe(false)
+  it('rejects deleting a worktree that contains another registered worktree in a dotdot-prefixed child', () => {
+    expect(() =>
+      getRegisteredDeletableWorktree('/repo', '/workspaces/parent', [
+        makeGitWorktree('/repo', true),
+        makeGitWorktree('/workspaces/parent'),
+        makeGitWorktree('/workspaces/parent/..child')
+      ])
+    ).toThrow(
+      'Refusing to delete worktree because it contains another registered worktree: /workspaces/parent/..child'
+    )
   })
 })
 
-// ─── Part 2: Filesystem integration (all inside os.tmpdir) ───
-
-describe('canSafelyRemoveOrphanedWorktreeDirectory (integration)', () => {
-  const tempDirs: string[] = []
-
-  function makeTempDir(prefix: string): string {
-    const dir = mkdtempSync(join(tmpdir(), prefix))
-    tempDirs.push(dir)
-    return dir
-  }
-
-  function git(cwd: string, ...args: string[]): string {
-    return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: 'pipe' })
-  }
-
-  afterEach(() => {
-    for (const dir of tempDirs.splice(0)) {
-      rmSync(dir, { recursive: true, force: true })
-    }
+describe('canSafelyRemoveOrphanedWorktreeDirectory', () => {
+  it('accepts a linked worktree .git file that points at this repo worktrees entry', async () => {
+    await expect(
+      canSafelyRemoveOrphanedWorktreeDirectory(
+        '/workspaces/orphan',
+        '/repo',
+        makeStatPath(['/workspaces/orphan/.git'], ['/repo/.git']),
+        makeReadPath([
+          ['/workspaces/orphan/.git', 'gitdir: /repo/.git/worktrees/orphan\n'],
+          ['/repo/.git/worktrees/orphan/gitdir', '/workspaces/orphan/.git\n']
+        ])
+      )
+    ).resolves.toBe(true)
   })
 
-  it('returns true for a valid same-drive worktree with correct .git link', async () => {
-    // Setup: create repo and worktree inside the SAME temp root
-    const root = makeTempDir('safety-ok-')
-    const repoPath = join(root, 'main-repo')
-    const wtPath = join(root, 'worktree-feature')
-
-    execFileSync('git', ['init', repoPath], { stdio: 'pipe' })
-    git(repoPath, 'commit', '--allow-empty', '-m', 'init')
-    git(repoPath, 'worktree', 'add', wtPath, '-b', 'feature')
-
-    // Sanity: .git file in worktree points to the repo
-    const gitContent = readFileSync(join(wtPath, '.git'), 'utf8')
-    expect(gitContent).toContain('gitdir:')
-
-    const result = await canSafelyRemoveOrphanedWorktreeDirectory(wtPath, repoPath)
-    expect(result).toBe(true)
+  it('accepts repo worktree admin entries with dotdot-prefixed directory names', async () => {
+    await expect(
+      canSafelyRemoveOrphanedWorktreeDirectory(
+        '/workspaces/orphan',
+        '/repo',
+        makeStatPath(['/workspaces/orphan/.git'], ['/repo/.git']),
+        makeReadPath([
+          ['/workspaces/orphan/.git', 'gitdir: /repo/.git/worktrees/..orphan\n'],
+          ['/repo/.git/worktrees/..orphan/gitdir', '/workspaces/orphan/.git\n']
+        ])
+      )
+    ).resolves.toBe(true)
   })
 
-  it('returns false when .git file points to a DIFFERENT repo', async () => {
-    const root = makeTempDir('safety-wrongrepo-')
-    const repoA = join(root, 'repo-a')
-    const repoB = join(root, 'repo-b')
-    const wtPath = join(root, 'worktree-x')
-
-    execFileSync('git', ['init', repoA], { stdio: 'pipe' })
-    git(repoA, 'commit', '--allow-empty', '-m', 'init')
-    execFileSync('git', ['init', repoB], { stdio: 'pipe' })
-    git(repoB, 'commit', '--allow-empty', '-m', 'init')
-    git(repoA, 'worktree', 'add', wtPath, '-b', 'feat')
-
-    // Ask: is this worktree safe to remove as if it belongs to repoB?
-    const result = await canSafelyRemoveOrphanedWorktreeDirectory(wtPath, repoB)
-    expect(result).toBe(false)
+  it('accepts remote filesystem provider readFile results for linked worktree .git files', async () => {
+    await expect(
+      canSafelyRemoveOrphanedWorktreeDirectory(
+        '/workspaces/orphan',
+        '/repo',
+        makeStatPath(['/workspaces/orphan/.git'], ['/repo/.git']),
+        makeReadPath([
+          [
+            '/workspaces/orphan/.git',
+            { isBinary: false, content: 'gitdir: /repo/.git/worktrees/orphan\n' }
+          ],
+          [
+            '/repo/.git/worktrees/orphan/gitdir',
+            { isBinary: false, content: '/workspaces/orphan/.git\n' }
+          ]
+        ])
+      )
+    ).resolves.toBe(true)
   })
 
-  it('returns false when .git is a directory (real repo, not worktree)', async () => {
-    const root = makeTempDir('safety-notworktree-')
-    const repoPath = join(root, 'real-repo')
-    execFileSync('git', ['init', repoPath], { stdio: 'pipe' })
-
-    const result = await canSafelyRemoveOrphanedWorktreeDirectory(repoPath, repoPath)
-    expect(result).toBe(false)
+  it('preserves forward-slash UNC roots when probing linked worktree .git files', async () => {
+    await expect(
+      canSafelyRemoveOrphanedWorktreeDirectory(
+        '//Server/Share/orphan',
+        '//Server/Repo',
+        makeStatPath(['\\\\Server\\Share\\orphan\\.git'], ['\\\\Server\\Repo\\.git']),
+        makeReadPath([
+          ['\\\\Server\\Share\\orphan\\.git', 'gitdir: //Server/Repo/.git/worktrees/orphan\n'],
+          ['\\\\Server\\Repo\\.git\\worktrees\\orphan\\gitdir', '//Server/Share/orphan/.git\n']
+        ])
+      )
+    ).resolves.toBe(true)
   })
 
-  it('returns false when no .git exists at all', async () => {
-    const root = makeTempDir('safety-nogit-')
-    const plainDir = join(root, 'just-a-dir')
-    execFileSync('git', ['init', root], { stdio: 'pipe' })
+  it('rejects a plain .git directory for unregistered cleanup', async () => {
+    const readPath = vi.fn()
 
-    const { mkdirSync } = await import('fs')
-    mkdirSync(plainDir)
-    writeFileSync(join(plainDir, 'important-data.txt'), 'do not delete')
+    await expect(
+      canSafelyRemoveOrphanedWorktreeDirectory(
+        '/workspaces/orphan',
+        '/repo',
+        async () => ({ type: 'directory' }),
+        readPath
+      )
+    ).resolves.toBe(false)
 
-    const result = await canSafelyRemoveOrphanedWorktreeDirectory(plainDir, root)
-    expect(result).toBe(false)
+    expect(readPath).not.toHaveBeenCalled()
   })
 
-  it('end-to-end: orphaned worktree cleanup preserves user files', async () => {
-    // This test reproduces the EXACT bug scenario:
-    // 1. Create a repo + worktree
-    // 2. Put user files in the worktree
-    // 3. Orphan the worktree (prune it from the repo)
-    // 4. Simulate what the fixed code does: unlink .git only
-    // 5. Verify ALL user files survive
-
-    const root = makeTempDir('safety-e2e-')
-    const repoPath = join(root, 'main-repo')
-    const wtPath = join(root, 'my-worktree')
-
-    execFileSync('git', ['init', repoPath], { stdio: 'pipe' })
-    git(repoPath, 'commit', '--allow-empty', '-m', 'init')
-    git(repoPath, 'worktree', 'add', wtPath, '-b', 'feature')
-
-    // User creates files in the worktree
-    writeFileSync(join(wtPath, 'user-data.txt'), 'critical user data')
-    writeFileSync(join(wtPath, 'project-notes.md'), '# My Notes')
-    const { mkdirSync } = await import('fs')
-    mkdirSync(join(wtPath, 'src'))
-    writeFileSync(join(wtPath, 'src', 'index.ts'), 'console.log("hello")')
-
-    // Orphan the worktree: remove git's tracking without touching the directory
-    git(repoPath, 'worktree', 'remove', '--force', wtPath)
-
-    // Recreate the directory as if the user still has it (simulating stale state)
-    mkdirSync(wtPath)
-    writeFileSync(join(wtPath, 'user-data.txt'), 'critical user data')
-    writeFileSync(join(wtPath, 'project-notes.md'), '# My Notes')
-    mkdirSync(join(wtPath, 'src'))
-    writeFileSync(join(wtPath, 'src', 'index.ts'), 'console.log("hello")')
-    // No .git file — canSafelyRemove should return false
-    const safetyResult = await canSafelyRemoveOrphanedWorktreeDirectory(wtPath, repoPath)
-    expect(safetyResult).toBe(false)
-
-    // Even if safety returned true, the NEW code path only does unlink(.git)
-    // Simulate the fixed code path:
-    const { unlink } = await import('fs/promises')
-    await unlink(join(wtPath, '.git')).catch(() => {})
-
-    // Verify: ALL user files survive
-    expect(existsSync(join(wtPath, 'user-data.txt'))).toBe(true)
-    expect(existsSync(join(wtPath, 'project-notes.md'))).toBe(true)
-    expect(existsSync(join(wtPath, 'src', 'index.ts'))).toBe(true)
-    expect(readFileSync(join(wtPath, 'user-data.txt'), 'utf8')).toBe('critical user data')
-
-    // Count: directory still has all entries
-    const entries = readdirSync(wtPath)
-    expect(entries).toContain('user-data.txt')
-    expect(entries).toContain('project-notes.md')
-    expect(entries).toContain('src')
+  it('rejects a gitdir file that points outside this repo worktrees directory', async () => {
+    await expect(
+      canSafelyRemoveOrphanedWorktreeDirectory(
+        '/workspaces/orphan',
+        '/repo',
+        makeStatPath(['/workspaces/orphan/.git'], ['/repo/.git']),
+        makeReadPath([
+          [
+            '/workspaces/orphan/.git',
+            { isBinary: false, content: 'gitdir: /other/.git/worktrees/orphan\n' }
+          ]
+        ])
+      )
+    ).resolves.toBe(false)
   })
 
-  it('cross-drive scenario: isDangerous blocks before canSafely is even called', async () => {
-    // Simulates D:\orca (worktree) vs G:\repos\orca (repo)
-    // isDangerousWorktreeRemovalPath must return true, blocking everything
-    const dangerous = isDangerousWorktreeRemovalPath('D:\\orca', 'G:\\repos\\orca')
-    expect(dangerous).toBe(true)
+  it('rejects a copied .git file when the admin entry points at another candidate path', async () => {
+    await expect(
+      canSafelyRemoveOrphanedWorktreeDirectory(
+        '/workspaces/reused',
+        '/repo',
+        makeStatPath(['/workspaces/reused/.git'], ['/repo/.git']),
+        makeReadPath([
+          ['/workspaces/reused/.git', 'gitdir: /repo/.git/worktrees/other\n'],
+          ['/repo/.git/worktrees/other/gitdir', '/workspaces/other/.git\n']
+        ])
+      )
+    ).resolves.toBe(false)
+  })
 
-    // So canSafelyRemoveOrphanedWorktreeDirectory would also return false
-    const safe = await canSafelyRemoveOrphanedWorktreeDirectory('D:\\orca', 'G:\\repos\\orca')
-    expect(safe).toBe(false)
+  it('rejects POSIX admin backlinks that differ only by case', async () => {
+    await withProcessPlatform('win32', async () => {
+      await expect(
+        canSafelyRemoveOrphanedWorktreeDirectory(
+          '/workspaces/reused',
+          '/repo',
+          makeStatPath(['/workspaces/reused/.git'], ['/repo/.git']),
+          makeReadPath([
+            ['/workspaces/reused/.git', 'gitdir: /repo/.git/worktrees/reused\n'],
+            ['/repo/.git/worktrees/reused/gitdir', '/workspaces/Reused/.git\n']
+          ])
+        )
+      ).resolves.toBe(false)
+    })
+  })
+
+  it('accepts a pruned admin entry when the candidate .git points under this repo worktrees dir', async () => {
+    await expect(
+      canSafelyRemoveOrphanedWorktreeDirectory(
+        '/workspaces/orphan',
+        '/repo',
+        makeStatPath(['/workspaces/orphan/.git'], ['/repo/.git']),
+        makeReadPath([['/workspaces/orphan/.git', 'gitdir: /repo/.git/worktrees/orphan\n']])
+      )
+    ).resolves.toBe(true)
+  })
+
+  it('rejects existing admin entries with a missing gitdir backlink', async () => {
+    await expect(
+      canSafelyRemoveOrphanedWorktreeDirectory(
+        '/workspaces/orphan',
+        '/repo',
+        makeStatPath(['/workspaces/orphan/.git'], ['/repo/.git', '/repo/.git/worktrees/orphan']),
+        makeReadPath([['/workspaces/orphan/.git', 'gitdir: /repo/.git/worktrees/orphan\n']])
+      )
+    ).resolves.toBe(false)
+  })
+
+  it('rejects symlink .git entries from remote lstat-shaped providers', async () => {
+    const readPath = vi.fn()
+
+    await expect(
+      canSafelyRemoveOrphanedWorktreeDirectory(
+        '/workspaces/orphan',
+        '/repo',
+        async () => ({ type: 'symlink' }),
+        readPath
+      )
+    ).resolves.toBe(false)
+
+    expect(readPath).not.toHaveBeenCalled()
+  })
+
+  it('rejects separate-git-dir sibling repos when the admin gitdir is missing', async () => {
+    await expect(
+      canSafelyRemoveOrphanedWorktreeDirectory(
+        '/workspaces/orphan',
+        '/repo',
+        makeStatPath(['/workspaces/orphan/.git', '/repo/.git']),
+        makeReadPath([
+          ['/workspaces/orphan/.git', 'gitdir: /git/other.git\n'],
+          ['/repo/.git', 'gitdir: /git/repo.git\n']
+        ])
+      )
+    ).resolves.toBe(false)
+  })
+
+  it('rejects separate git dirs under worktrees when the admin gitdir is missing', async () => {
+    await expect(
+      canSafelyRemoveOrphanedWorktreeDirectory(
+        '/workspaces/reused',
+        '/repo',
+        makeStatPath(['/workspaces/reused/.git', '/repo/.git']),
+        makeReadPath([
+          ['/workspaces/reused/.git', 'gitdir: /git/worktrees/other.git\n'],
+          ['/repo/.git', 'gitdir: /git/worktrees/repo.git\n']
+        ])
+      )
+    ).resolves.toBe(false)
+  })
+
+  it('accepts a repo path that is itself a linked worktree', async () => {
+    await expect(
+      canSafelyRemoveOrphanedWorktreeDirectory(
+        '/workspaces/orphan',
+        '/repos/main-linked',
+        makeStatPath(['/workspaces/orphan/.git', '/repos/main-linked/.git']),
+        makeReadPath([
+          ['/workspaces/orphan/.git', 'gitdir: /common/.git/worktrees/orphan\n'],
+          ['/repos/main-linked/.git', 'gitdir: /common/.git/worktrees/main-linked\n'],
+          ['/common/.git/worktrees/main-linked/gitdir', '/repos/main-linked/.git\n'],
+          ['/common/.git/worktrees/orphan/gitdir', '/workspaces/orphan/.git\n']
+        ])
+      )
+    ).resolves.toBe(true)
   })
 })

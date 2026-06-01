@@ -1,14 +1,20 @@
+/* eslint-disable max-lines -- Why: runtime git routing tests share compatibility-cache and IPC stubs; splitting would hide cross-environment contract drift. */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   bulkDiscardRuntimeGitPaths,
   bulkStageRuntimeGitPaths,
   cancelRuntimeGenerateCommitMessage,
   commitRuntimeGit,
+  discoverRuntimeCommitMessageModels,
+  fastForwardRuntimeGit,
+  fetchRuntimeGit,
   generateRuntimeCommitMessage,
   getRuntimeGitDiff,
   getRuntimeGitHistory,
+  getRuntimeGitIgnoredPaths,
   getRuntimeGitStatus,
-  pushRuntimeGit
+  pushRuntimeGit,
+  rebaseRuntimeGitFromBase
 } from './runtime-git-client'
 import {
   createCompatibleRuntimeStatusResponseIfNeeded,
@@ -17,13 +23,18 @@ import {
 import { clearRuntimeCompatibilityCacheForTests } from './runtime-rpc-client'
 
 const gitStatus = vi.fn()
+const gitCheckIgnored = vi.fn()
 const gitDiff = vi.fn()
 const gitHistory = vi.fn()
 const gitBulkStage = vi.fn()
 const gitBulkDiscard = vi.fn()
 const gitCommit = vi.fn()
+const gitFetch = vi.fn()
+const gitFastForward = vi.fn()
 const gitPush = vi.fn()
+const gitRebaseFromBase = vi.fn()
 const gitGenerateCommitMessage = vi.fn()
+const gitDiscoverCommitMessageModels = vi.fn()
 const gitCancelGenerateCommitMessage = vi.fn()
 const runtimeEnvironmentCall = vi.fn()
 const runtimeEnvironmentTransportCall = vi.fn()
@@ -32,13 +43,18 @@ const runtimeCall = vi.fn()
 beforeEach(() => {
   clearRuntimeCompatibilityCacheForTests()
   gitStatus.mockReset()
+  gitCheckIgnored.mockReset()
   gitDiff.mockReset()
   gitHistory.mockReset()
   gitBulkStage.mockReset()
   gitBulkDiscard.mockReset()
   gitCommit.mockReset()
+  gitFetch.mockReset()
+  gitFastForward.mockReset()
   gitPush.mockReset()
+  gitRebaseFromBase.mockReset()
   gitGenerateCommitMessage.mockReset()
+  gitDiscoverCommitMessageModels.mockReset()
   gitCancelGenerateCommitMessage.mockReset()
   runtimeEnvironmentCall.mockReset()
   runtimeEnvironmentTransportCall.mockReset()
@@ -50,13 +66,18 @@ beforeEach(() => {
     api: {
       git: {
         status: gitStatus,
+        checkIgnored: gitCheckIgnored,
         diff: gitDiff,
         history: gitHistory,
         bulkStage: gitBulkStage,
         bulkDiscard: gitBulkDiscard,
         commit: gitCommit,
+        fetch: gitFetch,
+        fastForward: gitFastForward,
         push: gitPush,
+        rebaseFromBase: gitRebaseFromBase,
         generateCommitMessage: gitGenerateCommitMessage,
+        discoverCommitMessageModels: gitDiscoverCommitMessageModels,
         cancelGenerateCommitMessage: gitCancelGenerateCommitMessage
       },
       runtime: { call: runtimeCall },
@@ -109,6 +130,28 @@ describe('runtime git client', () => {
       worktreePath: '/repo',
       connectionId: undefined
     })
+  })
+
+  it('checks ignored paths through local git IPC', async () => {
+    gitCheckIgnored.mockResolvedValue(['dist/bundle.js'])
+
+    const result = await getRuntimeGitIgnoredPaths(
+      {
+        settings: { activeRuntimeEnvironmentId: null },
+        worktreeId: 'wt-1',
+        worktreePath: '/repo',
+        connectionId: 'ssh-1'
+      },
+      ['dist/bundle.js', 'src/index.ts']
+    )
+
+    expect(gitCheckIgnored).toHaveBeenCalledWith({
+      worktreePath: '/repo',
+      connectionId: 'ssh-1',
+      paths: ['dist/bundle.js', 'src/index.ts']
+    })
+    expect(result).toEqual(['dist/bundle.js'])
+    expect(runtimeEnvironmentCall).not.toHaveBeenCalled()
   })
 
   it('uses local git IPC for history when no remote runtime is active', async () => {
@@ -219,6 +262,32 @@ describe('runtime git client', () => {
     })
   })
 
+  it('checks ignored paths through the active runtime environment', async () => {
+    runtimeEnvironmentCall.mockResolvedValue({
+      id: 'rpc-1',
+      ok: true,
+      result: ['dist/bundle.js'],
+      _meta: { runtimeId: 'remote-runtime' }
+    })
+
+    const result = await getRuntimeGitIgnoredPaths(
+      {
+        settings: { activeRuntimeEnvironmentId: 'env-1' },
+        worktreeId: 'wt-1',
+        worktreePath: '/repo'
+      },
+      ['dist/bundle.js']
+    )
+
+    expect(runtimeEnvironmentCall).toHaveBeenCalledWith({
+      selector: 'env-1',
+      method: 'git.checkIgnored',
+      params: { worktree: 'wt-1', paths: ['dist/bundle.js'] },
+      timeoutMs: 15_000
+    })
+    expect(result).toEqual(['dist/bundle.js'])
+  })
+
   it('routes bulk mutations and remote operations through the active runtime', async () => {
     runtimeEnvironmentCall.mockResolvedValue({
       id: 'rpc-1',
@@ -237,7 +306,13 @@ describe('runtime git client', () => {
     await commitRuntimeGit(context, 'feat: test')
     await generateRuntimeCommitMessage(context)
     await cancelRuntimeGenerateCommitMessage(context)
-    await pushRuntimeGit(context, { publish: true, pushTarget: { remote: 'origin' } as never })
+    await pushRuntimeGit(context, {
+      publish: true,
+      pushTarget: { remoteName: 'origin', branchName: 'feature' }
+    })
+    await fetchRuntimeGit(context, { remoteName: 'fork', branchName: 'feature' })
+    await fastForwardRuntimeGit(context, { remoteName: 'fork', branchName: 'feature' })
+    await rebaseRuntimeGitFromBase(context, 'origin/main')
 
     expect(runtimeEnvironmentCall).toHaveBeenNthCalledWith(1, {
       selector: 'env-1',
@@ -260,7 +335,7 @@ describe('runtime git client', () => {
     expect(runtimeEnvironmentCall).toHaveBeenNthCalledWith(4, {
       selector: 'env-1',
       method: 'git.generateCommitMessage',
-      params: { worktree: 'wt-1' },
+      params: { worktree: 'wt-1', commitMessageDiscoveryHostKey: 'runtime:env-1' },
       timeoutMs: 75_000
     })
     expect(runtimeEnvironmentCall).toHaveBeenNthCalledWith(5, {
@@ -272,7 +347,35 @@ describe('runtime git client', () => {
     expect(runtimeEnvironmentCall).toHaveBeenNthCalledWith(6, {
       selector: 'env-1',
       method: 'git.push',
-      params: { worktree: 'wt-1', publish: true, pushTarget: { remote: 'origin' } },
+      params: {
+        worktree: 'wt-1',
+        publish: true,
+        pushTarget: { remoteName: 'origin', branchName: 'feature' }
+      },
+      timeoutMs: 30_000
+    })
+    expect(runtimeEnvironmentCall).toHaveBeenNthCalledWith(7, {
+      selector: 'env-1',
+      method: 'git.fetch',
+      params: {
+        worktree: 'wt-1',
+        pushTarget: { remoteName: 'fork', branchName: 'feature' }
+      },
+      timeoutMs: 30_000
+    })
+    expect(runtimeEnvironmentCall).toHaveBeenNthCalledWith(8, {
+      selector: 'env-1',
+      method: 'git.fastForward',
+      params: {
+        worktree: 'wt-1',
+        pushTarget: { remoteName: 'fork', branchName: 'feature' }
+      },
+      timeoutMs: 30_000
+    })
+    expect(runtimeEnvironmentCall).toHaveBeenNthCalledWith(9, {
+      selector: 'env-1',
+      method: 'git.rebaseFromBase',
+      params: { worktree: 'wt-1', baseRef: 'origin/main' },
       timeoutMs: 30_000
     })
   })
@@ -312,9 +415,37 @@ describe('runtime git client', () => {
         worktree: 'wt-1',
         commitMessageAi,
         agentCmdOverrides,
-        enableGitHubAttribution: true
+        enableGitHubAttribution: true,
+        commitMessageDiscoveryHostKey: 'runtime:env-1'
       },
       timeoutMs: 75_000
     })
+  })
+
+  it('discovers commit-message models through the active runtime', async () => {
+    const agentCmdOverrides = { cursor: 'cursor-agent' }
+    runtimeEnvironmentCall.mockResolvedValue({
+      id: 'rpc-1',
+      ok: true,
+      result: { success: true, models: [{ id: 'auto', label: 'Auto' }], defaultModelId: 'auto' },
+      _meta: { runtimeId: 'remote-runtime' }
+    })
+
+    await discoverRuntimeCommitMessageModels(
+      {
+        settings: { activeRuntimeEnvironmentId: 'env-1', agentCmdOverrides },
+        worktreeId: 'wt-1',
+        worktreePath: '/repo'
+      },
+      'cursor'
+    )
+
+    expect(runtimeEnvironmentCall).toHaveBeenCalledWith({
+      selector: 'env-1',
+      method: 'git.discoverCommitMessageModels',
+      params: { worktree: 'wt-1', agentId: 'cursor', agentCmdOverrides },
+      timeoutMs: 75_000
+    })
+    expect(gitDiscoverCommitMessageModels).not.toHaveBeenCalled()
   })
 })

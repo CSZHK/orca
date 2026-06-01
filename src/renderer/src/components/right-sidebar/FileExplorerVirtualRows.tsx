@@ -31,7 +31,11 @@ type FileExplorerVirtualRowsProps = {
   onStartNew: (type: 'file' | 'folder', parentPath: string, depth: number) => void
   onStartRename: (node: TreeNode) => void
   onDuplicate: (node: TreeNode) => void
+  onAddFolderAsProject: (node: TreeNode) => void
+  canAddFolderAsProject: (node: TreeNode) => boolean
   onRequestDelete: (node: TreeNode) => void
+  onCollapseFolderSubtree: (node: TreeNode) => void
+  onFindInFolder: (node: TreeNode) => void
   onMoveDrop: (sourcePath: string, destDir: string) => void
   onDragTargetChange: (dir: string | null) => void
   onDragSourceChange: (path: string | null) => void
@@ -67,7 +71,11 @@ export function FileExplorerVirtualRows(props: FileExplorerVirtualRowsProps): Re
     onStartNew,
     onStartRename,
     onDuplicate,
+    onAddFolderAsProject,
+    canAddFolderAsProject,
     onRequestDelete,
+    onCollapseFolderSubtree,
+    onFindInFolder,
     onMoveDrop,
     onDragTargetChange,
     onDragSourceChange,
@@ -149,6 +157,7 @@ export function FileExplorerVirtualRows(props: FileExplorerVirtualRowsProps): Re
               isExpanded={expanded.has(n.path)}
               isLoading={n.isDirectory && Boolean(dirCache[n.path]?.loading)}
               isSelected={selectedPaths.has(n.path) || activeFileId === n.path}
+              selectedPaths={selectedPaths}
               isFlashing={flashingPath === n.path}
               nodeStatus={nodeStatus}
               statusColor={nodeStatus ? STATUS_COLORS[nodeStatus] : null}
@@ -164,7 +173,11 @@ export function FileExplorerVirtualRows(props: FileExplorerVirtualRowsProps): Re
               onStartNew={onStartNew}
               onStartRename={onStartRename}
               onDuplicate={onDuplicate}
+              onAddFolderAsProject={() => onAddFolderAsProject(n)}
+              canAddAsProject={canAddFolderAsProject(n)}
               onRequestDelete={() => onRequestDelete(n)}
+              onCollapseFolderSubtree={() => onCollapseFolderSubtree(n)}
+              onFindInFolder={() => onFindInFolder(n)}
               onMoveDrop={onMoveDrop}
               onDragTargetChange={onDragTargetChange}
               onDragSourceChange={onDragSourceChange}

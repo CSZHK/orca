@@ -11,7 +11,6 @@ import {
   ChevronRight,
   LoaderCircle,
   MemoryStick,
-  Moon,
   RotateCw,
   Terminal,
   Trash2,
@@ -29,29 +28,47 @@ import {
   DialogTitle
 } from '@/components/ui/dialog'
 import { cn } from '@/lib/utils'
+import { useMountedRef } from '@/hooks/useMountedRef'
 import { activateAndRevealWorktree } from '@/lib/worktree-activation'
 import { activateTabAndFocusPane } from '@/lib/activate-tab-and-focus-pane'
+import { installWindowVisibilityInterval } from '@/lib/window-visibility-interval'
 import { useAppStore } from '../../store'
-import { useAllWorktrees, useWorktreeMap } from '../../store/selectors'
+import { useWorktreeMap } from '../../store/selectors'
 import { runWorktreeDelete } from '../sidebar/delete-worktree-flow'
-import { runSleepWorktree } from '../sidebar/sleep-worktree-flow'
 import { useDaemonActions, DaemonActionDialog } from '../shared/useDaemonActions'
 import type { AppMemory, UsageValues, Worktree } from '../../../../shared/types'
 import { ORPHAN_WORKTREE_ID } from '../../../../shared/constants'
 import { isFolderRepo } from '../../../../shared/repo-kind'
 import { isWorkspaceOldForCleanup } from '../../../../shared/workspace-cleanup'
-import { parsePaneKey } from '../../../../shared/stable-pane-id'
 import {
   mergeSnapshotAndSessions,
   UNATTRIBUTED_REPO_ID,
   type DaemonSession,
   type Metric,
-  type UnifiedRepoGroup,
+  type UnifiedProjectGroup,
   type UnifiedSessionRow,
   type UnifiedWorktreeRow
 } from './mergeSnapshotAndSessions'
 import { WorkspaceSpaceCompactPanel } from './WorkspaceSpaceCompactPanel'
 import { STATUS_BAR_CONTEXT_MENU_EXEMPT_PROPS } from './status-bar-context-menu-policy'
+import {
+  isResourceSessionActivationKey,
+  navigateResourceSessionToTab
+} from './resource-session-navigation'
+import {
+  getResourceUsageAllWorktrees,
+  getResourceUsageRepos,
+  getResourceUsageRuntimePaneTitlesByTabId,
+  getResourceUsageTabsByWorktree
+} from './resource-usage-open-slices'
+import {
+  resolveResourceUsageSpaceScanReady,
+  type ResourceUsageSpaceScanSnapshot
+} from './resource-usage-space-scan-ready'
+import {
+  getResourceManagerAriaLabel,
+  getResourceManagerTooltipLines
+} from './resource-manager-terminal-copy'
 
 const POLL_MS = 2_000
 const SESSIONS_POLL_MS = 10_000
@@ -290,7 +307,7 @@ function sortWorktrees(list: UnifiedWorktreeRow[], sort: SortOption): UnifiedWor
   return copy
 }
 
-function sortRepoGroups(groups: UnifiedRepoGroup[], sort: SortOption): UnifiedRepoGroup[] {
+function sortProjectGroups(groups: UnifiedProjectGroup[], sort: SortOption): UnifiedProjectGroup[] {
   const copy = [...groups]
   if (sort === 'memory') {
     copy.sort((a, b) => compareMetricDesc(a.memory, b.memory))
@@ -334,7 +351,7 @@ function SessionRow({
       onKeyDown={
         clickable
           ? (e) => {
-              if (e.key === 'Enter' || e.key === ' ') {
+              if (isResourceSessionActivationKey(e.key)) {
                 e.preventDefault()
                 handleClick()
               }
@@ -384,20 +401,20 @@ function SessionRow({
 function WorktreeRow({
   worktree,
   storeRecord,
+  activeWorktreeId,
   isCollapsed,
   onToggle,
   onNavigate,
-  onSleep,
   onDelete,
   onKillSession,
   navigateToTab
 }: {
   worktree: UnifiedWorktreeRow
   storeRecord: Worktree | null
+  activeWorktreeId: string | null
   isCollapsed: boolean
   onToggle: () => void
   onNavigate: () => void
-  onSleep: () => void
   onDelete: () => void
   onKillSession: (session: UnifiedSessionRow) => void
   navigateToTab: (tabId: string, paneKey: string | null) => void
@@ -410,10 +427,12 @@ function WorktreeRow({
   const isSynthetic =
     worktree.worktreeId === ORPHAN_WORKTREE_ID || worktree.repoId === UNATTRIBUTED_REPO_ID
   const isNavigable = !isSynthetic
-  // Why: Sleep / Delete affordances act on a sidebar worktree record; without
+  // Why: Delete acts on a sidebar worktree record; without
   // one (synthesized SSH rows whose worktreeId isn't in worktreeById, or
-  // synthetic buckets) we hide them but keep the row clickable for navigation.
-  const showWorktreeActions = !isSynthetic && storeRecord !== null
+  // synthetic buckets), or for the active worktree, we hide it but keep the
+  // row clickable for navigation.
+  const showWorktreeActions =
+    !isSynthetic && storeRecord !== null && worktree.worktreeId !== activeWorktreeId
   const isMainWorktree = storeRecord?.isMainWorktree ?? false
   const rowLabel = storeRecord?.displayName?.trim() || worktree.worktreeName
 
@@ -442,7 +461,7 @@ function WorktreeRow({
         <button
           type="button"
           onClick={onNavigate}
-          aria-label={`Open workspace ${rowLabel}`}
+          aria-label={`Resume workspace ${rowLabel}`}
           className="flex-1 min-w-0 py-2 pr-2 pl-1 text-left flex items-center gap-1.5"
           disabled={!isNavigable}
         >
@@ -471,25 +490,6 @@ function WorktreeRow({
             </span>
             {showWorktreeActions && (
               <div className="absolute inset-0 flex items-center justify-end gap-0.5 opacity-0 pointer-events-none transition-opacity group-hover/wtrow:opacity-100 group-hover/wtrow:pointer-events-auto group-focus-within/wtrow:opacity-100 group-focus-within/wtrow:pointer-events-auto">
-                <Tooltip delayDuration={300}>
-                  <TooltipTrigger asChild>
-                    <button
-                      type="button"
-                      onClick={onSleep}
-                      aria-label={`Sleep workspace ${rowLabel}`}
-                      className="p-0.5 rounded text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"
-                    >
-                      <Moon className="size-3" />
-                    </button>
-                  </TooltipTrigger>
-                  <TooltipContent
-                    side="top"
-                    sideOffset={4}
-                    className="z-[70] max-w-[200px] text-pretty"
-                  >
-                    Sleep — close all panels in this workspace to free memory.
-                  </TooltipContent>
-                </Tooltip>
                 <Tooltip delayDuration={300}>
                   <TooltipTrigger asChild>
                     <button
@@ -545,29 +545,29 @@ function ResourceTree({
   collapsedRepos,
   toggleRepo,
   collapsedWorktrees,
+  activeWorktreeId,
   toggleWorktree,
   navigateToWorktree,
   navigateToTab,
-  onSleep,
   onDelete,
   onKillSession
 }: {
-  repos: UnifiedRepoGroup[]
+  repos: UnifiedProjectGroup[]
   sortOption: SortOption
   collapsedRepos: Set<string>
   toggleRepo: (repoId: string) => void
   collapsedWorktrees: Set<string>
+  activeWorktreeId: string | null
   toggleWorktree: (worktreeId: string) => void
   navigateToWorktree: (worktreeId: string) => void
   navigateToTab: (tabId: string, paneKey: string | null) => void
-  onSleep: (worktreeId: string) => void
   onDelete: (worktreeId: string) => void
   onKillSession: (session: UnifiedSessionRow) => void
 }): React.JSX.Element {
   const worktreeById = useWorktreeMap()
 
   const sortedRepos = useMemo(() => {
-    const grouped = sortRepoGroups(repos, sortOption)
+    const grouped = sortProjectGroups(repos, sortOption)
     return grouped.map((repo) => ({
       ...repo,
       worktrees: sortWorktrees(repo.worktrees, sortOption)
@@ -581,10 +581,10 @@ function ResourceTree({
         key={wt.worktreeId}
         worktree={wt}
         storeRecord={storeRecord}
+        activeWorktreeId={activeWorktreeId}
         isCollapsed={collapsedWorktrees.has(wt.worktreeId)}
         onToggle={() => toggleWorktree(wt.worktreeId)}
         onNavigate={() => navigateToWorktree(wt.worktreeId)}
-        onSleep={() => onSleep(wt.worktreeId)}
         onDelete={() => onDelete(wt.worktreeId)}
         onKillSession={onKillSession}
         navigateToTab={navigateToTab}
@@ -656,16 +656,14 @@ export function ResourceUsageStatusSegment({
   const fetchSnapshot = useAppStore((s) => s.fetchMemorySnapshot)
   const workspaceSessionReady = useAppStore((s) => s.workspaceSessionReady)
   const ptyIdsByTabId = useAppStore((s) => s.ptyIdsByTabId)
-  const tabsByWorktree = useAppStore((s) => s.tabsByWorktree)
-  const runtimePaneTitlesByTabId = useAppStore((s) => s.runtimePaneTitlesByTabId)
   const setActiveView = useAppStore((s) => s.setActiveView)
   const openModal = useAppStore((s) => s.openModal)
   const openSpacePage = useAppStore((s) => s.openSpacePage)
+  const recordFeatureInteraction = useAppStore((s) => s.recordFeatureInteraction)
   const activeView = useAppStore((s) => s.activeView)
+  const activeWorktreeId = useAppStore((s) => s.activeWorktreeId)
   const workspaceSpaceScannedAt = useAppStore((s) => s.workspaceSpaceAnalysis?.scannedAt ?? null)
   const workspaceSpaceScanning = useAppStore((s) => s.workspaceSpaceScanning)
-  const repos = useAppStore((s) => s.repos)
-  const allWorktrees = useAllWorktrees()
   const activeRuntimeEnvironmentId = useAppStore(
     (s) => s.settings?.activeRuntimeEnvironmentId ?? null
   )
@@ -680,9 +678,26 @@ export function ResourceUsageStatusSegment({
   const [sessionsError, setSessionsError] = useState(false)
   const [killConfirm, setKillConfirm] = useState<UnifiedSessionRow | null>(null)
   const [killing, setKilling] = useState(false)
-  const [spaceScanReady, setSpaceScanReady] = useState(false)
-  const previousSpaceScanningRef = useRef(workspaceSpaceScanning)
-  const lastSeenSpaceScanAtRef = useRef<number | null>(workspaceSpaceScannedAt)
+  const [spaceScanSnapshot, setSpaceScanSnapshot] = useState<ResourceUsageSpaceScanSnapshot>(
+    () => ({
+      ready: false,
+      previousScanning: workspaceSpaceScanning,
+      lastSeenScannedAt: workspaceSpaceScannedAt
+    })
+  )
+  // Why: tab titles can update on terminal keystrokes. The resource popover's
+  // merged tree needs them only while open, so closed status-bar badges should
+  // not subscribe to those high-churn maps.
+  const runtimePaneTitlesByTabId = useAppStore((s) =>
+    getResourceUsageRuntimePaneTitlesByTabId(s, open, runtimeEnvironmentActive)
+  )
+  const repos = useAppStore((s) => getResourceUsageRepos(s, open, runtimeEnvironmentActive))
+  const allWorktrees = useAppStore((s) =>
+    getResourceUsageAllWorktrees(s, open, runtimeEnvironmentActive)
+  )
+  const tabsByWorktree = useAppStore((s) =>
+    getResourceUsageTabsByWorktree(s, open, runtimeEnvironmentActive)
+  )
   // Why: this segment only understands the local Electron PTY/resource daemon.
   // While a runtime server is active, hiding local samples avoids showing or
   // killing sessions from the wrong machine.
@@ -692,21 +707,49 @@ export function ResourceUsageStatusSegment({
   // fall to <body>. We park a ref on the popover body so we can restore focus
   // somewhere stable for keyboard users.
   const popoverBodyRef = useRef<HTMLDivElement | null>(null)
+  const popoverBodyFocusFrameRef = useRef<number | null>(null)
+  const mountedRef = useMountedRef()
+
+  const cancelPopoverBodyFocusFrame = useCallback((): void => {
+    if (popoverBodyFocusFrameRef.current === null) {
+      return
+    }
+    cancelAnimationFrame(popoverBodyFocusFrameRef.current)
+    popoverBodyFocusFrameRef.current = null
+  }, [])
+
+  const setPopoverBodyNode = useCallback(
+    (node: HTMLDivElement | null): void => {
+      // Why: the queued post-kill focus is only valid while the popover body exists.
+      if (!node) {
+        cancelPopoverBodyFocusFrame()
+      }
+      popoverBodyRef.current = node
+    },
+    [cancelPopoverBodyFocusFrame]
+  )
 
   const refreshSessions = useCallback(async () => {
     if (runtimeEnvironmentActive) {
-      setSessions([])
-      setSessionsError(false)
+      if (mountedRef.current) {
+        setSessions([])
+        setSessionsError(false)
+      }
       return
     }
     try {
       const result = await window.api.pty.listSessions()
+      if (!mountedRef.current) {
+        return
+      }
       setSessions(result)
       setSessionsError(false)
     } catch {
-      setSessionsError(true)
+      if (mountedRef.current) {
+        setSessionsError(true)
+      }
     }
-  }, [runtimeEnvironmentActive])
+  }, [mountedRef, runtimeEnvironmentActive])
 
   const daemonActions = useDaemonActions({
     onRestartSettled: () => {
@@ -721,37 +764,24 @@ export function ResourceUsageStatusSegment({
 
   // Why: Space scans can finish after the user backs out of the full page or
   // closes this popover; the status-bar trigger becomes the handoff point.
-  useEffect(() => {
-    if (runtimeEnvironmentActive) {
-      setSpaceScanReady(false)
-      previousSpaceScanningRef.current = false
-      return
-    }
-    const scannedAt = workspaceSpaceScannedAt
-    const wasScanning = previousSpaceScanningRef.current
-    const scanCompleted =
-      wasScanning &&
-      !workspaceSpaceScanning &&
-      scannedAt !== null &&
-      scannedAt !== lastSeenSpaceScanAtRef.current
-
-    if (scanCompleted) {
-      lastSeenSpaceScanAtRef.current = scannedAt
-      setSpaceScanReady(!open && activeView !== 'space')
-    } else if (spaceScanReady && (open || activeView === 'space')) {
-      setSpaceScanReady(false)
-      lastSeenSpaceScanAtRef.current = scannedAt
-    }
-
-    previousSpaceScanningRef.current = workspaceSpaceScanning
-  }, [
-    activeView,
-    open,
+  const nextSpaceScanSnapshot = resolveResourceUsageSpaceScanReady({
+    snapshot: spaceScanSnapshot,
     runtimeEnvironmentActive,
-    spaceScanReady,
-    workspaceSpaceScannedAt,
-    workspaceSpaceScanning
-  ])
+    open,
+    activeView,
+    scannedAt: workspaceSpaceScannedAt,
+    scanning: workspaceSpaceScanning
+  })
+  if (
+    nextSpaceScanSnapshot.ready !== spaceScanSnapshot.ready ||
+    nextSpaceScanSnapshot.previousScanning !== spaceScanSnapshot.previousScanning ||
+    nextSpaceScanSnapshot.lastSeenScannedAt !== spaceScanSnapshot.lastSeenScannedAt
+  ) {
+    // Why: keep the scan transition render-time without mutating refs during
+    // render; React can safely retry this guarded state update before commit.
+    setSpaceScanSnapshot(nextSpaceScanSnapshot)
+  }
+  const spaceScanReady = nextSpaceScanSnapshot.ready
 
   // Poll memory + sessions when popover is open. Sessions also poll in the
   // background at a slower rate so the badge count stays reasonably fresh
@@ -780,23 +810,13 @@ export function ResourceUsageStatusSegment({
       setSessionsError(false)
       return
     }
-    const refreshIfVisible = (): void => {
-      if (document.visibilityState === 'visible' && document.hasFocus()) {
-        void refreshSessions()
-      }
-    }
-    void refreshSessions()
     // Why: the closed-popover badge is informational. Polling daemon sessions
     // while the whole window is hidden keeps IPC and daemon list calls hot for
-    // no visible UI; focus/visibility refreshes catch the badge up immediately.
-    const interval = setInterval(refreshIfVisible, SESSIONS_POLL_MS)
-    window.addEventListener('focus', refreshIfVisible)
-    document.addEventListener('visibilitychange', refreshIfVisible)
-    return () => {
-      clearInterval(interval)
-      window.removeEventListener('focus', refreshIfVisible)
-      document.removeEventListener('visibilitychange', refreshIfVisible)
-    }
+    // no visible UI; visibility refreshes catch the badge up immediately.
+    return installWindowVisibilityInterval({
+      run: () => void refreshSessions(),
+      intervalMs: SESSIONS_POLL_MS
+    })
   }, [runtimeEnvironmentActive, refreshSessions])
 
   const repoDisplayNameById = useMemo(() => {
@@ -924,6 +944,17 @@ export function ResourceUsageStatusSegment({
   // empty/stale even though the resource numbers look fine.
   const sessionsOnlyError =
     !runtimeEnvironmentActive && sessionsError && memorySnapshotError === null
+  const resourceManagerTooltipLines = getResourceManagerTooltipLines({
+    memoryLabel: memBadgeLabel,
+    sessionCount: sessions.length,
+    runtimeEnvironmentActive,
+    spaceScanReady
+  })
+  const resourceManagerAriaLabel = getResourceManagerAriaLabel({
+    sessionCount: sessions.length,
+    runtimeEnvironmentActive,
+    spaceScanReady
+  })
 
   const toggleRepo = useCallback((repoId: string): void => {
     setCollapsedRepos((prev) => {
@@ -949,10 +980,9 @@ export function ResourceUsageStatusSegment({
     })
   }, [])
 
-  // Why: navigation handlers leave the popover open so users can chain
-  // multiple jumps (e.g. browse worktrees, hop between terminals) without
-  // having to re-open the popover each time. The popover still closes via
-  // its own outside-click / Escape handlers.
+  // Why: worktree navigation leaves the popover open so users can browse the
+  // tree without reopening it; bound terminal rows close explicitly because
+  // focus transfer is intentionally suppressed by onFocusOutside below.
   const navigateToWorktree = useCallback((worktreeId: string): void => {
     if (worktreeId === ORPHAN_WORKTREE_ID || worktreeId.startsWith(`${UNATTRIBUTED_REPO_ID}::`)) {
       return
@@ -962,19 +992,13 @@ export function ResourceUsageStatusSegment({
 
   const navigateToTab = useCallback(
     (tabId: string, paneKey: string | null) => {
-      // Resolve the tab → worktree from the store so we can also reveal the
-      // worktree in the sidebar before flipping the active tab.
-      for (const [worktreeId, tabs] of Object.entries(tabsByWorktree)) {
-        if (tabs.some((t) => t.id === tabId)) {
-          activateAndRevealWorktree(worktreeId)
-          break
-        }
-      }
-      setActiveView('terminal')
-      // Why: paneKey suffixes are stable UUID leaf ids after replay/reload.
-      // Legacy numeric keys degrade to tab-only activation instead of guessing.
-      const parsed = paneKey ? parsePaneKey(paneKey) : null
-      activateTabAndFocusPane(tabId, parsed?.tabId === tabId ? parsed.leafId : null)
+      navigateResourceSessionToTab(tabId, paneKey, {
+        tabsByWorktree,
+        setOpen,
+        setActiveView,
+        activateAndRevealWorktree,
+        activateTabAndFocusPane
+      })
     },
     [tabsByWorktree, setActiveView]
   )
@@ -982,10 +1006,6 @@ export function ResourceUsageStatusSegment({
   const deleteWorktree = useCallback((worktreeId: string): void => {
     setOpen(false)
     runWorktreeDelete(worktreeId)
-  }, [])
-
-  const handleSleep = useCallback((id: string): void => {
-    void runSleepWorktree(id)
   }, [])
 
   const handleOpenWorkspaceCleanup = useCallback((): void => {
@@ -1062,17 +1082,23 @@ export function ResourceUsageStatusSegment({
     } catch {
       /* already dead — fall through */
     } finally {
-      setKilling(false)
-      setKillConfirm(null)
-      // Why: after the killed row unmounts, focus would otherwise drop to
-      // <body>. Park focus on the popover body so keyboard users land back
-      // in the list rather than outside the popover.
-      requestAnimationFrame(() => {
-        popoverBodyRef.current?.focus()
-      })
-      void refreshSessions()
+      if (mountedRef.current) {
+        setKilling(false)
+        setKillConfirm(null)
+        // Why: after the killed row unmounts, focus would otherwise drop to
+        // <body>. Park focus on the popover body so keyboard users land back
+        // in the list rather than outside the popover.
+        cancelPopoverBodyFocusFrame()
+        if (popoverBodyRef.current) {
+          popoverBodyFocusFrameRef.current = requestAnimationFrame(() => {
+            popoverBodyFocusFrameRef.current = null
+            popoverBodyRef.current?.focus()
+          })
+        }
+        void refreshSessions()
+      }
     }
-  }, [killConfirm, refreshSessions])
+  }, [cancelPopoverBodyFocusFrame, killConfirm, mountedRef, refreshSessions])
 
   const openSpaceResults = useCallback((): void => {
     setOpen(false)
@@ -1080,7 +1106,15 @@ export function ResourceUsageStatusSegment({
   }, [openSpacePage])
 
   return (
-    <Popover open={open} onOpenChange={setOpen}>
+    <Popover
+      open={open}
+      onOpenChange={(nextOpen) => {
+        if (nextOpen) {
+          recordFeatureInteraction('resource-manager')
+        }
+        setOpen(nextOpen)
+      }}
+    >
       <Tooltip delayDuration={150}>
         <TooltipTrigger asChild>
           <PopoverTrigger asChild>
@@ -1089,9 +1123,9 @@ export function ResourceUsageStatusSegment({
               {...STATUS_BAR_CONTEXT_MENU_EXEMPT_PROPS}
               className="relative inline-flex items-center gap-1.5 cursor-pointer rounded px-1 py-0.5 hover:bg-accent/70"
               aria-label={
-                spaceScanReady && !runtimeEnvironmentActive
-                  ? 'Resource manager, Space scan ready'
-                  : 'Resource manager'
+                daemonUnreachable
+                  ? `${resourceManagerAriaLabel}, daemon unreachable`
+                  : resourceManagerAriaLabel
               }
             >
               {spaceScanReady && !runtimeEnvironmentActive ? (
@@ -1129,13 +1163,14 @@ export function ResourceUsageStatusSegment({
         </TooltipTrigger>
         <TooltipContent side="top" sideOffset={6}>
           <div className="space-y-0.5">
-            <div>
-              Resource Manager — {memBadgeLabel} · {sessions.length} session
-              {sessions.length === 1 ? '' : 's'}
-            </div>
-            {spaceScanReady && !runtimeEnvironmentActive ? (
-              <div className="text-primary">Space scan ready</div>
-            ) : null}
+            {resourceManagerTooltipLines.map((line, index) => (
+              <div
+                key={`${index}:${line}`}
+                className={line === 'Space scan ready' ? 'text-primary' : ''}
+              >
+                {line}
+              </div>
+            ))}
           </div>
         </TooltipContent>
       </Tooltip>
@@ -1157,7 +1192,9 @@ export function ResourceUsageStatusSegment({
         <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-1.5">
           <div className="flex min-w-0 items-center gap-1.5 text-[11px] font-medium text-foreground">
             <MemoryStick className="size-3 shrink-0 text-muted-foreground" />
-            <span className="truncate">Resource Manager</span>
+            <span className="truncate">
+              {runtimeEnvironmentActive ? 'Resource Manager' : 'Resource Manager - Terminals'}
+            </span>
           </div>
 
           <div className="flex items-center gap-0.5">
@@ -1287,7 +1324,11 @@ export function ResourceUsageStatusSegment({
             jump as worktrees expand/collapse or as sessions come and go. The
             inner tree owns its own scroll. The footer renders below this
             shell when orphan-bulk-kill is available. */}
-        <div ref={popoverBodyRef} tabIndex={-1} className="flex h-[420px] flex-col outline-none">
+        <div
+          ref={setPopoverBodyNode}
+          tabIndex={-1}
+          className="flex h-[420px] flex-col outline-none"
+        >
           {(unifiedRepos.length > 0 || resourceSnapshot) && (
             <div className="flex items-center justify-between px-3 py-1 bg-muted/30 border-b border-border/50 text-[10px] uppercase tracking-wide shrink-0">
               <button
@@ -1350,10 +1391,10 @@ export function ResourceUsageStatusSegment({
                 collapsedRepos={collapsedRepos}
                 toggleRepo={toggleRepo}
                 collapsedWorktrees={collapsedWorktrees}
+                activeWorktreeId={activeWorktreeId}
                 toggleWorktree={toggleWorktree}
                 navigateToWorktree={navigateToWorktree}
                 navigateToTab={navigateToTab}
-                onSleep={handleSleep}
                 onDelete={deleteWorktree}
                 onKillSession={handleKillSession}
               />
@@ -1392,7 +1433,7 @@ export function ResourceUsageStatusSegment({
                 className="relative inline-flex w-full items-center justify-center rounded-md border border-border/70 px-2.5 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-accent/60"
               >
                 <span className="min-w-0 truncate px-4 text-center">
-                  delete inactive workspaces ({oldWorkspaceCount})
+                  Review inactive workspaces ({oldWorkspaceCount})
                 </span>
                 <ChevronRight
                   className="absolute right-2.5 size-3.5 text-muted-foreground"

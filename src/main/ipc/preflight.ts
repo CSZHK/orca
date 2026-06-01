@@ -1,21 +1,22 @@
-import { app, ipcMain } from 'electron'
+import { ipcMain } from 'electron'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
 import path from 'path'
 import { TUI_AGENT_CONFIG } from '../../shared/tui-agent-config'
 import type { PathSource, ShellHydrationFailureReason } from '../../shared/types'
-import {
-  ensureShellPathHydrated,
-  hydrateShellPath,
-  mergePathSegments
-} from '../startup/hydrate-shell-path'
+import { hydrateShellPath, mergePathSegments } from '../startup/hydrate-shell-path'
 import { getAzureDevOpsAuthStatus } from '../azure-devops/client'
 import { getBitbucketAuthStatus } from '../bitbucket/client'
 import { getGiteaAuthStatus } from '../gitea/client'
 import { _resetKnownHostsCache } from '../gitlab/gl-utils'
 import { getActiveMultiplexer } from './ssh'
-
 const execFileAsync = promisify(execFile)
+const PREFLIGHT_COMMAND_TIMEOUT_MS = 5000
+
+type PreflightRuntimeContext = {
+  wslDistro?: string | null
+  wslDefault?: boolean
+}
 
 export type PreflightStatus = {
   git: { installed: boolean }
@@ -51,9 +52,74 @@ export function _resetPreflightCache(): void {
   cached = null
 }
 
-async function isCommandAvailable(command: string): Promise<boolean> {
+type WslPreflightTarget = {
+  distro?: string
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`
+}
+
+type PreflightCommandResult = { stdout: string; stderr: string }
+
+// Why: a broken PATH shim or auth helper should not keep startup/settings
+// preflight IPC pending forever; WSL probes already use the same deadline.
+async function withPreflightTimeout<T>(command: string, commandPromise: Promise<T>): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | null = null
   try {
-    await execFileAsync(command, ['--version'])
+    return await Promise.race([
+      commandPromise,
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => {
+          const error = Object.assign(new Error(`Timed out running ${command}`), {
+            code: 'ETIMEDOUT'
+          })
+          reject(error)
+        }, PREFLIGHT_COMMAND_TIMEOUT_MS)
+        if (typeof timeout.unref === 'function') {
+          timeout.unref()
+        }
+      })
+    ])
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout)
+    }
+  }
+}
+
+async function execLocalPreflightCommand(
+  command: string,
+  args: string[]
+): Promise<PreflightCommandResult> {
+  const commandPromise = execFileAsync(command, args, {
+    encoding: 'utf-8',
+    timeout: PREFLIGHT_COMMAND_TIMEOUT_MS
+  }) as Promise<PreflightCommandResult>
+
+  return withPreflightTimeout(command, commandPromise)
+}
+
+async function execCommandInWsl(
+  target: WslPreflightTarget,
+  command: string
+): Promise<{ stdout: string; stderr: string }> {
+  const distroArgs = target.distro ? ['-d', target.distro] : []
+  const commandPromise = execFileAsync('wsl.exe', [...distroArgs, '--', 'bash', '-lc', command], {
+    encoding: 'utf-8',
+    timeout: PREFLIGHT_COMMAND_TIMEOUT_MS
+  }) as Promise<{ stdout: string; stderr: string }>
+  return withPreflightTimeout('wsl.exe', commandPromise)
+}
+
+async function isCommandAvailable(
+  command: string,
+  wslTarget?: WslPreflightTarget
+): Promise<boolean> {
+  try {
+    await (wslTarget
+      ? execCommandInWsl(wslTarget, `${shellQuote(command)} --version`)
+      : execLocalPreflightCommand(command, ['--version']))
     return true
   } catch {
     return false
@@ -63,10 +129,12 @@ async function isCommandAvailable(command: string): Promise<boolean> {
 // Why: `which`/`where` is faster than spawning the agent binary itself and avoids
 // triggering any agent-specific startup side-effects. This gives a reliable
 // PATH-based check without requiring `--version` support from each agent.
-async function isCommandOnPath(command: string): Promise<boolean> {
+async function isCommandOnPath(command: string, wslTarget?: WslPreflightTarget): Promise<boolean> {
   const finder = process.platform === 'win32' ? 'where' : 'which'
   try {
-    const { stdout } = await execFileAsync(finder, [command], { encoding: 'utf-8' })
+    const { stdout } = wslTarget
+      ? await execCommandInWsl(wslTarget, `command -v ${shellQuote(command)}`)
+      : await execLocalPreflightCommand(finder, [command])
     return stdout
       .split(/\r?\n/)
       .map((line) => line.trim())
@@ -81,12 +149,39 @@ const KNOWN_AGENT_COMMANDS = Object.entries(TUI_AGENT_CONFIG).map(([id, config])
   cmd: config.detectCmd
 }))
 
-export async function detectInstalledAgents(): Promise<string[]> {
-  await ensureShellPathHydrated(app.isPackaged)
+function getPreflightWslTarget(context?: PreflightRuntimeContext): WslPreflightTarget | null {
+  if (process.platform !== 'win32') {
+    return null
+  }
+  const distro = context?.wslDistro?.trim()
+  if (distro) {
+    return { distro }
+  }
+  return context?.wslDefault ? {} : null
+}
+
+async function detectCommandRuntime(
+  command: string,
+  context?: PreflightRuntimeContext
+): Promise<{ installed: boolean; wslTarget?: WslPreflightTarget }> {
+  const wslTarget = getPreflightWslTarget(context)
+  if (wslTarget) {
+    return (await isCommandAvailable(command, wslTarget))
+      ? { installed: true, wslTarget }
+      : { installed: false }
+  }
+  if (await isCommandAvailable(command)) {
+    return { installed: true }
+  }
+  return { installed: false }
+}
+
+export async function detectInstalledAgents(context?: PreflightRuntimeContext): Promise<string[]> {
+  const wslTarget = getPreflightWslTarget(context)
   const checks = await Promise.all(
     KNOWN_AGENT_COMMANDS.map(async ({ id, cmd }) => ({
       id,
-      installed: await isCommandOnPath(cmd)
+      installed: await isCommandOnPath(cmd, wslTarget ?? undefined)
     }))
   )
   return checks.filter((c) => c.installed).map((c) => c.id)
@@ -115,10 +210,12 @@ export type RefreshAgentsResult = {
  * Refresh — handles the "installed a new CLI, Orca doesn't see it yet" case
  * without requiring an app restart.
  */
-export async function refreshShellPathAndDetectAgents(): Promise<RefreshAgentsResult> {
+export async function refreshShellPathAndDetectAgents(
+  context?: PreflightRuntimeContext
+): Promise<RefreshAgentsResult> {
   const hydration = await hydrateShellPath({ force: true })
   const added = hydration.ok ? mergePathSegments(hydration.segments) : []
-  const agents = await detectInstalledAgents()
+  const agents = await detectInstalledAgents(context)
   return {
     agents,
     addedPathSegments: added,
@@ -139,11 +236,11 @@ export async function detectRemoteAgents(args: { connectionId: string }): Promis
   return result.agents
 }
 
-async function isGhAuthenticated(): Promise<boolean> {
+async function isGhAuthenticated(wslTarget?: WslPreflightTarget): Promise<boolean> {
   try {
-    await execFileAsync('gh', ['auth', 'status'], {
-      encoding: 'utf-8'
-    })
+    await (wslTarget
+      ? execCommandInWsl(wslTarget, `${shellQuote('gh')} auth status`)
+      : execLocalPreflightCommand('gh', ['auth', 'status']))
     // Why: for plain-text `gh auth status`, exit 0 means gh did not detect any
     // authentication issues for the checked hosts/accounts.
     return true
@@ -160,9 +257,11 @@ async function isGhAuthenticated(): Promise<boolean> {
 
 // Why: parallel to isGhAuthenticated for the glab CLI. glab writes auth
 // status to stderr in some versions and stdout in others; check both.
-async function isGlabAuthenticated(): Promise<boolean> {
+async function isGlabAuthenticated(wslTarget?: WslPreflightTarget): Promise<boolean> {
   try {
-    await execFileAsync('glab', ['auth', 'status'], { encoding: 'utf-8' })
+    await (wslTarget
+      ? execCommandInWsl(wslTarget, `${shellQuote('glab')} auth status`)
+      : execLocalPreflightCommand('glab', ['auth', 'status']))
     return true
   } catch (error) {
     const stdout = (error as { stdout?: string }).stdout ?? ''
@@ -172,8 +271,12 @@ async function isGlabAuthenticated(): Promise<boolean> {
   }
 }
 
-export async function runPreflightCheck(force = false): Promise<PreflightStatus> {
-  if (cached && !force) {
+export async function runPreflightCheck(
+  force = false,
+  context?: PreflightRuntimeContext
+): Promise<PreflightStatus> {
+  const cacheable = !getPreflightWslTarget(context)
+  if (cacheable && cached && !force) {
     return cached
   }
 
@@ -187,46 +290,56 @@ export async function runPreflightCheck(force = false): Promise<PreflightStatus>
     _resetKnownHostsCache()
   }
 
-  const [gitInstalled, ghInstalled, glabInstalled] = await Promise.all([
-    isCommandAvailable('git'),
-    isCommandAvailable('gh'),
-    isCommandAvailable('glab')
+  const [gitProbe, ghProbe, glabProbe] = await Promise.all([
+    detectCommandRuntime('git', context),
+    detectCommandRuntime('gh', context),
+    detectCommandRuntime('glab', context)
   ])
 
   const [ghAuthenticated, glabAuthenticated, bitbucket, azureDevOps, gitea] = await Promise.all([
-    ghInstalled ? isGhAuthenticated() : Promise.resolve(false),
-    glabInstalled ? isGlabAuthenticated() : Promise.resolve(false),
+    ghProbe.installed ? isGhAuthenticated(ghProbe.wslTarget) : Promise.resolve(false),
+    glabProbe.installed ? isGlabAuthenticated(glabProbe.wslTarget) : Promise.resolve(false),
     getBitbucketAuthStatus(),
     getAzureDevOpsAuthStatus(),
     getGiteaAuthStatus()
   ])
 
-  cached = {
-    git: { installed: gitInstalled },
-    gh: { installed: ghInstalled, authenticated: ghAuthenticated },
-    glab: { installed: glabInstalled, authenticated: glabAuthenticated },
+  const result = {
+    git: { installed: gitProbe.installed },
+    gh: { installed: ghProbe.installed, authenticated: ghAuthenticated },
+    glab: { installed: glabProbe.installed, authenticated: glabAuthenticated },
     bitbucket,
     azureDevOps,
     gitea
   }
 
-  return cached
+  if (cacheable) {
+    cached = result
+  }
+
+  return result
 }
 
 export function registerPreflightHandlers(): void {
   ipcMain.handle(
     'preflight:check',
-    async (_event, args?: { force?: boolean }): Promise<PreflightStatus> => {
-      return runPreflightCheck(args?.force)
+    async (
+      _event,
+      args?: PreflightRuntimeContext & { force?: boolean }
+    ): Promise<PreflightStatus> => {
+      return runPreflightCheck(args?.force, args)
     }
   )
 
-  ipcMain.handle('preflight:detectAgents', async (): Promise<string[]> => {
-    return detectInstalledAgents()
-  })
+  ipcMain.handle(
+    'preflight:detectAgents',
+    async (_event, args?: PreflightRuntimeContext): Promise<string[]> => {
+      return detectInstalledAgents(args)
+    }
+  )
 
-  ipcMain.handle('preflight:refreshAgents', async (): Promise<RefreshAgentsResult> => {
-    return refreshShellPathAndDetectAgents()
+  ipcMain.handle('preflight:refreshAgents', async (_event, args?: PreflightRuntimeContext) => {
+    return refreshShellPathAndDetectAgents(args)
   })
 
   // Why: remote worktrees need agent detection on the SSH host, not the local

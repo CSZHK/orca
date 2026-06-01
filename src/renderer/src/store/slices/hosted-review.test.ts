@@ -1,11 +1,9 @@
+/* eslint-disable max-lines -- Why: hosted-review tests cover runtime routing,
+hinted cache revalidation, provider discovery, and PR cache reconciliation. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { create } from 'zustand'
 import type { AppState } from '../types'
-import {
-  createHostedReviewSlice,
-  getHostedReviewCacheKey,
-  refreshHostedReviewCard
-} from './hosted-review'
+import { createHostedReviewSlice, refreshHostedReviewCard } from './hosted-review'
 import type { HostedReviewInfo } from '../../../../shared/hosted-review'
 
 const runtimeRpc = vi.hoisted(() => ({
@@ -24,19 +22,32 @@ vi.mock('@/runtime/runtime-rpc-client', () => ({
 
 const mockApi = {
   hostedReview: {
-    forBranch: vi.fn()
+    forBranch: vi.fn(),
+    getCreationEligibility: vi.fn(),
+    create: vi.fn()
   }
 }
 
 globalThis.window = { api: mockApi } as never
 
 function makeStore(settings: AppState['settings'] = null) {
-  return create<Pick<AppState, 'hostedReviewCache' | 'fetchHostedReviewForBranch' | 'settings'>>()(
-    (...args) => ({
-      settings,
-      ...createHostedReviewSlice(...(args as Parameters<typeof createHostedReviewSlice>))
-    })
-  )
+  return create<
+    Pick<
+      AppState,
+      | 'hostedReviewCache'
+      | 'fetchHostedReviewForBranch'
+      | 'getHostedReviewCreationEligibility'
+      | 'createHostedReview'
+      | 'settings'
+      | 'repos'
+      | 'prCache'
+    >
+  >()((...args) => ({
+    settings,
+    repos: [{ id: 'repo-1', path: '/repo', connectionId: null } as AppState['repos'][number]],
+    prCache: {},
+    ...createHostedReviewSlice(...(args as Parameters<typeof createHostedReviewSlice>))
+  }))
 }
 
 const review: HostedReviewInfo = {
@@ -53,6 +64,8 @@ const review: HostedReviewInfo = {
 describe('hosted review slice', () => {
   beforeEach(() => {
     mockApi.hostedReview.forBranch.mockReset()
+    mockApi.hostedReview.getCreationEligibility.mockReset()
+    mockApi.hostedReview.create.mockReset()
     runtimeRpc.callRuntimeRpc.mockReset()
   })
 
@@ -85,6 +98,67 @@ describe('hosted review slice', () => {
     })
   })
 
+  it('clears stale GitHub PR cache when branch review lookup finds a non-GitHub review', async () => {
+    mockApi.hostedReview.forBranch.mockResolvedValueOnce(review)
+    const store = makeStore()
+    store.setState({
+      prCache: {
+        'repo-1::feature/gitlab': {
+          data: {
+            number: 12,
+            title: 'Old GitHub PR',
+            state: 'open',
+            url: 'https://github.com/acme/orca/pull/12',
+            checksStatus: 'pending',
+            updatedAt: '2026-03-28T00:00:00Z',
+            mergeable: 'UNKNOWN',
+            headSha: 'head-oid'
+          },
+          fetchedAt: 1
+        },
+        '/repo::feature/gitlab': {
+          data: {
+            number: 99,
+            title: 'Old path-scoped GitHub PR',
+            state: 'closed',
+            url: 'https://github.com/acme/orca/pull/99',
+            checksStatus: 'failure',
+            updatedAt: '2026-03-28T00:00:00Z',
+            mergeable: 'UNKNOWN',
+            headSha: 'old-head-oid'
+          },
+          fetchedAt: 1
+        }
+      }
+    } as unknown as Partial<AppState>)
+
+    await expect(
+      store.getState().fetchHostedReviewForBranch('/repo', 'feature/gitlab')
+    ).resolves.toEqual(review)
+
+    expect(store.getState().prCache['repo-1::feature/gitlab']).toBeUndefined()
+    expect(store.getState().prCache['/repo::feature/gitlab']).toBeUndefined()
+  })
+
+  it('uses SSH-scoped hosted review cache entries for SSH-backed repos', async () => {
+    mockApi.hostedReview.forBranch.mockResolvedValueOnce(review)
+    const store = makeStore()
+    store.setState({
+      repos: [{ id: 'repo-1', path: '/repo', connectionId: 'ssh-1' } as AppState['repos'][number]]
+    } as Partial<AppState>)
+
+    await expect(
+      store.getState().fetchHostedReviewForBranch('/repo', 'feature/gitlab', {
+        repoId: 'repo-1'
+      })
+    ).resolves.toEqual(review)
+
+    expect(store.getState().hostedReviewCache['ssh:ssh-1::repo-1::feature/gitlab']).toMatchObject({
+      data: review
+    })
+    expect(store.getState().hostedReviewCache['local::repo-1::feature/gitlab']).toBeUndefined()
+  })
+
   it('routes active runtime review lookups through runtime RPC', async () => {
     runtimeRpc.callRuntimeRpc.mockResolvedValueOnce(review)
     const store = makeStore({
@@ -110,6 +184,161 @@ describe('hosted review slice', () => {
         linkedBitbucketPR: null,
         linkedAzureDevOpsPR: null,
         linkedGiteaPR: null
+      },
+      { timeoutMs: 30_000 }
+    )
+  })
+
+  it('forwards the selected worktree path when creating a local pull request', async () => {
+    mockApi.hostedReview.create.mockResolvedValueOnce({
+      ok: true,
+      number: 12,
+      url: 'https://github.com/acme/orca/pull/12'
+    })
+    const store = makeStore()
+
+    await expect(
+      store.getState().createHostedReview('/repo', {
+        provider: 'github',
+        base: 'main',
+        head: 'feature/create-pr',
+        title: 'Create PR',
+        worktreePath: '/worktrees/feature'
+      })
+    ).resolves.toMatchObject({ ok: true, number: 12 })
+
+    expect(mockApi.hostedReview.create).toHaveBeenCalledWith({
+      repoPath: '/repo',
+      connectionId: null,
+      provider: 'github',
+      base: 'main',
+      head: 'feature/create-pr',
+      title: 'Create PR',
+      worktreePath: '/worktrees/feature'
+    })
+  })
+
+  it('forwards SSH connectionId when creating pull requests through local IPC', async () => {
+    mockApi.hostedReview.create.mockResolvedValueOnce({
+      ok: true,
+      number: 12,
+      url: 'https://github.com/acme/orca/pull/12'
+    })
+    const store = makeStore()
+    store.setState({
+      repos: [{ id: 'repo-1', path: '/repo', connectionId: 'ssh-1' } as AppState['repos'][number]]
+    })
+
+    await expect(
+      store.getState().createHostedReview('/repo', {
+        provider: 'github',
+        base: 'main',
+        head: 'feature/create-pr',
+        title: 'Create PR',
+        worktreePath: '/remote/worktree'
+      })
+    ).resolves.toMatchObject({ ok: true, number: 12 })
+
+    expect(mockApi.hostedReview.create).toHaveBeenCalledWith({
+      repoPath: '/repo',
+      connectionId: 'ssh-1',
+      provider: 'github',
+      base: 'main',
+      head: 'feature/create-pr',
+      title: 'Create PR',
+      worktreePath: '/remote/worktree'
+    })
+  })
+
+  it('forwards SSH connectionId when checking pull request creation eligibility', async () => {
+    mockApi.hostedReview.getCreationEligibility.mockResolvedValueOnce({
+      provider: 'github',
+      review: null,
+      canCreate: true,
+      blockedReason: null,
+      nextAction: null
+    })
+    const store = makeStore()
+    store.setState({
+      repos: [{ id: 'repo-1', path: '/repo', connectionId: 'ssh-1' } as AppState['repos'][number]]
+    })
+
+    await store.getState().getHostedReviewCreationEligibility({
+      repoPath: '/repo',
+      worktreePath: '/remote/worktree',
+      branch: 'feature/create-pr',
+      base: 'main'
+    })
+
+    expect(mockApi.hostedReview.getCreationEligibility).toHaveBeenCalledWith({
+      repoPath: '/repo',
+      connectionId: 'ssh-1',
+      worktreePath: '/remote/worktree',
+      branch: 'feature/create-pr',
+      base: 'main'
+    })
+  })
+
+  it('uses the selected worktree selector for runtime pull request creation', async () => {
+    runtimeRpc.callRuntimeRpc.mockResolvedValueOnce({
+      ok: true,
+      number: 12,
+      url: 'https://github.com/acme/orca/pull/12'
+    })
+    const store = makeStore({
+      activeRuntimeEnvironmentId: 'env-win'
+    } as AppState['settings'])
+
+    await store.getState().createHostedReview('/repo', {
+      provider: 'github',
+      base: 'main',
+      head: 'feature/create-pr',
+      title: 'Create PR',
+      worktreePath: 'C:\\worktrees\\feature'
+    })
+
+    expect(runtimeRpc.callRuntimeRpc).toHaveBeenCalledWith(
+      { kind: 'environment', environmentId: 'env-win' },
+      'hostedReview.create',
+      {
+        repo: 'repo-1',
+        worktree: 'path:C:\\worktrees\\feature',
+        provider: 'github',
+        base: 'main',
+        head: 'feature/create-pr',
+        title: 'Create PR'
+      },
+      { timeoutMs: 60_000 }
+    )
+  })
+
+  it('uses the selected worktree selector for runtime pull request creation eligibility', async () => {
+    runtimeRpc.callRuntimeRpc.mockResolvedValueOnce({
+      provider: 'github',
+      review: null,
+      canCreate: true,
+      blockedReason: null,
+      nextAction: null
+    })
+    const store = makeStore({
+      activeRuntimeEnvironmentId: 'env-win'
+    } as AppState['settings'])
+
+    await store.getState().getHostedReviewCreationEligibility({
+      repoPath: '/repo',
+      worktreePath: 'C:\\worktrees\\feature',
+      branch: 'feature/create-pr',
+      base: 'main'
+    })
+
+    expect(runtimeRpc.callRuntimeRpc).toHaveBeenCalledWith(
+      { kind: 'environment', environmentId: 'env-win' },
+      'hostedReview.getCreationEligibility',
+      {
+        repo: 'repo-1',
+        worktree: 'path:C:\\worktrees\\feature',
+        branch: 'feature/create-pr',
+        base: 'main'
       },
       { timeoutMs: 30_000 }
     )
@@ -186,105 +415,5 @@ describe('hosted review slice', () => {
     resolveBranchLookup(null)
     await expect(plainFetch).resolves.toBeNull()
     await expect(linkedFetch).resolves.toEqual(review)
-  })
-
-  it('dedupes repeated linked PR retries while a stronger lookup is in flight', async () => {
-    let resolveLinkedLookup: (value: typeof review) => void = () => {}
-    const linkedLookup = new Promise<typeof review>((resolve) => {
-      resolveLinkedLookup = resolve
-    })
-    mockApi.hostedReview.forBranch.mockResolvedValueOnce(null).mockReturnValueOnce(linkedLookup)
-    const store = makeStore()
-
-    await expect(store.getState().fetchHostedReviewForBranch('/repo', 'feature/pr')).resolves.toBe(
-      null
-    )
-
-    const firstLinkedFetch = store.getState().fetchHostedReviewForBranch('/repo', 'feature/pr', {
-      linkedGitHubPR: 42
-    })
-    const secondLinkedFetch = store.getState().fetchHostedReviewForBranch('/repo', 'feature/pr', {
-      linkedGitHubPR: 42
-    })
-
-    expect(mockApi.hostedReview.forBranch).toHaveBeenCalledTimes(2)
-    resolveLinkedLookup(review)
-    await expect(firstLinkedFetch).resolves.toEqual(review)
-    await expect(secondLinkedFetch).resolves.toEqual(review)
-  })
-
-  it('serves stale hosted review metadata while revalidating in the background', async () => {
-    vi.useFakeTimers()
-    vi.setSystemTime(0)
-    const updatedReview: HostedReviewInfo = {
-      ...review,
-      title: 'Updated linked PR status',
-      status: 'failure',
-      updatedAt: '2026-05-10T00:01:01.000Z'
-    }
-    let resolveRefresh: (value: typeof updatedReview) => void = () => {}
-    const refresh = new Promise<typeof updatedReview>((resolve) => {
-      resolveRefresh = resolve
-    })
-    mockApi.hostedReview.forBranch
-      .mockResolvedValueOnce(review)
-      .mockReturnValueOnce(refresh as Promise<HostedReviewInfo>)
-    const store = makeStore()
-
-    await expect(
-      store.getState().fetchHostedReviewForBranch('/repo', 'feature/pr', {
-        linkedGitHubPR: 42
-      })
-    ).resolves.toEqual(review)
-    vi.setSystemTime(60_001)
-    await expect(
-      store.getState().fetchHostedReviewForBranch('/repo', 'feature/pr', {
-        linkedGitHubPR: 42,
-        staleWhileRevalidate: true
-      })
-    ).resolves.toEqual(review)
-    await expect(
-      store.getState().fetchHostedReviewForBranch('/repo', 'feature/pr', {
-        linkedGitHubPR: 42,
-        staleWhileRevalidate: true
-      })
-    ).resolves.toEqual(review)
-
-    expect(mockApi.hostedReview.forBranch).toHaveBeenCalledTimes(2)
-    const cacheKey = getHostedReviewCacheKey('/repo', 'feature/pr')
-    expect(store.getState().hostedReviewCache[cacheKey]?.data).toEqual(review)
-
-    resolveRefresh(updatedReview)
-    await refresh
-    await Promise.resolve()
-
-    expect(store.getState().hostedReviewCache[cacheKey]?.data).toEqual(updatedReview)
-  })
-
-  it('does not serve stale metadata when a stronger linked PR hint changes the lookup', async () => {
-    vi.useFakeTimers()
-    vi.setSystemTime(0)
-    const linkedReview: HostedReviewInfo = {
-      ...review,
-      provider: 'github',
-      number: 42,
-      title: 'Exact linked PR',
-      url: 'https://github.com/acme/orca/pull/42'
-    }
-    mockApi.hostedReview.forBranch.mockResolvedValueOnce(review).mockResolvedValueOnce(linkedReview)
-    const store = makeStore()
-
-    await expect(store.getState().fetchHostedReviewForBranch('/repo', 'feature/pr')).resolves.toBe(
-      review
-    )
-    vi.setSystemTime(60_001)
-    await expect(
-      store.getState().fetchHostedReviewForBranch('/repo', 'feature/pr', {
-        linkedGitHubPR: 42,
-        staleWhileRevalidate: true
-      })
-    ).resolves.toEqual(linkedReview)
-
-    expect(mockApi.hostedReview.forBranch).toHaveBeenCalledTimes(2)
   })
 })

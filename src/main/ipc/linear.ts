@@ -1,3 +1,5 @@
+/* eslint-disable max-lines -- Why: Linear IPC validates one namespace in one
+   registration boundary so local and SSH runtime schemas can stay mirrored. */
 import { ipcMain } from 'electron'
 import { connect, disconnect, getStatus, selectWorkspace, testConnection } from '../linear/client'
 import { _resetPreflightCache } from './preflight'
@@ -10,9 +12,22 @@ import {
   addIssueComment,
   getIssueComments
 } from '../linear/issues'
+import {
+  getCustomView,
+  getProject,
+  listCustomViewIssues,
+  listCustomViewProjects,
+  listCustomViews,
+  listProjectIssues,
+  listProjects
+} from '../linear/projects'
 import { listTeams, getTeamStates, getTeamLabels, getTeamMembers } from '../linear/teams'
 import type { LinearListFilter } from '../linear/issues'
-import type { LinearIssueUpdate, LinearWorkspaceSelection } from '../../shared/types'
+import type {
+  LinearCustomViewModel,
+  LinearIssueUpdate,
+  LinearWorkspaceSelection
+} from '../../shared/types'
 
 const VALID_FILTERS = new Set<LinearListFilter>(['assigned', 'created', 'all', 'completed'])
 
@@ -23,6 +38,21 @@ function normalizeWorkspaceId(value: unknown): string | undefined {
 function normalizeWorkspaceSelection(value: unknown): LinearWorkspaceSelection | undefined {
   const workspaceId = normalizeWorkspaceId(value)
   return workspaceId as LinearWorkspaceSelection | undefined
+}
+
+function normalizeConcreteWorkspaceId(value: unknown): string {
+  const workspaceId = normalizeWorkspaceId(value)
+  if (!workspaceId || workspaceId === 'all') {
+    throw new Error('Concrete Linear workspace ID is required')
+  }
+  return workspaceId
+}
+
+function normalizeCustomViewModel(value: unknown): LinearCustomViewModel {
+  if (value !== 'issue' && value !== 'project') {
+    throw new Error('Custom view model is required')
+  }
+  return value
 }
 
 export function registerLinearHandlers(): void {
@@ -90,7 +120,18 @@ export function registerLinearHandlers(): void {
     'linear:createIssue',
     async (
       _event,
-      args: { teamId: string; title: string; description?: string; workspaceId?: string }
+      args: {
+        teamId: string
+        title: string
+        description?: string
+        workspaceId?: string
+        parentIssueId?: string
+        projectId?: string | null
+        stateId?: string
+        priority?: number
+        assigneeId?: string | null
+        labelIds?: string[]
+      }
     ) => {
       if (typeof args?.teamId !== 'string' || !args.teamId.trim()) {
         return { ok: false, error: 'Team ID is required' }
@@ -98,11 +139,32 @@ export function registerLinearHandlers(): void {
       if (typeof args?.title !== 'string' || !args.title.trim()) {
         return { ok: false, error: 'Title is required' }
       }
+      if (
+        args.priority !== undefined &&
+        (!Number.isInteger(args.priority) || args.priority < 0 || args.priority > 4)
+      ) {
+        return { ok: false, error: 'Invalid priority' }
+      }
+      if (
+        args.labelIds !== undefined &&
+        (!Array.isArray(args.labelIds) ||
+          !args.labelIds.every((id) => typeof id === 'string' && id.trim()))
+      ) {
+        return { ok: false, error: 'Invalid label IDs' }
+      }
       return createIssue(
         args.teamId.trim(),
         args.title.trim(),
         args.description?.trim() || undefined,
-        normalizeWorkspaceId(args.workspaceId)
+        normalizeWorkspaceId(args.workspaceId),
+        {
+          parentId: typeof args.parentIssueId === 'string' ? args.parentIssueId.trim() : undefined,
+          projectId: typeof args.projectId === 'string' ? args.projectId.trim() : null,
+          stateId: typeof args.stateId === 'string' ? args.stateId.trim() : undefined,
+          priority: typeof args.priority === 'number' ? args.priority : undefined,
+          assigneeId: typeof args.assigneeId === 'string' ? args.assigneeId.trim() : null,
+          labelIds: Array.isArray(args.labelIds) ? args.labelIds.map((id) => id.trim()) : undefined
+        }
       )
     }
   )
@@ -130,6 +192,12 @@ export function registerLinearHandlers(): void {
       if (u.stateId !== undefined && (typeof u.stateId !== 'string' || !u.stateId.trim())) {
         return { ok: false, error: 'Invalid state ID' }
       }
+      if (u.title !== undefined && (typeof u.title !== 'string' || !u.title.trim())) {
+        return { ok: false, error: 'Title is required' }
+      }
+      if (u.description !== undefined && typeof u.description !== 'string') {
+        return { ok: false, error: 'Description must be a string' }
+      }
       if (
         u.priority !== undefined &&
         (!Number.isInteger(u.priority) || u.priority < 0 || u.priority > 4)
@@ -137,10 +205,24 @@ export function registerLinearHandlers(): void {
         return { ok: false, error: 'Priority must be an integer 0-4' }
       }
       if (
+        u.estimate !== undefined &&
+        u.estimate !== null &&
+        (!Number.isInteger(u.estimate) || u.estimate < 0)
+      ) {
+        return { ok: false, error: 'Estimate must be a non-negative integer' }
+      }
+      if (
         u.labelIds !== undefined &&
         (!Array.isArray(u.labelIds) || !u.labelIds.every((id: unknown) => typeof id === 'string'))
       ) {
         return { ok: false, error: 'Label IDs must be an array of strings' }
+      }
+      if (
+        u.projectId !== undefined &&
+        u.projectId !== null &&
+        (typeof u.projectId !== 'string' || !u.projectId.trim())
+      ) {
+        return { ok: false, error: 'Invalid project ID' }
       }
       return updateIssue(args.id.trim(), args.updates, normalizeWorkspaceId(args.workspaceId))
     }
@@ -177,6 +259,108 @@ export function registerLinearHandlers(): void {
     'linear:listTeams',
     async (_event, args?: { workspaceId?: LinearWorkspaceSelection }) => {
       return listTeams(normalizeWorkspaceSelection(args?.workspaceId))
+    }
+  )
+
+  ipcMain.handle(
+    'linear:listProjects',
+    async (
+      _event,
+      args?: { query?: string; limit?: number; workspaceId?: LinearWorkspaceSelection }
+    ) => {
+      const limit = Math.min(Math.max(1, args?.limit ?? 20), 50)
+      return listProjects(args?.query, limit, normalizeWorkspaceSelection(args?.workspaceId))
+    }
+  )
+
+  ipcMain.handle(
+    'linear:getProject',
+    async (_event, args: { id: string; workspaceId?: string }) => {
+      if (typeof args?.id !== 'string' || !args.id.trim()) {
+        throw new Error('Project ID is required')
+      }
+      return getProject(args.id.trim(), normalizeConcreteWorkspaceId(args.workspaceId))
+    }
+  )
+
+  ipcMain.handle(
+    'linear:listProjectIssues',
+    async (_event, args: { projectId: string; limit?: number; workspaceId?: string }) => {
+      if (typeof args?.projectId !== 'string' || !args.projectId.trim()) {
+        throw new Error('Project ID is required')
+      }
+      const limit = Math.min(Math.max(1, args?.limit ?? 20), 50)
+      return listProjectIssues(
+        args.projectId.trim(),
+        limit,
+        normalizeConcreteWorkspaceId(args.workspaceId)
+      )
+    }
+  )
+
+  ipcMain.handle(
+    'linear:listCustomViews',
+    async (
+      _event,
+      args?: {
+        model?: LinearCustomViewModel
+        limit?: number
+        workspaceId?: LinearWorkspaceSelection
+      }
+    ) => {
+      const limit = Math.min(Math.max(1, args?.limit ?? 20), 50)
+      return listCustomViews(
+        normalizeCustomViewModel(args?.model),
+        limit,
+        normalizeWorkspaceSelection(args?.workspaceId)
+      )
+    }
+  )
+
+  ipcMain.handle(
+    'linear:getCustomView',
+    async (
+      _event,
+      args: { viewId: string; model?: LinearCustomViewModel; workspaceId?: string }
+    ) => {
+      if (typeof args?.viewId !== 'string' || !args.viewId.trim()) {
+        throw new Error('Custom view ID is required')
+      }
+      return getCustomView(
+        args.viewId.trim(),
+        normalizeCustomViewModel(args.model),
+        normalizeConcreteWorkspaceId(args.workspaceId)
+      )
+    }
+  )
+
+  ipcMain.handle(
+    'linear:listCustomViewIssues',
+    async (_event, args: { viewId: string; limit?: number; workspaceId?: string }) => {
+      if (typeof args?.viewId !== 'string' || !args.viewId.trim()) {
+        throw new Error('Custom view ID is required')
+      }
+      const limit = Math.min(Math.max(1, args?.limit ?? 20), 50)
+      return listCustomViewIssues(
+        args.viewId.trim(),
+        limit,
+        normalizeConcreteWorkspaceId(args.workspaceId)
+      )
+    }
+  )
+
+  ipcMain.handle(
+    'linear:listCustomViewProjects',
+    async (_event, args: { viewId: string; limit?: number; workspaceId?: string }) => {
+      if (typeof args?.viewId !== 'string' || !args.viewId.trim()) {
+        throw new Error('Custom view ID is required')
+      }
+      const limit = Math.min(Math.max(1, args?.limit ?? 20), 50)
+      return listCustomViewProjects(
+        args.viewId.trim(),
+        limit,
+        normalizeConcreteWorkspaceId(args.workspaceId)
+      )
     }
   )
 

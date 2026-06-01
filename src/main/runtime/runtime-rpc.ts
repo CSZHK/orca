@@ -124,21 +124,154 @@ const MOBILE_RPC_METHOD_ALLOWLIST = new Set([
   'accounts.selectCodex',
   'accounts.subscribe',
   'accounts.unsubscribe',
+  'browser.back',
+  'browser.dialogAccept',
+  'browser.dialogDismiss',
+  'browser.forward',
+  'browser.goto',
+  'browser.keyboardInsertText',
+  'browser.keypress',
+  'browser.mouseDown',
+  'browser.mouseClick',
+  'browser.mouseMove',
+  'browser.mouseUp',
+  'browser.mouseWheel',
+  'browser.reload',
+  'browser.screencast',
+  'browser.screencast.unsubscribe',
+  'browser.tabCreate',
+  'browser.viewport',
+  'clipboard.saveImageAsTempFile',
+  'files.createFile',
   'files.list',
   'files.open',
+  'files.openDiff',
   'files.read',
+  'git.abortMerge',
+  'git.abortRebase',
+  'git.bulkStage',
+  'git.bulkUnstage',
+  'git.branchCompare',
+  'git.branchDiff',
+  'git.commit',
+  'git.discard',
+  'git.diff',
+  'git.fetch',
+  'git.fastForward',
+  'git.pull',
+  'git.push',
+  'git.rebaseFromBase',
+  'git.stage',
+  'git.status',
+  'git.unstage',
+  'git.upstreamStatus',
+  'github.createIssue',
+  'github.addIssueComment',
+  'github.addPRReviewComment',
+  'github.addPRReviewCommentReply',
+  'github.countWorkItems',
+  'github.listAssignableUsers',
+  'github.listLabels',
+  'github.listWorkItems',
+  'github.mergePR',
+  'github.setPRAutoMerge',
+  'github.requestPRReviewers',
+  'github.project.listAccessible',
+  'github.project.listAssignableUsersBySlug',
+  'github.project.listIssueTypesBySlug',
+  'github.project.listLabelsBySlug',
+  'github.project.listViews',
+  'github.project.resolveRef',
+  'github.project.addIssueCommentBySlug',
+  'github.project.updateIssueCommentBySlug',
+  'github.project.deleteIssueCommentBySlug',
+  'github.project.clearItemField',
+  'github.project.updateIssueBySlug',
+  'github.project.updateIssueTypeBySlug',
+  'github.project.updateItemField',
+  'github.project.updatePullRequestBySlug',
+  'github.project.viewTable',
+  'github.project.workItemDetailsBySlug',
+  'github.prFileContents',
+  'github.prChecks',
+  'github.rerunPRChecks',
+  'github.resolveReviewThread',
+  'github.setPRFileViewed',
+  'github.updateIssue',
+  'github.updatePR',
+  'github.updatePRTitle',
+  'github.updatePRState',
+  'github.repoSlug',
+  'github.workItem',
+  'github.workItemDetails',
+  'gitlab.createIssue',
+  'gitlab.addIssueComment',
+  'gitlab.addMRComment',
+  'gitlab.listWorkItems',
+  'gitlab.mergeMR',
+  'gitlab.resolveMRDiscussion',
+  'gitlab.todos',
+  'gitlab.updateIssue',
+  'gitlab.updateMR',
+  'gitlab.updateMRState',
+  'gitlab.workItemDetails',
+  'host.gitBash.isAvailable',
+  'host.platform',
+  'host.pwsh.isAvailable',
+  'host.wsl.isAvailable',
+  'host.wsl.listDistros',
+  'linear.getCustomView',
+  'linear.getIssue',
+  'linear.getProject',
+  'linear.addIssueComment',
+  'linear.connect',
+  'linear.createIssue',
+  'linear.issueComments',
+  'linear.listCustomViewIssues',
+  'linear.listCustomViewProjects',
+  'linear.listCustomViews',
+  'linear.listIssues',
+  'linear.listProjectIssues',
+  'linear.listProjects',
+  'linear.teamLabels',
+  'linear.teamMembers',
+  'linear.listTeams',
+  'linear.searchIssues',
+  'linear.selectWorkspace',
+  'linear.status',
+  'linear.teamStates',
+  'linear.updateIssue',
   'markdown.readTab',
   'markdown.saveTab',
   'notifications.subscribe',
   'notifications.unsubscribe',
+  'preflight.check',
+  'preflight.detectAgents',
+  'preflight.detectRemoteAgents',
+  'repo.baseRefDefault',
   'repo.hooks',
   'repo.list',
+  'repo.saveSparsePreset',
+  'repo.searchRefs',
+  'repo.sparsePresets',
+  'repo.update',
   'session.tabs.activate',
   'session.tabs.close',
   'session.tabs.createTerminal',
   'session.tabs.list',
+  'session.tabs.listAll',
+  'session.tabs.move',
   'session.tabs.subscribe',
+  'session.tabs.subscribeAll',
   'session.tabs.unsubscribe',
+  'settings.get',
+  'settings.update',
+  'ssh.connect',
+  'ssh.getState',
+  'speech.dictation.cancel',
+  'speech.dictation.chunk',
+  'speech.dictation.finish',
+  'speech.dictation.start',
   'stats.summary',
   'status.get',
   'terminal.clearBuffer',
@@ -146,6 +279,7 @@ const MOBILE_RPC_METHOD_ALLOWLIST = new Set([
   'terminal.create',
   'terminal.focus',
   'terminal.getAutoRestoreFit',
+  'terminal.isRunningAgent',
   'terminal.list',
   'terminal.multiplex',
   'terminal.read',
@@ -156,9 +290,18 @@ const MOBILE_RPC_METHOD_ALLOWLIST = new Set([
   'terminal.subscribe',
   'terminal.unsubscribe',
   'terminal.updateViewport',
+  'terminal.wait',
+  'ui.get',
+  'ui.recordFeatureInteraction',
+  'ui.set',
   'worktree.activate',
   'worktree.create',
+  'worktree.forceDeleteBranch',
+  'worktree.prefetchCreateBase',
   'worktree.ps',
+  'worktree.show',
+  'worktree.resolveMrBase',
+  'worktree.resolvePrBase',
   'worktree.rm',
   'worktree.set',
   'worktree.sleep'
@@ -209,6 +352,10 @@ export class OrcaRuntimeRpcServer {
     string,
     Map<number, (frame: TerminalStreamFrame) => void>
   >()
+  private readonly wsDispatchAbortStates = new Map<
+    WebSocket,
+    { controllers: Set<AbortController>; abortOnClose: () => void }
+  >()
   // Why: separate from Node's server.maxConnections because we need to count
   // only long-running dispatches, not every in-flight short RPC. See §3.1 +
   // §7 risk #2.
@@ -258,6 +405,15 @@ export class OrcaRuntimeRpcServer {
   revokeMobileDevice(deviceId: string): boolean {
     const device = this.deviceRegistry?.getDevice(deviceId)
     if (device?.scope !== 'mobile' || !this.deviceRegistry?.removeDevice(deviceId)) {
+      return false
+    }
+    this.wsTransport?.terminateClientConnections(device.token)
+    return true
+  }
+
+  revokeRuntimeAccess(deviceId: string): boolean {
+    const device = this.deviceRegistry?.getDevice(deviceId)
+    if (device?.scope !== 'runtime' || !this.deviceRegistry?.removeDevice(deviceId)) {
       return false
     }
     this.wsTransport?.terminateClientConnections(device.token)
@@ -347,6 +503,62 @@ export class OrcaRuntimeRpcServer {
       return
     }
     this.binaryStreamHandlers.get(connectionId)?.get(frame.streamId)?.(frame)
+  }
+
+  private registerWebSocketDispatchAbort(ws: WebSocket): {
+    signal: AbortSignal
+    dispose: () => void
+  } {
+    const abortController = new AbortController()
+    if (ws.readyState !== ws.OPEN) {
+      abortController.abort()
+      return { signal: abortController.signal, dispose: () => {} }
+    }
+
+    let state = this.wsDispatchAbortStates.get(ws)
+    if (!state) {
+      state = {
+        controllers: new Set(),
+        abortOnClose: () => this.abortWebSocketDispatches(ws)
+      }
+      this.wsDispatchAbortStates.set(ws, state)
+      // Why: many streaming RPCs can share one WebSocket. A single socket-level
+      // abort fan-out avoids MaxListenersExceededWarning while preserving cleanup.
+      ws.on('close', state.abortOnClose)
+      ws.on('error', state.abortOnClose)
+    }
+    state.controllers.add(abortController)
+
+    return {
+      signal: abortController.signal,
+      dispose: () => {
+        const current = this.wsDispatchAbortStates.get(ws)
+        if (!current) {
+          return
+        }
+        current.controllers.delete(abortController)
+        if (current.controllers.size > 0) {
+          return
+        }
+        this.wsDispatchAbortStates.delete(ws)
+        ws.off('close', current.abortOnClose)
+        ws.off('error', current.abortOnClose)
+      }
+    }
+  }
+
+  private abortWebSocketDispatches(ws: WebSocket): void {
+    const state = this.wsDispatchAbortStates.get(ws)
+    if (!state) {
+      return
+    }
+    this.wsDispatchAbortStates.delete(ws)
+    ws.off('close', state.abortOnClose)
+    ws.off('error', state.abortOnClose)
+    for (const controller of state.controllers) {
+      controller.abort()
+    }
+    state.controllers.clear()
   }
 
   async start(): Promise<void> {
@@ -489,6 +701,7 @@ export class OrcaRuntimeRpcServer {
         // so destroy the channel for THIS exact ws and skip the per-client
         // teardown when other sockets for the same token are still alive.
         wsTransport.onConnectionClose((clientId, ws, hasOtherConnections) => {
+          this.abortWebSocketDispatches(ws)
           // Why: sweep streaming subscriptions for THIS ws regardless of
           // hasOtherConnections, so per-ws listeners (notifications,
           // accounts, terminal) don't leak across reconnects. This is
@@ -639,7 +852,7 @@ export class OrcaRuntimeRpcServer {
   private async handleWebSocketMessage(
     rawMessage: string,
     reply: (response: string) => void,
-    sendBinary: (response: Uint8Array<ArrayBufferLike>) => void,
+    sendBinary: (response: Uint8Array<ArrayBufferLike>) => boolean | void,
     wsTransport?: WebSocketTransport,
     ws?: WebSocket,
     authenticatedDeviceToken?: string | null
@@ -714,19 +927,9 @@ export class OrcaRuntimeRpcServer {
       return
     }
 
-    let abortController: AbortController | null = null
-    let abortOnClose: (() => void) | null = null
+    const abortRegistration = ws ? this.registerWebSocketDispatchAbort(ws) : null
     if (longPoll) {
       this.activeLongPolls += 1
-      abortController = new AbortController()
-      if (ws) {
-        abortOnClose = () => abortController?.abort()
-        ws.once('close', abortOnClose)
-        ws.once('error', abortOnClose)
-        if (ws.readyState !== ws.OPEN) {
-          abortController.abort()
-        }
-      }
     }
 
     const connectionId = ws ? this.wsConnectionIds.get(ws) : undefined
@@ -734,16 +937,13 @@ export class OrcaRuntimeRpcServer {
       await this.dispatcher.dispatchStreaming(request, reply, {
         connectionId,
         clientId: token,
-        signal: abortController?.signal,
+        signal: abortRegistration?.signal,
         sendBinary,
         registerBinaryStreamHandler: (streamId, handler) =>
           this.registerBinaryStreamHandler(connectionId, streamId, handler)
       })
     } finally {
-      if (abortOnClose && ws) {
-        ws.off('close', abortOnClose)
-        ws.off('error', abortOnClose)
-      }
+      abortRegistration?.dispose()
       if (longPoll) {
         this.activeLongPolls = Math.max(0, this.activeLongPolls - 1)
       }

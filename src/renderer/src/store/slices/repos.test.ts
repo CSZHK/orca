@@ -1,5 +1,6 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest'
 import { createTestStore, makeWorktree } from './store-test-helpers'
+import { workItemsCacheKey } from './github'
 import type { Repo } from '../../../../shared/types'
 import {
   createCompatibleRuntimeStatusResponseIfNeeded,
@@ -181,7 +182,7 @@ describe('repo slice runtime routing', () => {
       activeRepoId: remoteRepo.id
     })
 
-    await store.getState().removeRepo(remoteRepo.id)
+    await store.getState().removeProject(remoteRepo.id)
 
     expect(store.getState().repos).toEqual([])
     expect(store.getState().activeRepoId).toBeNull()
@@ -192,6 +193,32 @@ describe('repo slice runtime routing', () => {
       timeoutMs: 15_000
     })
     expect(reposRemove).not.toHaveBeenCalled()
+  })
+
+  it('evicts GitHub caches for removed repos using repo id and legacy path keys', async () => {
+    const store = createTestStore()
+    store.setState({
+      repos: [localRepo],
+      workItemsInvalidationNonce: 2,
+      workItemsCache: {
+        [workItemsCacheKey(localRepo.id, 20, '')]: { data: [], fetchedAt: 1 },
+        [workItemsCacheKey(localRepo.path, 20, '')]: { data: [], fetchedAt: 1 },
+        [workItemsCacheKey('other-repo', 20, '')]: { data: [], fetchedAt: 1 }
+      },
+      prCache: {
+        [`${localRepo.id}::branch`]: { data: {} as never, fetchedAt: 1 },
+        [`${localRepo.path}::branch`]: { data: {} as never, fetchedAt: 1 },
+        'other-repo::branch': { data: {} as never, fetchedAt: 1 }
+      }
+    })
+
+    await store.getState().removeProject(localRepo.id)
+
+    expect(Object.keys(store.getState().workItemsCache)).toEqual([
+      workItemsCacheKey('other-repo', 20, '')
+    ])
+    expect(Object.keys(store.getState().prCache)).toEqual(['other-repo::branch'])
+    expect(store.getState().workItemsInvalidationNonce).toBe(3)
   })
 
   it('stops remote runtime terminals instead of killing remote ids through local pty IPC', async () => {
@@ -217,7 +244,7 @@ describe('repo slice runtime routing', () => {
       }
     })
 
-    await store.getState().removeRepo(remoteRepo.id)
+    await store.getState().removeProject(remoteRepo.id)
 
     expect(runtimeEnvironmentCall).toHaveBeenCalledWith({
       selector: 'env-1',
@@ -227,6 +254,48 @@ describe('repo slice runtime routing', () => {
     })
     expect(ptyKill).toHaveBeenCalledWith('pty-local-stale')
     expect(ptyKill).not.toHaveBeenCalledWith('remote:term-1')
+  })
+
+  it('cleans up hidden detected worktree state when removing a repo', async () => {
+    const store = createTestStore()
+    const hiddenWorktree = makeWorktree({
+      id: `${localRepo.id}::/local/hidden`,
+      repoId: localRepo.id,
+      path: '/local/hidden'
+    })
+    store.setState({
+      repos: [localRepo],
+      worktreesByRepo: { [localRepo.id]: [] },
+      detectedWorktreesByRepo: {
+        [localRepo.id]: {
+          repoId: localRepo.id,
+          authoritative: true,
+          source: 'git',
+          worktrees: [
+            {
+              ...hiddenWorktree,
+              ownership: 'external',
+              selectedCheckout: false,
+              visible: false
+            }
+          ]
+        }
+      },
+      tabsByWorktree: {
+        [hiddenWorktree.id]: [{ id: 'tab-hidden', worktreeId: hiddenWorktree.id }] as never
+      },
+      ptyIdsByTabId: {
+        'tab-hidden': ['pty-hidden']
+      },
+      activeWorktreeId: hiddenWorktree.id
+    })
+
+    await store.getState().removeProject(localRepo.id)
+
+    expect(store.getState().detectedWorktreesByRepo[localRepo.id]).toBeUndefined()
+    expect(store.getState().tabsByWorktree[hiddenWorktree.id]).toBeUndefined()
+    expect(store.getState().activeWorktreeId).toBeNull()
+    expect(ptyKill).toHaveBeenCalledWith('pty-hidden')
   })
 
   it('reorders repos through the active remote runtime environment', async () => {

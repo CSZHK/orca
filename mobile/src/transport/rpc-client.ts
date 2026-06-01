@@ -20,14 +20,28 @@ import {
   decodeTerminalStreamJson,
   decodeTerminalStreamText
 } from './terminal-stream-protocol'
+import {
+  decodeBrowserScreencastFrame,
+  type BrowserScreencastFrame
+} from './browser-screencast-protocol'
 
 type PendingRequest = {
   resolve: (response: RpcResponse) => void
   reject: (error: Error) => void
 }
 
+type ConnectWaiter = {
+  resolve: () => void
+  reject: (error: Error) => void
+  timeout: ReturnType<typeof setTimeout> | null
+}
+
 type SendRequestOptions = {
   timeoutMs?: number
+}
+
+type SubscribeOptions = {
+  onBinaryFrame?: (frame: BrowserScreencastFrame) => void
 }
 
 type StreamingListener = (result: unknown) => void
@@ -36,6 +50,10 @@ type StreamRequest = {
   method: string
   params: unknown
   listener: StreamingListener
+  onBinaryFrame?: (frame: BrowserScreencastFrame) => void
+  subscriptionId?: string
+  cancelled?: boolean
+  sent?: boolean
 }
 
 type TerminalSnapshotState = {
@@ -50,7 +68,12 @@ export type RpcClient = {
     params?: unknown,
     options?: SendRequestOptions
   ) => Promise<RpcResponse>
-  subscribe: (method: string, params: unknown, onData: StreamingListener) => () => void
+  subscribe: (
+    method: string,
+    params: unknown,
+    onData: StreamingListener,
+    options?: SubscribeOptions
+  ) => () => void
   getState: () => ConnectionState
   // Why: UI escalates "Reconnecting…" to "Can't connect" once attempts cross
   // a threshold. 0 means never failed; counter is reset on successful open.
@@ -168,8 +191,10 @@ export function connect(
   const terminalStreamListeners = new Map<number, StreamingListener>()
   const terminalStreamIdsByRequest = new Map<string, Set<number>>()
   const terminalSnapshots = new Map<number, TerminalSnapshotState>()
+  let activeBrowserScreencastRequestId: string | null = null
+  let pendingBrowserScreencastRequestId: string | null = null
   const stateListeners = new Set<(state: ConnectionState) => void>()
-  const connectWaiters: Array<{ resolve: () => void; reject: (e: Error) => void }> = []
+  const connectWaiters: ConnectWaiter[] = []
 
   if (onStateChange) {
     stateListeners.add(onStateChange)
@@ -179,6 +204,16 @@ export function connect(
   // for spotting "stuck in connecting" or "stuck in reconnecting" cases
   // in the logs.
   let stateEnteredAt = Date.now()
+
+  function rejectConnectWaiters(reason: string) {
+    const error = new Error(reason)
+    for (const waiter of connectWaiters.splice(0)) {
+      if (waiter.timeout) {
+        clearTimeout(waiter.timeout)
+      }
+      waiter.reject(error)
+    }
+  }
 
   function setState(next: ConnectionState) {
     if (state === next) return
@@ -195,11 +230,16 @@ export function connect(
     })
     if (next === 'connected') {
       lastConnectedAt = Date.now()
-      for (const w of connectWaiters.splice(0)) w.resolve()
+      for (const waiter of connectWaiters.splice(0)) {
+        if (waiter.timeout) {
+          clearTimeout(waiter.timeout)
+        }
+        waiter.resolve()
+      }
     } else if (next === 'disconnected' || next === 'auth-failed') {
       const reason =
         next === 'auth-failed' ? 'Unauthorized — pairing may be revoked' : 'Connection closed'
-      for (const w of connectWaiters.splice(0)) w.reject(new Error(reason))
+      rejectConnectWaiters(reason)
     }
     for (const listener of stateListeners) {
       listener(next)
@@ -217,11 +257,31 @@ export function connect(
     }
   }
 
-  function waitForConnected(): Promise<void> {
+  function waitForConnected(timeoutMs?: number): Promise<void> {
     if (state === 'connected') return Promise.resolve()
     if (intentionallyClosed) return Promise.reject(new Error('Client closed'))
+    if (state === 'reconnecting' && reconnectAttempt >= GIVE_UP_AFTER_ATTEMPTS && !reconnectTimer) {
+      // Why: after the retry cap there is no future state transition to
+      // release callers waiting before their per-request timeout starts.
+      return Promise.reject(new Error('Connection retry limit reached'))
+    }
     return new Promise((resolve, reject) => {
-      connectWaiters.push({ resolve, reject })
+      const waiter: ConnectWaiter = { resolve, reject, timeout: null }
+      if (timeoutMs !== undefined) {
+        // Why: explicit per-request timeouts must include offline/reconnect
+        // waiting, not only the RPC after the socket becomes connected.
+        waiter.timeout = setTimeout(
+          () => {
+            const index = connectWaiters.indexOf(waiter)
+            if (index !== -1) {
+              connectWaiters.splice(index, 1)
+            }
+            reject(new Error('Timed out while connecting to the remote Orca runtime.'))
+          },
+          Math.max(0, timeoutMs)
+        )
+      }
+      connectWaiters.push(waiter)
     })
   }
 
@@ -259,6 +319,19 @@ export function connect(
 
     ws = new WebSocket(endpoint)
     const openingWs = ws
+    const ignoreStaleSocketEvent = (eventName: string): boolean => {
+      if (ws === openingWs) {
+        return false
+      }
+      // Why: React Native can deliver callbacks from a timed-out socket after
+      // reconnect has swapped in a replacement; stale events must not mutate it.
+      console.log('[net] stale ws event ignored', {
+        eventName,
+        state,
+        attempt: reconnectAttempt
+      })
+      return true
+    }
 
     // Why: React Native can leave TCP/WebSocket opens pending indefinitely on
     // flaky network handoffs. Force the existing onclose reconnect path if
@@ -283,6 +356,9 @@ export function connect(
     }, CONNECT_TIMEOUT_MS)
 
     ws.onopen = () => {
+      if (ignoreStaleSocketEvent('open')) {
+        return
+      }
       console.log('[net] ws.onopen', { attempt: reconnectAttempt })
       clearConnectTimer()
       reconnectAttempt = 0
@@ -297,13 +373,16 @@ export function connect(
         type: 'e2ee_hello',
         publicKeyB64: publicKeyToBase64(ephemeral.publicKey)
       })
-      ws?.send(hello)
+      openingWs.send(hello)
       emitLog('info', 'Sent e2ee_hello', 'Awaiting server e2ee_ready')
 
       sharedKey = deriveSharedKey(ephemeral.secretKey, serverPublicKey)
 
       handshakeTimer = setTimeout(() => {
         handshakeTimer = null
+        if (ws !== openingWs || state !== 'handshaking') {
+          return
+        }
         console.log('[net] handshake-timeout fired (e2ee_authenticated never arrived)', {
           timeoutMs: HANDSHAKE_TIMEOUT_MS
         })
@@ -312,11 +391,14 @@ export function connect(
           'Handshake timeout',
           `No e2ee_ready/e2ee_authenticated within ${HANDSHAKE_TIMEOUT_MS / 1000}s`
         )
-        ws?.close()
+        openingWs.close()
       }, HANDSHAKE_TIMEOUT_MS)
     }
 
     ws.onmessage = (event) => {
+      if (ignoreStaleSocketEvent('message')) {
+        return
+      }
       void handleSocketMessage(event.data)
     }
 
@@ -366,7 +448,22 @@ export function connect(
             emitLog('success', 'Authenticated', 'Channel ready for RPC')
             startActivityProbe()
             for (const [id, stream] of streamListeners) {
-              sendEncrypted({ id, deviceToken, method: stream.method, params: stream.params })
+              if (stream.cancelled) {
+                removeStreamListener(id)
+                continue
+              }
+              if (stream.method === 'browser.screencast') {
+                pendingBrowserScreencastRequestId = id
+                activeBrowserScreencastRequestId = null
+              }
+              if (
+                sendEncrypted({ id, deviceToken, method: stream.method, params: stream.params })
+              ) {
+                stream.sent = true
+              } else {
+                emitStreamError(stream, 'Connection interrupted')
+                removeStreamListener(id)
+              }
             }
           } else if (msg.type === 'e2ee_error' || (!msg.ok && msg.error?.code === 'unauthorized')) {
             console.log('[net] e2ee auth FAILED', { msgType: msg.type, error: msg.error })
@@ -378,6 +475,8 @@ export function connect(
             intentionallyClosed = true
             ws?.close()
             ws = null
+            activeBrowserScreencastRequestId = null
+            pendingBrowserScreencastRequestId = null
             setState('auth-failed')
             rejectAllPending('Unauthorized — pairing may be revoked')
           }
@@ -395,6 +494,9 @@ export function connect(
 
       if (raw === null) {
         const bytes = await websocketPayloadToUint8(rawData)
+        if (ws !== openingWs) {
+          return
+        }
         if (!bytes) {
           return
         }
@@ -402,7 +504,7 @@ export function connect(
         if (!plaintextBytes) {
           return
         }
-        handleTerminalBinaryFrame(plaintextBytes)
+        handleBinaryFrame(plaintextBytes)
         return
       }
 
@@ -424,6 +526,8 @@ export function connect(
         intentionallyClosed = true
         ws?.close()
         ws = null
+        activeBrowserScreencastRequestId = null
+        pendingBrowserScreencastRequestId = null
         setState('auth-failed')
         rejectAllPending('Unauthorized — pairing may be revoked')
         return
@@ -435,6 +539,26 @@ export function connect(
         const stream = streamListeners.get(response.id)
         if (stream && response.ok) {
           const result = (response as RpcSuccess).result
+          if (isBrowserScreencastReadyResult(result)) {
+            stream.subscriptionId = result.subscriptionId
+            if (stream.cancelled) {
+              sendBrowserScreencastUnsubscribe(result.subscriptionId)
+              removeStreamListener(response.id)
+              return
+            }
+            if (stream.method === 'browser.screencast') {
+              if (
+                pendingBrowserScreencastRequestId !== response.id &&
+                activeBrowserScreencastRequestId !== response.id
+              ) {
+                sendBrowserScreencastUnsubscribe(result.subscriptionId)
+                removeStreamListener(response.id)
+                return
+              }
+              pendingBrowserScreencastRequestId = null
+              activeBrowserScreencastRequestId = response.id
+            }
+          }
           if (isTerminalSubscribedResult(result)) {
             let ids = terminalStreamIdsByRequest.get(response.id)
             if (!ids) {
@@ -444,7 +568,9 @@ export function connect(
             ids.add(result.streamId)
             terminalStreamListeners.set(result.streamId, stream.listener)
           }
-          stream.listener(result)
+          if (!stream.cancelled) {
+            stream.listener(result)
+          }
         }
         return
       }
@@ -454,8 +580,10 @@ export function connect(
         if (result && result.type === 'end') {
           const stream = streamListeners.get(response.id)
           if (stream) {
-            stream.listener(result)
-            streamListeners.delete(response.id)
+            if (!stream.cancelled) {
+              stream.listener(result)
+            }
+            removeStreamListener(response.id)
             return
           }
         }
@@ -466,6 +594,17 @@ export function connect(
             return
           }
         }
+      }
+
+      const stream = streamListeners.get(response.id)
+      if (stream) {
+        if (!response.ok) {
+          emitStreamError(stream, response.error.message, response.error)
+        } else {
+          emitStreamError(stream, 'Streaming request ended before it was ready.')
+        }
+        removeStreamListener(response.id)
+        return
       }
 
       const req = pending.get(response.id)
@@ -536,6 +675,9 @@ export function connect(
     }
 
     ws.onerror = (event) => {
+      if (ignoreStaleSocketEvent('error')) {
+        return
+      }
       // Why: RN surfaces network errors here (DNS failure, TCP RST, etc).
       // onclose fires right after, but logging the error message gives us
       // the original cause that the close code alone can hide.
@@ -586,6 +728,8 @@ export function connect(
     clearConnectTimer()
     ws = null
     sharedKey = null
+    activeBrowserScreencastRequestId = null
+    pendingBrowserScreencastRequestId = null
     if (handshakeTimer) {
       clearTimeout(handshakeTimer)
       handshakeTimer = null
@@ -624,6 +768,7 @@ export function connect(
         reason: 'give-up-cap',
         endpoint: redactedEndpoint(endpoint)
       })
+      rejectConnectWaiters('Connection retry limit reached')
       return
     }
     const delay = RECONNECT_DELAYS[Math.min(reconnectAttempt, RECONNECT_DELAYS.length - 1)]!
@@ -706,6 +851,79 @@ export function connect(
       pending.delete(id)
       queueMicrotask(() => req.reject(error))
     }
+  }
+
+  function removeStreamListener(id: string): void {
+    const stream = streamListeners.get(id)
+    streamListeners.delete(id)
+    if (activeBrowserScreencastRequestId === id) {
+      activeBrowserScreencastRequestId = null
+    }
+    if (pendingBrowserScreencastRequestId === id) {
+      pendingBrowserScreencastRequestId = null
+    }
+    const terminalStreamIds = terminalStreamIdsByRequest.get(id)
+    if (terminalStreamIds) {
+      for (const streamId of terminalStreamIds) {
+        terminalStreamListeners.delete(streamId)
+        terminalSnapshots.delete(streamId)
+      }
+      terminalStreamIdsByRequest.delete(id)
+    }
+    if (stream?.method === 'browser.screencast') {
+      stream.cancelled = true
+    }
+  }
+
+  function emitStreamError(stream: StreamRequest, message: string, error?: unknown): void {
+    if (stream.cancelled) {
+      return
+    }
+    stream.listener({ type: 'error', message, error })
+  }
+
+  function disposeBrowserScreencastStream(id: string): void {
+    const stream = streamListeners.get(id)
+    if (!stream || stream.method !== 'browser.screencast') {
+      return
+    }
+    stream.cancelled = true
+    if (activeBrowserScreencastRequestId === id) {
+      activeBrowserScreencastRequestId = null
+    }
+    if (pendingBrowserScreencastRequestId === id) {
+      pendingBrowserScreencastRequestId = null
+    }
+    if (stream.subscriptionId) {
+      sendBrowserScreencastUnsubscribe(stream.subscriptionId)
+      removeStreamListener(id)
+      return
+    }
+    // Why: sent streams may still reply with `ready`; keep a tombstone so we
+    // can immediately unsubscribe. Queued streams never reached desktop.
+    if (!stream.sent) {
+      removeStreamListener(id)
+    }
+  }
+
+  function handleBinaryFrame(bytes: Uint8Array) {
+    const browserFrame = decodeBrowserScreencastFrame(bytes)
+    if (browserFrame) {
+      handleBrowserBinaryFrame(browserFrame)
+      return
+    }
+    handleTerminalBinaryFrame(bytes)
+  }
+
+  function handleBrowserBinaryFrame(frame: BrowserScreencastFrame) {
+    if (!activeBrowserScreencastRequestId) {
+      return
+    }
+    const stream = streamListeners.get(activeBrowserScreencastRequestId)
+    if (!stream || stream.cancelled || stream.method !== 'browser.screencast') {
+      return
+    }
+    stream.onBinaryFrame?.(frame)
   }
 
   function handleTerminalBinaryFrame(bytes: Uint8Array) {
@@ -802,6 +1020,15 @@ export function connect(
     return false
   }
 
+  function sendBrowserScreencastUnsubscribe(subscriptionId: string): void {
+    sendEncrypted({
+      id: nextId(),
+      deviceToken,
+      method: 'browser.screencast.unsubscribe',
+      params: { subscriptionId }
+    })
+  }
+
   openConnection()
 
   return {
@@ -812,7 +1039,7 @@ export function connect(
     ): Promise<RpcResponse> {
       const waitStart = Date.now()
       const wasConnected = state === 'connected'
-      await waitForConnected()
+      await waitForConnected(options?.timeoutMs)
       if (!wasConnected) {
         console.log('[net] sendRequest waited for connect', {
           method,
@@ -852,12 +1079,41 @@ export function connect(
       })
     },
 
-    subscribe(method: string, params: unknown, onData: StreamingListener): () => void {
+    subscribe(
+      method: string,
+      params: unknown,
+      onData: StreamingListener,
+      options?: SubscribeOptions
+    ): () => void {
       const id = nextId()
-      streamListeners.set(id, { method, params, listener: onData })
+      const stream: StreamRequest = {
+        method,
+        params,
+        listener: onData,
+        onBinaryFrame: options?.onBinaryFrame
+      }
+      streamListeners.set(id, stream)
+      if (method === 'browser.screencast') {
+        if (activeBrowserScreencastRequestId && activeBrowserScreencastRequestId !== id) {
+          disposeBrowserScreencastStream(activeBrowserScreencastRequestId)
+        }
+        if (pendingBrowserScreencastRequestId && pendingBrowserScreencastRequestId !== id) {
+          disposeBrowserScreencastStream(pendingBrowserScreencastRequestId)
+        }
+        // Why: browser screencast frames are connection-scoped and carry no
+        // stream id. Wait for the replacement stream's ready response before
+        // routing frames, so in-flight old-page pixels are dropped.
+        pendingBrowserScreencastRequestId = id
+        activeBrowserScreencastRequestId = null
+      }
 
       if (state === 'connected') {
-        sendEncrypted({ id, deviceToken, method, params })
+        if (sendEncrypted({ id, deviceToken, method, params })) {
+          stream.sent = true
+        } else {
+          emitStreamError(stream, 'Connection interrupted')
+          removeStreamListener(id)
+        }
       } else {
         // Stream is registered but the actual outbound subscribe will be
         // sent (or re-sent) when the channel reaches 'connected'. Useful
@@ -867,14 +1123,9 @@ export function connect(
 
       return () => {
         const stream = streamListeners.get(id)
-        streamListeners.delete(id)
-        const terminalStreamIds = terminalStreamIdsByRequest.get(id)
-        if (terminalStreamIds) {
-          for (const streamId of terminalStreamIds) {
-            terminalStreamListeners.delete(streamId)
-            terminalSnapshots.delete(streamId)
-          }
-          terminalStreamIdsByRequest.delete(id)
+        if (stream?.method === 'browser.screencast') {
+          disposeBrowserScreencastStream(id)
+          return
         }
         if (
           stream?.method === 'terminal.subscribe' &&
@@ -919,6 +1170,7 @@ export function connect(
             params: { worktree: (stream.params as { worktree: string }).worktree }
           })
         }
+        removeStreamListener(id)
       }
     },
 
@@ -970,6 +1222,17 @@ function isTerminalSubscribedResult(
     typeof value === 'object' &&
     (value as { type?: unknown }).type === 'subscribed' &&
     typeof (value as { streamId?: unknown }).streamId === 'number'
+  )
+}
+
+function isBrowserScreencastReadyResult(
+  value: unknown
+): value is { type: 'ready'; subscriptionId: string } {
+  return (
+    !!value &&
+    typeof value === 'object' &&
+    (value as { type?: unknown }).type === 'ready' &&
+    typeof (value as { subscriptionId?: unknown }).subscriptionId === 'string'
   )
 }
 

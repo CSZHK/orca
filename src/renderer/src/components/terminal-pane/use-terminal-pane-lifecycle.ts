@@ -3,17 +3,21 @@ import { useEffect, useRef } from 'react'
 import type { IDisposable, Terminal } from '@xterm/xterm'
 import { PaneManager } from '@/lib/pane-manager/pane-manager'
 import { resolveTerminalCursorInactiveStyle } from '@/lib/pane-manager/pane-terminal-options'
+import { buildWindowsPtyCompatibilityOptions } from '@/lib/pane-manager/windows-pty-compatibility'
 import { useAppStore } from '@/store'
 import {
   createFilePathLinkProvider,
   getTerminalFileOpenHint,
   getTerminalUrlOpenHint,
-  handleOscLink
+  installFilePathLinkClickFallback
 } from './terminal-link-handlers'
 import type { LinkHandlerDeps } from './terminal-link-handlers'
+import { handleOscLink } from './terminal-osc-link-routing'
+import { installHttpLinkClickFallback } from './terminal-url-link-hit-testing'
 import type {
   GlobalSettings,
   SetupSplitDirection,
+  TerminalTab,
   TerminalLayoutSnapshot
 } from '../../../../shared/types'
 import type { EventProps } from '../../../../shared/telemetry-events'
@@ -21,6 +25,7 @@ import { resolveTerminalFontWeights } from '../../../../shared/terminal-fonts'
 import {
   buildFontFamily,
   normalizeTerminalLayoutSnapshot,
+  RESET_KITTY_KEYBOARD_PROTOCOL,
   replayTerminalLayout,
   restoreScrollbackBuffers
 } from './layout-serialization'
@@ -31,9 +36,17 @@ import {
   installMode2031Handlers,
   mode2031SequenceFor
 } from './terminal-appearance'
-import { parseOsc52 } from './osc52-clipboard'
+import { handleOsc52ClipboardRequest } from './osc52-clipboard'
+import { showOsc52ClipboardBlockedToast } from './osc52-clipboard-blocked-toast'
 import { parseOsc7 } from './parse-osc7'
-import { shouldBypassXtermKeydown } from './xterm-bypass-policy'
+import { resolveTerminalJisYenInput } from './terminal-jis-yen-input'
+import {
+  shouldBypassXtermKeyboardEvent,
+  shouldHandleTerminalInterruptKeyboardEvent,
+  shouldSuppressTerminalInterruptKeyup,
+  shouldSuppressTerminalModifierKeyboardEvent,
+  TERMINAL_INTERRUPT_INPUT
+} from './xterm-bypass-policy'
 import type { PaneCwdMap } from './resolve-split-cwd'
 import { installMouseHideWhileTyping } from './mouse-hide-while-typing'
 import type { EffectiveMacOptionAsAlt } from '@/lib/keyboard-layout/detect-option-as-alt'
@@ -41,6 +54,7 @@ import { resolveEffectiveTerminalAppearance } from '@/lib/terminal-theme'
 import { connectPanePty } from './pty-connection'
 import type { PtyTransport } from './pty-transport'
 import { getRemoteRuntimePtyEnvironmentId } from '@/runtime/runtime-terminal-stream'
+import { getConnectionId } from '@/lib/connection-context'
 import { isPaneReplaying, type ReplayingPanesRef } from './replay-guard'
 import { fitAndFocusPanes, fitPanes } from './pane-helpers'
 import { registerRuntimeTerminalTab, scheduleRuntimeGraphSync } from '@/runtime/sync-runtime-graph'
@@ -56,6 +70,12 @@ import {
   type SplitTerminalPaneDetail,
   type CloseTerminalPaneDetail
 } from '@/constants/terminal'
+import { acquireWebviewsDragPassthrough } from '../browser-pane/webview-registry'
+
+function extractUncHost(value: string | undefined): string | null {
+  const match = /^(?:\\\\|\/\/)([^\\/]+)/.exec(value ?? '')
+  return match?.[1] || null
+}
 
 type UseTerminalPaneLifecycleDeps = {
   tabId: string
@@ -80,6 +100,7 @@ type UseTerminalPaneLifecycleDeps = {
    *  issue-automation command with the linked issue number interpolated. */
   issueCommandSplit?: { command: string; env?: Record<string, string> } | null
   isActive: boolean
+  isVisible: boolean
   systemPrefersDark: boolean
   settings: GlobalSettings | null | undefined
   settingsRef: React.RefObject<GlobalSettings | null | undefined>
@@ -116,8 +137,10 @@ type UseTerminalPaneLifecycleDeps = {
   updateTabPtyId: (tabId: string, ptyId: string) => void
   markWorktreeUnread: (worktreeId: string) => void
   markTerminalTabUnread: (tabId: string) => void
+  markTerminalPaneUnread: (paneKey: string) => void
   clearWorktreeUnread: (worktreeId: string) => void
   clearTerminalTabUnread: (tabId: string) => void
+  clearTerminalPaneUnread: (paneKey: string) => void
   dispatchNotification: (event: {
     source: 'terminal-bell' | 'agent-task-complete'
     terminalTitle?: string
@@ -140,6 +163,17 @@ type UseTerminalPaneLifecycleDeps = {
   setPaneCount: React.Dispatch<React.SetStateAction<number>>
 }
 
+export function suppressIntentionalPaneCloseExit(
+  transport: Pick<PtyTransport, 'getPtyId'> | null | undefined,
+  suppressPtyExit: (ptyId: string) => void
+): string | null {
+  const ptyId = transport?.getPtyId() ?? null
+  if (ptyId) {
+    suppressPtyExit(ptyId)
+  }
+  return ptyId
+}
+
 function terminalSelectionExceedsPrimaryLimit(terminal: Terminal): boolean {
   const range = terminal.getSelectionPosition()
   if (!range) {
@@ -159,6 +193,20 @@ type SplitStartupPayload = { command: string; env?: Record<string, string> }
 
 type SplitWithStartupDeps = {
   startup?: SplitStartupPayload | null
+}
+
+function resolveTerminalHomePathFromEnv(env: Record<string, string> | undefined): string | null {
+  const home = env?.HOME?.trim()
+  if (home) {
+    return home
+  }
+  const userProfile = env?.USERPROFILE?.trim()
+  if (userProfile) {
+    return userProfile
+  }
+  const homeDrive = env?.HOMEDRIVE?.trim()
+  const homePath = env?.HOMEPATH?.trim()
+  return homeDrive && homePath ? `${homeDrive}${homePath}` : null
 }
 
 /** Scopes `deps.startup` to a single call of `splitPane()`, clearing it in `finally` so later splits do not replay the payload. */
@@ -183,6 +231,23 @@ export function splitPaneWithOneShotStartup<TPane>(
   }
 }
 
+export function shouldDetachPaneTransportOnUnmount(args: {
+  tabStillExists: boolean
+  tabId: string
+  ptyId: string | null
+  worktreeTabs: readonly TerminalTab[] | undefined
+}): boolean {
+  if (!args.ptyId) {
+    return false
+  }
+  if (args.tabStillExists) {
+    return true
+  }
+  return Boolean(
+    args.worktreeTabs?.some((tab) => tab.id !== args.tabId && tab.ptyId === args.ptyId)
+  )
+}
+
 export function useTerminalPaneLifecycle({
   tabId,
   worktreeId,
@@ -191,6 +256,7 @@ export function useTerminalPaneLifecycle({
   setupSplit,
   issueCommandSplit,
   isActive,
+  isVisible,
   systemPrefersDark,
   settings,
   settingsRef,
@@ -219,8 +285,10 @@ export function useTerminalPaneLifecycle({
   updateTabPtyId,
   markWorktreeUnread,
   markTerminalTabUnread,
+  markTerminalPaneUnread,
   clearWorktreeUnread,
   clearTerminalTabUnread,
+  clearTerminalPaneUnread,
   dispatchNotification,
   setCacheTimerStartedAt,
   syncPanePtyLayoutBinding,
@@ -237,6 +305,8 @@ export function useTerminalPaneLifecycle({
   const systemPrefersDarkRef = useRef(systemPrefersDark)
   systemPrefersDarkRef.current = systemPrefersDark
   const linkProviderDisposablesRef = useRef(new Map<number, IDisposable>())
+  const fileLinkClickFallbackDisposablesRef = useRef(new Map<number, IDisposable>())
+  const httpLinkClickFallbackDisposablesRef = useRef(new Map<number, IDisposable>())
   // Why: read settingsRef at fire time so toggling "copy on select" takes
   // effect without recreating panes.
   const selectionDisposablesRef = useRef(new Map<number, IDisposable>())
@@ -304,6 +374,8 @@ export function useTerminalPaneLifecycle({
     const paneTransports = paneTransportsRef.current
     const panePtyBindings = panePtyBindingsRef.current
     const linkDisposables = linkProviderDisposablesRef.current
+    const fileLinkClickFallbackDisposables = fileLinkClickFallbackDisposablesRef.current
+    const httpLinkClickFallbackDisposables = httpLinkClickFallbackDisposablesRef.current
     const selectionDisposables = selectionDisposablesRef.current
     const selectionCaptureTimers = selectionCaptureTimersRef.current
     const mouseHideDisposables = mouseHideDisposablesRef.current
@@ -315,11 +387,16 @@ export function useTerminalPaneLifecycle({
       cwd ??
       ''
     const startupCwd = cwd ?? worktreePath
+    const terminalHomePath = resolveTerminalHomePathFromEnv(startup?.env)
+    // Why: existence probes can cross SSH/runtime boundaries. This cache is
+    // lifecycle-scoped, so external mutations and the initial 'active' runtime
+    // fallback can temporarily leave stale entries.
     const pathExistsCache = new Map<string, boolean>()
     const linkDeps: LinkHandlerDeps = {
       worktreeId,
       worktreePath,
       startupCwd,
+      terminalHomePath,
       managerRef,
       linkProviderDisposablesRef,
       pathExistsCache,
@@ -385,8 +462,10 @@ export function useTerminalPaneLifecycle({
       updateTabPtyId,
       markWorktreeUnread,
       markTerminalTabUnread,
+      markTerminalPaneUnread,
       clearWorktreeUnread,
       clearTerminalTabUnread,
+      clearTerminalPaneUnread,
       dispatchNotification,
       setCacheTimerStartedAt,
       syncPanePtyLayoutBinding,
@@ -403,6 +482,9 @@ export function useTerminalPaneLifecycle({
 
     const fileOpenLinkHint = getTerminalFileOpenHint()
     const urlOpenLinkHint = getTerminalUrlOpenHint()
+    const osc7UncHost = extractUncHost(cwd)
+
+    let releaseWebviewDragPassthrough: (() => void) | null = null
 
     const manager = new PaneManager(container, {
       // Why: `spawnHints` carries the resolved cwd from Cmd+D / context-menu
@@ -428,22 +510,13 @@ export function useTerminalPaneLifecycle({
         // both the enabled and disabled paths so xterm doesn't fall
         // through to any other OSC 52 handler and so our intentional drop
         // in the disabled path is explicit.
-        const osc52Disposable = pane.terminal.parser.registerOscHandler(52, (data) => {
-          if (!settingsRef.current?.terminalAllowOsc52Clipboard) {
-            return true
-          }
-          const parsed = parseOsc52(data)
-          if (parsed.kind !== 'write') {
-            // Queries and malformed payloads are intentionally dropped —
-            // answering a query would leak the user's clipboard to any
-            // process writing to the PTY.
-            return true
-          }
-          void window.api.ui.writeClipboardText(parsed.text).catch(() => {
-            /* ignore clipboard write failures */
+        const osc52Disposable = pane.terminal.parser.registerOscHandler(52, (data) =>
+          handleOsc52ClipboardRequest(data, {
+            allowClipboardWrite: settingsRef.current?.terminalAllowOsc52Clipboard === true,
+            writeClipboardText: window.api.ui.writeClipboardText,
+            onBlockedWrite: showOsc52ClipboardBlockedToast
           })
-          return true
-        })
+        )
         osc52DisposablesRef.current.set(pane.id, osc52Disposable)
 
         // OSC 7 — shell-reported current working directory. Drives split-pane
@@ -463,30 +536,72 @@ export function useTerminalPaneLifecycle({
         // consumer registers on code 7, registration order decides who sees
         // each sequence.
         const osc7Disposable = pane.terminal.parser.registerOscHandler(7, (data) => {
-          const cwd = parseOsc7(data)
-          if (cwd) {
+          const parsedCwd = parseOsc7(data, { uncHost: osc7UncHost })
+          if (parsedCwd) {
             const confirmed = !isPaneReplaying(replayingPanesRef, pane.id)
-            paneCwdRef.current.set(pane.id, { cwd, confirmed })
+            paneCwdRef.current.set(pane.id, { cwd: parsedCwd, confirmed })
           }
           return true
         })
         osc7DisposablesRef.current.set(pane.id, osc7Disposable)
 
-        // Why: let clipboard chords bypass xterm's kitty CSI-u encoder.
+        // Why: let host-handled keys bypass xterm's kitty CSI-u encoder.
         // With vtExtensions.kittyKeyboard on, a CLI that activates progressive
         // enhancement (Codex does, Claude Code does not) makes xterm encode
         // Cmd+C as a CSI-u sequence with cancel=true, which preventDefaults
         // the keydown and suppresses Chromium's native copy event — so the
-        // selection never reaches the clipboard. Returning false here short-
-        // circuits xterm's _keyDown before the encoder runs, letting the
-        // browser copy pipeline and Electron menu accelerators fire normally.
-        // See xterm-bypass-policy.ts for the rule derivation (Ghostty/VS Code).
+        // selection never reaches the clipboard. The same hook also bypasses
+        // matching keyups so kitty release sequences do not leak after a
+        // bypassed press. Returning false here short-circuits xterm before the
+        // encoder runs, letting the browser and Electron paths fire normally.
+        // See xterm-bypass-policy.ts for the rule derivation.
+        let pendingTerminalInterruptKeyup = false
         pane.terminal.attachCustomKeyEventHandler((e) => {
-          if (e.type !== 'keydown') {
-            return true
+          const isMac = navigator.userAgent.includes('Mac')
+          if (pendingTerminalInterruptKeyup && shouldSuppressTerminalInterruptKeyup(e)) {
+            pendingTerminalInterruptKeyup = false
+            return false
           }
-          return !shouldBypassXtermKeydown(e, {
-            isMac: navigator.userAgent.includes('Mac'),
+          if (
+            shouldHandleTerminalInterruptKeyboardEvent(e, {
+              isMac,
+              hasSelection: pane.terminal.hasSelection()
+            })
+          ) {
+            if (e.type === 'keydown') {
+              // Why: xterm's kitty encoder can turn plain Ctrl+C into CSI-u;
+              // ETX must stay transport-agnostic through the existing onData path.
+              pendingTerminalInterruptKeyup = true
+              pane.terminal.input(TERMINAL_INTERRUPT_INPUT)
+              // Why: CLIs such as Codex can die on SIGINT before restoring
+              // xterm's renderer-side Kitty flags, leaving the shell corrupted.
+              pane.terminal.write(RESET_KITTY_KEYBOARD_PROTOCOL)
+            } else {
+              pendingTerminalInterruptKeyup = false
+            }
+            return false
+          }
+          if (shouldSuppressTerminalModifierKeyboardEvent(e)) {
+            // Why: stale Kitty keyboard reporting can encode standalone
+            // modifier presses before Ctrl+C reaches the interrupt handler.
+            return false
+          }
+
+          const jisYenInput = resolveTerminalJisYenInput(e, {
+            enabled: settingsRef.current?.terminalJISYenToBackslash === true,
+            isMac
+          })
+          if (jisYenInput) {
+            if (jisYenInput.type === 'input') {
+              // Why: this is a translated character, not a terminal shortcut.
+              // Keep it on xterm's onData path so PTY input guards still run.
+              pane.terminal.input(jisYenInput.data)
+            }
+            return false
+          }
+
+          return !shouldBypassXtermKeyboardEvent(e, {
+            isMac,
             hasSelection: pane.terminal.hasSelection()
           })
         })
@@ -495,6 +610,17 @@ export function useTerminalPaneLifecycle({
           createFilePathLinkProvider(pane.id, linkDeps, pane.linkTooltip, fileOpenLinkHint)
         )
         linkProviderDisposablesRef.current.set(pane.id, linkProviderDisposable)
+        const fileLinkClickFallbackDisposable = installFilePathLinkClickFallback(
+          pane.id,
+          pane.terminal,
+          linkDeps
+        )
+        fileLinkClickFallbackDisposablesRef.current.set(pane.id, fileLinkClickFallbackDisposable)
+        const httpLinkClickFallbackDisposable = installHttpLinkClickFallback(
+          pane.terminal,
+          linkDeps
+        )
+        httpLinkClickFallbackDisposables.set(pane.id, httpLinkClickFallbackDisposable)
         // Why: skip empty selections so clicking to deselect doesn't clobber
         // whatever the user last copied elsewhere.
         const selectionDisposable = pane.terminal.onSelectionChange(() => {
@@ -590,6 +716,12 @@ export function useTerminalPaneLifecycle({
           // source pane) must override the tab-level ptyDeps.cwd (worktree
           // root) so Cmd+D splits boot in the live cwd.
           ...(spawnHints?.cwd ? { cwd: spawnHints.cwd } : {}),
+          restoredPtyIdByLeafId: spawnHints?.ptyId
+            ? {
+                ...ptyDeps.restoredPtyIdByLeafId,
+                [pane.leafId]: spawnHints.ptyId
+              }
+            : ptyDeps.restoredPtyIdByLeafId,
           restoredLeafId: pane.leafId
         })
         // Why: connectPanePty receives a spread copy of ptyDeps, so the
@@ -614,6 +746,17 @@ export function useTerminalPaneLifecycle({
         if (linkProviderDisposable) {
           linkProviderDisposable.dispose()
           linkProviderDisposablesRef.current.delete(paneId)
+        }
+        const fileLinkClickFallbackDisposable =
+          fileLinkClickFallbackDisposablesRef.current.get(paneId)
+        if (fileLinkClickFallbackDisposable) {
+          fileLinkClickFallbackDisposable.dispose()
+          fileLinkClickFallbackDisposablesRef.current.delete(paneId)
+        }
+        const httpLinkClickFallbackDisposable = httpLinkClickFallbackDisposables.get(paneId)
+        if (httpLinkClickFallbackDisposable) {
+          httpLinkClickFallbackDisposable.dispose()
+          httpLinkClickFallbackDisposables.delete(paneId)
         }
         const selectionDisposable = selectionDisposablesRef.current.get(paneId)
         if (selectionDisposable) {
@@ -658,21 +801,29 @@ export function useTerminalPaneLifecycle({
           panePtyBinding.dispose()
           panePtyBindings.delete(paneId)
         }
+        // Why: closing a pane is user-initiated teardown of this row — drop
+        // (not remove) so any retained `done` snapshot for this pane is also
+        // cleared and a same-frame live→gone transition cannot re-snapshot
+        // it via the retention sync. This is pane-keyed state, so it must
+        // clear even if the PTY transport was already removed.
+        const leafId = closedPane?.leafId
+        if (leafId) {
+          const paneKey = makePaneKey(tabId, leafId)
+          useAppStore.getState().setCacheTimerStartedAt(paneKey, null)
+          clearTerminalPaneUnread(paneKey)
+          useAppStore.getState().dropAgentStatus(paneKey)
+        }
         if (transport) {
-          const ptyId = transport.getPtyId()
+          const ptyId = suppressIntentionalPaneCloseExit(
+            transport,
+            useAppStore.getState().suppressPtyExit
+          )
           if (ptyId) {
+            // Why: user/CLI pane closes intentionally tear down this PTY after
+            // PaneManager has already promoted the sibling. Suppress that exit
+            // so the last-surviving pane is not mistaken for an exited tab.
             syncPanePtyLayoutBinding(paneId, null)
             clearTabPtyId(tabId, ptyId)
-          }
-          // Why: closing a pane is user-initiated teardown of this row — drop
-          // (not remove) so any retained `done` snapshot for this pane is also
-          // cleared and a same-frame live→gone transition cannot re-snapshot
-          // it via the retention sync.
-          const leafId = closedPane?.leafId
-          if (leafId) {
-            const paneKey = makePaneKey(tabId, leafId)
-            useAppStore.getState().setCacheTimerStartedAt(paneKey, null)
-            useAppStore.getState().dropAgentStatus(paneKey)
           }
           transport.destroy?.()
           paneTransportsRef.current.delete(paneId)
@@ -740,11 +891,31 @@ export function useTerminalPaneLifecycle({
           persistLayoutSnapshot()
         }
       },
+      onPaneDragActiveChange: (active) => {
+        if (active) {
+          releaseWebviewDragPassthrough?.()
+          releaseWebviewDragPassthrough = acquireWebviewsDragPassthrough()
+          return
+        }
+        releaseWebviewDragPassthrough?.()
+        releaseWebviewDragPassthrough = null
+      },
       terminalOptions: () => {
         const currentSettings = settingsRef.current
         const terminalFontWeights = resolveTerminalFontWeights(currentSettings?.terminalFontWeight)
         const cursorStyle = currentSettings?.terminalCursorStyle ?? 'bar'
+        const storeState = useAppStore.getState()
+        const currentTab = storeState.tabsByWorktree[worktreeId]?.find(
+          (candidate) => candidate.id === tabId
+        )
+        const windowsPtyCompatibilityOptions = buildWindowsPtyCompatibilityOptions({
+          userAgent: navigator.userAgent,
+          connectionId: getConnectionId(worktreeId),
+          cwd: startupCwd,
+          shellOverride: currentTab?.shellOverride
+        })
         return {
+          ...windowsPtyCompatibilityOptions,
           fontSize: currentSettings?.terminalFontSize ?? 14,
           fontFamily: buildFontFamily(currentSettings?.terminalFontFamily ?? ''),
           fontWeight: terminalFontWeights.fontWeight,
@@ -824,6 +995,10 @@ export function useTerminalPaneLifecycle({
         // Merge (not replace) so we don't discard any concurrent state
         // updates from onPaneClosed that React may have batched.
         setPaneTitles((prev) => ({ ...prev, ...restored }))
+        // Why: the lifecycle immediately persists a fresh layout after restore,
+        // before React state has flushed. Keep the ref in sync now so that
+        // persist preserves restored titles instead of rewriting them away.
+        paneTitlesRef.current = { ...paneTitlesRef.current, ...restored }
       }
     }
 
@@ -928,12 +1103,25 @@ export function useTerminalPaneLifecycle({
       if (!mgr) {
         return
       }
+      if (detail.newLeafId && mgr.getNumericIdForLeaf(detail.newLeafId) !== null) {
+        return
+      }
+      const sourcePaneId = detail.sourceLeafId
+        ? (mgr.getNumericIdForLeaf(detail.sourceLeafId) ?? detail.paneRuntimeId)
+        : detail.paneRuntimeId
+      if (sourcePaneId < 0) {
+        return
+      }
+      const splitOptions = {
+        ...(detail.newLeafId ? { leafId: detail.newLeafId } : {}),
+        ...(detail.ptyId ? { ptyId: detail.ptyId } : {})
+      }
       if (detail.command) {
         splitPaneWithOneShotStartup(ptyDeps, { command: detail.command }, () =>
-          mgr.splitPane(detail.paneRuntimeId, detail.direction)
+          mgr.splitPane(sourcePaneId, detail.direction, splitOptions)
         )
       } else {
-        mgr.splitPane(detail.paneRuntimeId, detail.direction)
+        mgr.splitPane(sourcePaneId, detail.direction, splitOptions)
       }
     }
     window.addEventListener(SPLIT_TERMINAL_PANE_EVENT, onCliSplitPane)
@@ -965,10 +1153,9 @@ export function useTerminalPaneLifecycle({
     return () => {
       window.removeEventListener(SPLIT_TERMINAL_PANE_EVENT, onCliSplitPane)
       window.removeEventListener(CLOSE_TERMINAL_PANE_EVENT, onCliClosePane)
+      const currentWorktreeTabs = useAppStore.getState().tabsByWorktree[worktreeId]
       const tabStillExists = Boolean(
-        useAppStore
-          .getState()
-          .tabsByWorktree[worktreeId]?.find((candidate) => candidate.id === tabId)
+        currentWorktreeTabs?.some((candidate) => candidate.id === tabId)
       )
       unregisterRuntimeTab()
       if (resizeRaf !== null) {
@@ -979,6 +1166,14 @@ export function useTerminalPaneLifecycle({
         disposable.dispose()
       }
       linkDisposables.clear()
+      for (const disposable of fileLinkClickFallbackDisposables.values()) {
+        disposable.dispose()
+      }
+      fileLinkClickFallbackDisposables.clear()
+      for (const disposable of httpLinkClickFallbackDisposables.values()) {
+        disposable.dispose()
+      }
+      httpLinkClickFallbackDisposables.clear()
       for (const disposable of selectionDisposables.values()) {
         disposable.dispose()
       }
@@ -992,11 +1187,21 @@ export function useTerminalPaneLifecycle({
       }
       mouseHideDisposables.clear()
       for (const transport of paneTransports.values()) {
-        if (tabStillExists && transport.getPtyId()) {
+        const ptyId = transport.getPtyId()
+        if (
+          shouldDetachPaneTransportOnUnmount({
+            tabStillExists,
+            tabId,
+            ptyId,
+            worktreeTabs: currentWorktreeTabs
+          })
+        ) {
           // Why: moving a terminal tab between groups currently rehomes the
           // React subtree, which unmounts this TerminalPane even though the tab
-          // itself is still alive. Detaching preserves the running PTY so the
-          // remounted pane can reattach without restarting the user's shell.
+          // itself is still alive. Web session mirroring can also replace a
+          // temporary local tab with a host surface that owns the same PTY.
+          // Detaching preserves the running PTY so the remounted pane can
+          // reattach without restarting the user's shell.
           // Transports that have not attached yet still have no PTY ID; those
           // must be destroyed so any in-flight spawn resolves into a killed PTY
           // instead of reviving a stale binding after unmount.
@@ -1011,6 +1216,8 @@ export function useTerminalPaneLifecycle({
       panePtyBindings.clear()
       paneTransports.clear()
       manager.destroy()
+      releaseWebviewDragPassthrough?.()
+      releaseWebviewDragPassthrough = null
       managerRef.current = null
       if (e2eConfig.exposeStore) {
         window.__paneManagers?.delete(tabId)
@@ -1020,6 +1227,17 @@ export function useTerminalPaneLifecycle({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tabId, cwd])
+
+  useEffect(() => {
+    isVisibleRef.current = isVisible
+    for (const panePtyBinding of panePtyBindingsRef.current.values()) {
+      const bindingWithVisibility = panePtyBinding as IDisposable & {
+        syncProcessTracking?: () => void
+      }
+      bindingWithVisibility.syncProcessTracking?.()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- Why: visibility flips must refresh existing PTY process tracking even though the ref object identity is stable.
+  }, [isVisible, isVisibleRef, panePtyBindingsRef])
 
   useEffect(() => {
     const manager = managerRef.current

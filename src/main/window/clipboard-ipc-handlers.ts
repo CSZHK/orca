@@ -1,7 +1,8 @@
-import fs from 'node:fs/promises'
-import path from 'node:path'
-
-import { app, clipboard, ipcMain, nativeImage } from 'electron'
+import { clipboard, ipcMain, nativeImage } from 'electron'
+import {
+  saveClipboardImageBufferAsTempFile,
+  type SaveClipboardImageAsTempFileArgs
+} from './clipboard-image-temp-file'
 
 export function registerClipboardHandlers(): void {
   ipcMain.removeHandler('clipboard:readText')
@@ -16,15 +17,16 @@ export function registerClipboardHandlers(): void {
   // Why: terminals need to detect clipboard images to support tools like Claude
   // Code that accept image input via paste. Writes the clipboard image to a
   // temp file and returns the path, or null if the clipboard has no image.
-  ipcMain.handle('clipboard:saveImageAsTempFile', async () => {
-    const image = clipboard.readImage()
-    if (image.isEmpty()) {
-      return null
+  ipcMain.handle(
+    'clipboard:saveImageAsTempFile',
+    async (_event, args?: SaveClipboardImageAsTempFileArgs) => {
+      const image = clipboard.readImage()
+      if (image.isEmpty()) {
+        return null
+      }
+      return saveClipboardImageBufferAsTempFile(image.toPNG(), args)
     }
-    const tempPath = path.join(app.getPath('temp'), `orca-paste-${Date.now()}.png`)
-    await fs.writeFile(tempPath, image.toPNG())
-    return tempPath
-  })
+  )
   ipcMain.handle('clipboard:writeText', (_event, text: string) => clipboard.writeText(text))
   ipcMain.handle('clipboard:writeSelectionText', (_event, text: string) =>
     clipboard.writeText(text, 'selection')

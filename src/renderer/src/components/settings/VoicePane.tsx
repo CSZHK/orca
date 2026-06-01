@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { GlobalSettings } from '../../../../shared/types'
 import { getDefaultVoiceSettings } from '../../../../shared/constants'
 import type { SpeechModelManifest, SpeechModelState } from '../../../../shared/speech-types'
@@ -14,9 +14,7 @@ import {
 import { Download, Trash2, Loader2, ChevronDown, Check } from 'lucide-react'
 import { toast } from 'sonner'
 import { useAppStore } from '@/store'
-
-const IS_MAC = navigator.userAgent.includes('Mac')
-const SHORTCUT_LABEL = IS_MAC ? '\u2318E' : 'Ctrl+E'
+import { useShortcutLabel } from '@/hooks/useShortcutLabel'
 
 type VoicePaneProps = {
   settings: GlobalSettings
@@ -31,14 +29,31 @@ export function VoicePane({ settings, updateSettings }: VoicePaneProps): React.J
   const voiceSettings = settings.voice ?? getDefaultVoiceSettings()
   const modelStates = useAppStore((s) => s.modelStates)
   const refreshModelStates = useAppStore((s) => s.refreshModelStates)
+  const shortcutLabel = useShortcutLabel('voice.dictation')
   const [catalog, setCatalog] = useState<SpeechModelManifest[]>([])
+  const [permissionPending, setPermissionPending] = useState(false)
+  const mountedRef = useRef(true)
+
+  const handlePaneRef = useCallback((node: HTMLDivElement | null): void => {
+    // Why: the microphone permission prompt can resolve after Settings closes;
+    // the pane ref gives that completion a stale-write guard without an Effect.
+    mountedRef.current = node !== null
+  }, [])
 
   useEffect(() => {
+    let cancelled = false
     refreshModelStates()
-    window.api.speech
+    void window.api.speech
       .getCatalog()
-      .then(setCatalog)
+      .then((nextCatalog) => {
+        if (!cancelled) {
+          setCatalog(nextCatalog)
+        }
+      })
       .catch(() => {})
+    return () => {
+      cancelled = true
+    }
   }, [refreshModelStates])
 
   useEffect(() => {
@@ -57,6 +72,39 @@ export function VoicePane({ settings, updateSettings }: VoicePaneProps): React.J
     })
   }
 
+  const toggleVoiceDictation = async (): Promise<void> => {
+    if (voiceSettings.enabled) {
+      updateVoiceSettings({ enabled: false })
+      return
+    }
+
+    setPermissionPending(true)
+    try {
+      // Why: enabling dictation is the point where users expect the macOS
+      // microphone prompt, not after their first attempted recording fails.
+      const result = await window.api.developerPermissions.request({ id: 'microphone' })
+      if (result.status === 'granted' || result.status === 'unsupported') {
+        updateVoiceSettings({ enabled: true })
+      }
+
+      if (result.status === 'granted') {
+        toast.success('Microphone permission granted')
+      } else if (result.openedSystemSettings) {
+        toast.message(
+          'Opened macOS Privacy & Security. Enable dictation again after granting access.'
+        )
+      } else if (result.status !== 'unsupported') {
+        toast.message('Microphone permission is required before enabling voice dictation.')
+      }
+    } catch {
+      toast.error('Could not request microphone permission. Voice dictation was not enabled.')
+    } finally {
+      if (mountedRef.current) {
+        setPermissionPending(false)
+      }
+    }
+  }
+
   const getModelState = (id: string): SpeechModelState | undefined =>
     modelStates.find((s) => s.id === id)
 
@@ -67,22 +115,24 @@ export function VoicePane({ settings, updateSettings }: VoicePaneProps): React.J
   const selectedIsReady = selectedModelState?.status === 'ready'
 
   return (
-    <div className="space-y-1">
-      <div className="flex items-center justify-between gap-4 px-1 py-2">
+    <div ref={handlePaneRef} className="space-y-1">
+      <div className="flex items-center justify-between gap-4 py-2">
         <div className="space-y-0.5">
           <Label>Enable Voice Dictation</Label>
           <p className="text-xs text-muted-foreground">
-            Press {SHORTCUT_LABEL} to dictate text into any focused pane.
+            Press {shortcutLabel} to dictate text into any focused pane.
           </p>
         </div>
         <button
           role="switch"
           aria-checked={voiceSettings.enabled}
           aria-label="Enable Voice Dictation"
-          onClick={() => updateVoiceSettings({ enabled: !voiceSettings.enabled })}
+          aria-busy={permissionPending}
+          disabled={permissionPending}
+          onClick={() => void toggleVoiceDictation()}
           className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full border border-transparent transition-colors ${
             voiceSettings.enabled ? 'bg-foreground' : 'bg-muted-foreground/30'
-          }`}
+          } ${permissionPending ? 'cursor-wait opacity-70' : ''}`}
         >
           <span
             className={`pointer-events-none block size-3.5 rounded-full bg-background shadow-sm transition-transform ${
@@ -94,12 +144,12 @@ export function VoicePane({ settings, updateSettings }: VoicePaneProps): React.J
 
       <Separator />
 
-      <div className="flex items-center justify-between gap-4 px-1 py-2">
+      <div className="flex items-center justify-between gap-4 py-2">
         <div className="space-y-0.5">
           <Label>Dictation Mode</Label>
           <p className="text-xs text-muted-foreground">
-            Toggle: press {SHORTCUT_LABEL} once to start, again to stop. Hold: dictate while{' '}
-            {SHORTCUT_LABEL} is held.
+            Toggle: press {shortcutLabel} once to start, again to stop. Hold: dictate while{' '}
+            {shortcutLabel} is held.
           </p>
         </div>
         <div className="flex shrink-0 items-center rounded-md border border-border/60 bg-background/50 p-0.5">
@@ -122,7 +172,7 @@ export function VoicePane({ settings, updateSettings }: VoicePaneProps): React.J
 
       <Separator />
 
-      <div className="flex items-center justify-between gap-4 px-1 py-2">
+      <div className="flex items-center justify-between gap-4 py-2">
         <div className="space-y-0.5">
           <Label>Speech Model</Label>
           <p className="text-xs text-muted-foreground">

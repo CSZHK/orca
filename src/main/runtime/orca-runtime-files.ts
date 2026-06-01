@@ -15,7 +15,6 @@ import {
   writeFile
 } from 'fs/promises'
 import { basename, dirname, extname, join } from 'path'
-import { auditedRm } from '../fs-safety/audited-rm'
 import type {
   DirEntry,
   FsChangeEvent,
@@ -50,13 +49,21 @@ import {
   SEARCH_TIMEOUT_MS
 } from '../../shared/text-search'
 import type { Store } from '../persistence'
-import { getSshFilesystemProvider } from '../providers/ssh-filesystem-dispatch'
+import {
+  getSshFilesystemProvider,
+  SSH_FILESYSTEM_PROVIDER_UNAVAILABLE_MESSAGE
+} from '../providers/ssh-filesystem-dispatch'
+import { assertNoClobberRenameDestinationAvailable } from '../../shared/filesystem-rename-collision'
 import { joinWorktreeRelativePath, normalizeRuntimeRelativePath } from './runtime-relative-paths'
 
 const MOBILE_FILE_LIST_LIMIT = 5000
 const MOBILE_FILE_READ_MAX_BYTES = 512 * 1024
 const RUNTIME_PREVIEWABLE_BINARY_MAX_BYTES = 10 * 1024 * 1024
 const WINDOWS_RUNTIME_FILE_WATCH_DEBOUNCE_MS = 150
+const RUNTIME_FILE_WATCH_EVENT_STAT_LIMIT = 200
+// Why: runtime files.watch subscriptions are cleaned up through synchronous RPC
+// callbacks. Track native Parcel unsubscribe work so app shutdown can drain it.
+const pendingRuntimeFileWatcherUnsubscribes = new Set<Promise<void>>()
 const MOBILE_BINARY_EXTENSIONS = new Set([
   '.avif',
   '.bmp',
@@ -85,6 +92,25 @@ const RUNTIME_PREVIEWABLE_BINARY_MIME_TYPES: Record<string, string> = {
   '.pdf': 'application/pdf'
 }
 
+function trackRuntimeFileWatcherUnsubscribe(
+  rootPath: string,
+  unsubscribe: () => Promise<void>
+): void {
+  const promise = Promise.resolve()
+    .then(unsubscribe)
+    .catch((err: unknown) => {
+      console.error('[runtime-files.watch] unsubscribe error', { rootPath, err })
+    })
+    .finally(() => {
+      pendingRuntimeFileWatcherUnsubscribes.delete(promise)
+    })
+  pendingRuntimeFileWatcherUnsubscribes.add(promise)
+}
+
+export async function awaitRuntimeFileWatcherUnsubscribes(): Promise<void> {
+  await Promise.allSettled(Array.from(pendingRuntimeFileWatcherUnsubscribes))
+}
+
 export type ResolvedRuntimeFileWorktree = Worktree & { git: GitWorktreeInfo }
 
 export type RuntimeFileCommandHost = {
@@ -95,6 +121,7 @@ export type RuntimeFileCommandHost = {
     selector: string
   ): Promise<{ worktree: ResolvedRuntimeFileWorktree; connectionId?: string }>
   openFile(worktreeId: string, filePath: string, relativePath: string): void
+  openDiff(worktreeId: string, filePath: string, relativePath: string, staged: boolean): void
 }
 
 export class RuntimeFileCommands {
@@ -150,6 +177,25 @@ export class RuntimeFileCommands {
     return { worktree: worktree.id, relativePath, kind, opened: true }
   }
 
+  async openMobileDiff(
+    worktreeSelector: string,
+    relativePath: string,
+    staged: boolean
+  ): Promise<RuntimeFileOpenResult> {
+    const worktree = await this.host.resolveWorktreeSelector(worktreeSelector)
+    if (!isSafeMobileRelativePath(relativePath)) {
+      throw new Error('invalid_relative_path')
+    }
+    const kind = isMobileBinaryPath(relativePath)
+      ? 'binary'
+      : isMobileMarkdownPath(relativePath)
+        ? 'markdown'
+        : 'text'
+    const filePath = joinWorktreeRelativePath(worktree.path, relativePath)
+    this.host.openDiff(worktree.id, filePath, relativePath, staged)
+    return { worktree: worktree.id, relativePath, kind, opened: true }
+  }
+
   async readMobileFile(
     worktreeSelector: string,
     relativePath: string
@@ -184,7 +230,7 @@ export class RuntimeFileCommands {
     const provider = target.connectionId ? getSshFilesystemProvider(target.connectionId) : null
     if (target.connectionId) {
       if (!provider) {
-        throw new Error('remote_filesystem_unavailable')
+        throw new Error(SSH_FILESYSTEM_PROVIDER_UNAVAILABLE_MESSAGE)
       }
       return provider.readDir(target.path)
     }
@@ -196,7 +242,7 @@ export class RuntimeFileCommands {
         const entryPath = join(dirPath, entry.name)
         return {
           name: entry.name,
-          isDirectory: await isRuntimeDirectoryEntry(entryPath),
+          isDirectory: await isRuntimeDirectoryEntry(entry, entryPath),
           isSymlink: entry.isSymbolicLink()
         }
       })
@@ -217,7 +263,7 @@ export class RuntimeFileCommands {
     const provider = target.connectionId ? getSshFilesystemProvider(target.connectionId) : null
     if (target.connectionId) {
       if (!provider) {
-        throw new Error('remote_filesystem_unavailable')
+        throw new Error(SSH_FILESYSTEM_PROVIDER_UNAVAILABLE_MESSAGE)
       }
       return provider.watch(target.path, callback)
     }
@@ -236,6 +282,12 @@ export class RuntimeFileCommands {
       (err, events) => {
         if (err) {
           console.error('[runtime-files.watch] watcher error', { rootPath, err })
+          callback([{ kind: 'overflow', absolutePath: rootPath }])
+          return
+        }
+        // Why: large watcher batches usually mean a generated directory or
+        // branch switch. Avoid stat fanout and ask the renderer to refresh.
+        if (events.length > RUNTIME_FILE_WATCH_EVENT_STAT_LIMIT) {
           callback([{ kind: 'overflow', absolutePath: rootPath }])
           return
         }
@@ -270,9 +322,7 @@ export class RuntimeFileCommands {
       }
     )
     return () => {
-      void subscription.unsubscribe().catch((err: unknown) => {
-        console.error('[runtime-files.watch] unsubscribe error', { rootPath, err })
-      })
+      trackRuntimeFileWatcherUnsubscribe(rootPath, () => subscription.unsubscribe())
     }
   }
 
@@ -284,7 +334,7 @@ export class RuntimeFileCommands {
     const provider = target.connectionId ? getSshFilesystemProvider(target.connectionId) : null
     if (target.connectionId) {
       if (!provider) {
-        throw new Error('remote_filesystem_unavailable')
+        throw new Error(SSH_FILESYSTEM_PROVIDER_UNAVAILABLE_MESSAGE)
       }
       const fileStats = await provider.stat(target.path)
       if (fileStats.size > RUNTIME_PREVIEWABLE_BINARY_MAX_BYTES) {
@@ -329,7 +379,7 @@ export class RuntimeFileCommands {
     const provider = target.connectionId ? getSshFilesystemProvider(target.connectionId) : null
     if (target.connectionId) {
       if (!provider) {
-        throw new Error('remote_filesystem_unavailable')
+        throw new Error(SSH_FILESYSTEM_PROVIDER_UNAVAILABLE_MESSAGE)
       }
       await provider.writeFile(target.path, content)
       return { ok: true }
@@ -360,7 +410,7 @@ export class RuntimeFileCommands {
     const content = Buffer.from(contentBase64, 'base64')
     if (target.connectionId) {
       if (!provider) {
-        throw new Error('remote_filesystem_unavailable')
+        throw new Error(SSH_FILESYSTEM_PROVIDER_UNAVAILABLE_MESSAGE)
       }
       await provider.writeFileBase64(target.path, contentBase64)
       return { ok: true }
@@ -383,7 +433,7 @@ export class RuntimeFileCommands {
     const content = Buffer.from(contentBase64, 'base64')
     if (target.connectionId) {
       if (!provider) {
-        throw new Error('remote_filesystem_unavailable')
+        throw new Error(SSH_FILESYSTEM_PROVIDER_UNAVAILABLE_MESSAGE)
       }
       await provider.writeFileBase64Chunk(target.path, contentBase64, append)
       return { ok: true }
@@ -403,7 +453,7 @@ export class RuntimeFileCommands {
     const provider = target.connectionId ? getSshFilesystemProvider(target.connectionId) : null
     if (target.connectionId) {
       if (!provider) {
-        throw new Error('remote_filesystem_unavailable')
+        throw new Error(SSH_FILESYSTEM_PROVIDER_UNAVAILABLE_MESSAGE)
       }
       await provider.createFile(target.path)
       return { ok: true }
@@ -427,7 +477,7 @@ export class RuntimeFileCommands {
     const provider = target.connectionId ? getSshFilesystemProvider(target.connectionId) : null
     if (target.connectionId) {
       if (!provider) {
-        throw new Error('remote_filesystem_unavailable')
+        throw new Error(SSH_FILESYSTEM_PROVIDER_UNAVAILABLE_MESSAGE)
       }
       await provider.createDir(target.path)
       return { ok: true }
@@ -447,7 +497,7 @@ export class RuntimeFileCommands {
     const provider = target.connectionId ? getSshFilesystemProvider(target.connectionId) : null
     if (target.connectionId) {
       if (!provider) {
-        throw new Error('remote_filesystem_unavailable')
+        throw new Error(SSH_FILESYSTEM_PROVIDER_UNAVAILABLE_MESSAGE)
       }
       await provider.createDirNoClobber(target.path)
       return { ok: true }
@@ -470,7 +520,7 @@ export class RuntimeFileCommands {
       : null
     if (tempTarget.connectionId) {
       if (!provider) {
-        throw new Error('remote_filesystem_unavailable')
+        throw new Error(SSH_FILESYSTEM_PROVIDER_UNAVAILABLE_MESSAGE)
       }
       await provider.copy(tempTarget.path, finalTarget.path)
       await provider.deletePath(tempTarget.path, false).catch(() => {})
@@ -498,16 +548,16 @@ export class RuntimeFileCommands {
       : null
     if (oldTarget.connectionId) {
       if (!provider) {
-        throw new Error('remote_filesystem_unavailable')
+        throw new Error(SSH_FILESYSTEM_PROVIDER_UNAVAILABLE_MESSAGE)
       }
-      await provider.rename(oldTarget.path, newTarget.path)
+      await provider.renameNoClobber(oldTarget.path, newTarget.path)
       return { ok: true }
     }
 
     const store = this.host.requireStore()
     const oldPath = await resolveAuthorizedPath(oldTarget.path, store, { preserveSymlink: true })
     const newPath = await resolveAuthorizedPath(newTarget.path, store, { preserveSymlink: true })
-    await assertRuntimePathDoesNotExist(newPath)
+    await assertNoClobberRenameDestinationAvailable(oldPath, newPath)
     await rename(oldPath, newPath)
     return { ok: true }
   }
@@ -527,7 +577,7 @@ export class RuntimeFileCommands {
       : null
     if (sourceTarget.connectionId) {
       if (!provider) {
-        throw new Error('remote_filesystem_unavailable')
+        throw new Error(SSH_FILESYSTEM_PROVIDER_UNAVAILABLE_MESSAGE)
       }
       await provider.copy(sourceTarget.path, destinationTarget.path)
       return { ok: true }
@@ -556,7 +606,7 @@ export class RuntimeFileCommands {
     const provider = target.connectionId ? getSshFilesystemProvider(target.connectionId) : null
     if (target.connectionId) {
       if (!provider) {
-        throw new Error('remote_filesystem_unavailable')
+        throw new Error(SSH_FILESYSTEM_PROVIDER_UNAVAILABLE_MESSAGE)
       }
       await provider.deletePath(target.path, recursive)
       return { ok: true }
@@ -567,9 +617,7 @@ export class RuntimeFileCommands {
     })
     // Why: a non-local runtime has no client OS Trash/Recycling Bin; server-side
     // file mutations are permanent and the renderer confirms before calling this.
-    await (recursive === true
-      ? auditedRm(targetPath, 'runtime file delete: user-initiated recursive rm')
-      : rm(targetPath, { force: true }))
+    await rm(targetPath, { recursive: recursive === true, force: true })
     return { ok: true }
   }
 
@@ -583,7 +631,7 @@ export class RuntimeFileCommands {
     const searchOptions = { ...options, rootPath }
     if (target.connectionId) {
       if (!provider) {
-        throw new Error('remote_filesystem_unavailable')
+        throw new Error(SSH_FILESYSTEM_PROVIDER_UNAVAILABLE_MESSAGE)
       }
       return provider.search(searchOptions)
     }
@@ -610,7 +658,7 @@ export class RuntimeFileCommands {
     const provider = target.connectionId ? getSshFilesystemProvider(target.connectionId) : null
     if (target.connectionId) {
       if (!provider) {
-        throw new Error('remote_filesystem_unavailable')
+        throw new Error(SSH_FILESYSTEM_PROVIDER_UNAVAILABLE_MESSAGE)
       }
       const relativePaths = await provider.listFiles(target.worktree.path)
       return markdownDocumentsFromRelativePaths(target.worktree.path, relativePaths)
@@ -626,7 +674,7 @@ export class RuntimeFileCommands {
     const provider = target.connectionId ? getSshFilesystemProvider(target.connectionId) : null
     if (target.connectionId) {
       if (!provider) {
-        throw new Error('remote_filesystem_unavailable')
+        throw new Error(SSH_FILESYSTEM_PROVIDER_UNAVAILABLE_MESSAGE)
       }
       const fileStat = await provider.stat(target.path)
       return {
@@ -676,8 +724,20 @@ export class RuntimeFileCommands {
         if (this.activeRuntimeTextSearches.get(searchKey) === child) {
           this.activeRuntimeTextSearches.delete(searchKey)
         }
-        clearTimeout(killTimeout)
+        cleanupListeners()
         resolvePromise(finalize(acc))
+      }
+
+      let killTimeout: ReturnType<typeof setTimeout> | null = null
+      const cleanupListeners = (): void => {
+        if (killTimeout) {
+          clearTimeout(killTimeout)
+          killTimeout = null
+        }
+        child?.stdout?.off('data', onStdoutData)
+        child?.stderr?.off('data', onStderrData)
+        child?.off('error', onError)
+        child?.off('close', onClose)
       }
 
       const processLine = (line: string): void => {
@@ -701,28 +761,34 @@ export class RuntimeFileCommands {
       this.activeRuntimeTextSearches.set(searchKey, nextChild)
 
       nextChild.stdout!.setEncoding('utf-8')
-      nextChild.stdout!.on('data', (chunk: string) => {
+      const onStdoutData = (chunk: string): void => {
         stdoutBuffer += chunk
         const lines = stdoutBuffer.split('\n')
         stdoutBuffer = lines.pop() ?? ''
         for (const line of lines) {
           processLine(line)
         }
-      })
-      nextChild.stderr!.on('data', () => {
+      }
+      const onStderrData = (): void => {
         // Drain stderr so rg cannot block on a full pipe.
-      })
-      nextChild.once('error', () => resolveOnce())
-      nextChild.once('close', () => {
+      }
+      const onError = (): void => resolveOnce()
+      const onClose = (): void => {
         if (stdoutBuffer) {
           processLine(stdoutBuffer)
         }
         resolveOnce()
-      })
+      }
 
-      const killTimeout = setTimeout(() => {
+      nextChild.stdout!.on('data', onStdoutData)
+      nextChild.stderr!.on('data', onStderrData)
+      nextChild.once('error', onError)
+      nextChild.once('close', onClose)
+
+      killTimeout = setTimeout(() => {
         acc.truncated = true
         child?.kill()
+        resolveOnce()
       }, SEARCH_TIMEOUT_MS)
     })
   }
@@ -753,7 +819,7 @@ export class RuntimeFileCommands {
   private async readRemoteMobileFile(filePath: string, connectionId: string): Promise<string> {
     const provider = getSshFilesystemProvider(connectionId)
     if (!provider) {
-      throw new Error('remote_filesystem_unavailable')
+      throw new Error(SSH_FILESYSTEM_PROVIDER_UNAVAILABLE_MESSAGE)
     }
     const fileStat = await provider.stat(filePath)
     // Why: the SSH filesystem API does not expose ranged reads here, so reject
@@ -843,12 +909,20 @@ function basenameFromRelativePath(relativePath: string): string {
   return normalized.slice(normalized.lastIndexOf('/') + 1)
 }
 
-async function isRuntimeDirectoryEntry(entryPath: string): Promise<boolean> {
-  try {
-    return (await stat(entryPath)).isDirectory()
-  } catch {
+async function isRuntimeDirectoryEntry(
+  entry: { isDirectory(): boolean; isSymbolicLink(): boolean },
+  _entryPath: string
+): Promise<boolean> {
+  // Why: runtime-backed file explorer listings are still passive UI reads.
+  // Do not stat symlink targets here; explicit open/expand can resolve them.
+  if (entry.isSymbolicLink()) {
+    void _entryPath
     return false
   }
+  if (entry.isDirectory()) {
+    return true
+  }
+  return false
 }
 
 function isBinaryBuffer(buffer: Buffer): boolean {

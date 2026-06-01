@@ -1,5 +1,5 @@
 import { ipcMain } from 'electron'
-import { resolve } from 'path'
+import { posix, resolve } from 'path'
 import type {
   CreateHostedReviewArgs,
   HostedReviewCreationEligibilityArgs,
@@ -13,6 +13,8 @@ import {
   getHostedReviewCreationEligibility
 } from '../source-control/hosted-review-creation'
 import { getHostedReviewForBranch } from '../source-control/hosted-review'
+import { resolveRegisteredWorktreePath } from './filesystem-auth'
+import { listRepoWorktrees } from '../repo-worktrees'
 
 function assertRegisteredRepo(repoPath: string, store: Store, repoId?: string): Repo {
   if (repoId) {
@@ -30,6 +32,44 @@ function assertRegisteredRepo(repoPath: string, store: Store, repoId?: string): 
   return repo
 }
 
+async function resolveHostedReviewWorktreePath(
+  repo: Repo,
+  store: Store,
+  worktreePath?: string
+): Promise<string> {
+  if (!worktreePath) {
+    return repo.path
+  }
+  if (repo.connectionId) {
+    const remoteWorktreePath = normalizeRemoteHostedReviewPath(worktreePath)
+    const repoWorktrees = await listRepoWorktrees(repo)
+    if (
+      !repoWorktrees.some(
+        (worktree) => normalizeRemoteHostedReviewPath(worktree.path) === remoteWorktreePath
+      )
+    ) {
+      throw new Error('Access denied: worktree does not belong to repository')
+    }
+    return remoteWorktreePath
+  }
+  const resolvedWorktreePath = await resolveRegisteredWorktreePath(worktreePath, store)
+  const repoWorktrees = await listRepoWorktrees(repo)
+  if (!repoWorktrees.some((worktree) => resolve(worktree.path) === resolvedWorktreePath)) {
+    throw new Error('Access denied: worktree does not belong to repository')
+  }
+  return resolvedWorktreePath
+}
+
+function normalizeRemoteHostedReviewPath(remotePath: string): string {
+  if (!remotePath || remotePath.includes('\0')) {
+    throw new Error('Access denied: invalid worktree path')
+  }
+  // Why: SSH worktree paths belong to the remote POSIX host. Local path.resolve
+  // rewrites them on Windows and cannot authorize remote-only paths.
+  const normalized = posix.normalize(remotePath)
+  return normalized.length > 1 ? normalized.replace(/\/+$/, '') : normalized
+}
+
 export function registerHostedReviewHandlers(store: Store, stats: StatsCollector): void {
   ipcMain.handle('hostedReview:forBranch', async (_event, args: HostedReviewForBranchArgs) => {
     const repo = assertRegisteredRepo(args.repoPath, store, args.repoId)
@@ -38,6 +78,7 @@ export function registerHostedReviewHandlers(store: Store, stats: StatsCollector
       connectionId: repo.connectionId,
       branch: args.branch,
       linkedGitHubPR: args.linkedGitHubPR ?? null,
+      fallbackGitHubPR: args.linkedGitHubPR == null ? (args.fallbackGitHubPR ?? null) : null,
       linkedGitLabMR: args.linkedGitLabMR ?? null,
       linkedBitbucketPR: args.linkedBitbucketPR ?? null,
       linkedAzureDevOpsPR: args.linkedAzureDevOpsPR ?? null,
@@ -58,40 +99,31 @@ export function registerHostedReviewHandlers(store: Store, stats: StatsCollector
     'hostedReview:getCreationEligibility',
     async (_event, args: HostedReviewCreationEligibilityArgs) => {
       const repo = assertRegisteredRepo(args.repoPath, store)
-      if (repo.connectionId) {
-        return {
-          provider: 'unsupported' as const,
-          review: null,
-          canCreate: false,
-          blockedReason: 'unsupported_provider' as const,
-          nextAction: null,
-          defaultBaseRef: args.base ?? null,
-          head: args.branch,
-          title: null,
-          body: null
-        }
-      }
-      return getHostedReviewCreationEligibility({ ...args, repoPath: repo.path })
+      const worktreePath = await resolveHostedReviewWorktreePath(repo, store, args.worktreePath)
+      return getHostedReviewCreationEligibility({
+        ...args,
+        repoPath: worktreePath,
+        connectionId: repo.connectionId ?? null
+      })
     }
   )
 
   ipcMain.handle('hostedReview:create', async (_event, args: CreateHostedReviewArgs) => {
     const repo = assertRegisteredRepo(args.repoPath, store)
-    if (repo.connectionId) {
-      return {
-        ok: false as const,
-        code: 'unsupported_provider' as const,
-        error: 'Creating pull requests from SSH worktrees is not supported yet.'
-      }
-    }
-    const result = await createHostedReview(repo.path, {
-      provider: args.provider,
-      base: args.base,
-      head: args.head,
-      title: args.title,
-      body: args.body,
-      draft: args.draft
-    })
+    const worktreePath = await resolveHostedReviewWorktreePath(repo, store, args.worktreePath)
+    const result = await createHostedReview(
+      worktreePath,
+      {
+        provider: args.provider,
+        base: args.base,
+        head: args.head,
+        title: args.title,
+        body: args.body,
+        draft: args.draft,
+        useTemplate: args.useTemplate
+      },
+      repo.connectionId ?? null
+    )
     if (result.ok && !stats.hasCountedPR(result.url)) {
       stats.record({
         type: 'pr_created',

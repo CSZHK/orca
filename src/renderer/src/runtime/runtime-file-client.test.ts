@@ -41,6 +41,7 @@ const runtimeEnvironmentSubscribe = vi.fn()
 const runtimeCall = vi.fn()
 
 beforeEach(() => {
+  delete (globalThis as { __ORCA_WEB_CLIENT__?: boolean }).__ORCA_WEB_CLIENT__
   clearRuntimeCompatibilityCacheForTests()
   fsReadFile.mockReset()
   fsOnChanged.mockReset()
@@ -887,6 +888,88 @@ describe('runtime file client', () => {
     })
   })
 
+  it('removes a created runtime directory import root when a nested file upload fails', async () => {
+    fsStageExternalPathsForRuntimeUpload.mockResolvedValue({
+      sources: [
+        {
+          sourcePath: '/Users/me/assets',
+          status: 'staged',
+          name: 'assets',
+          kind: 'directory',
+          entries: [
+            { relativePath: '', kind: 'directory' },
+            { relativePath: 'logo.png', kind: 'file', contentBase64: 'cG5n' }
+          ]
+        }
+      ]
+    })
+    runtimeEnvironmentCall
+      .mockResolvedValueOnce({
+        id: 'stat-destination',
+        ok: true,
+        result: { size: 0, isDirectory: true, mtime: 1 },
+        _meta: { runtimeId: 'remote-runtime' }
+      })
+      .mockResolvedValueOnce({
+        id: 'stat-import-root-miss',
+        ok: false,
+        error: { code: 'not_found', message: 'not found' },
+        _meta: { runtimeId: 'remote-runtime' }
+      })
+      .mockResolvedValueOnce({
+        id: 'create-import-root',
+        ok: true,
+        result: { ok: true },
+        _meta: { runtimeId: 'remote-runtime' }
+      })
+      .mockResolvedValueOnce({
+        id: 'write-file',
+        ok: false,
+        error: { code: 'write_failed', message: 'disk full' },
+        _meta: { runtimeId: 'remote-runtime' }
+      })
+      .mockResolvedValueOnce({
+        id: 'delete-temp',
+        ok: true,
+        result: { ok: true },
+        _meta: { runtimeId: 'remote-runtime' }
+      })
+      .mockResolvedValueOnce({
+        id: 'delete-import-root',
+        ok: true,
+        result: { ok: true },
+        _meta: { runtimeId: 'remote-runtime' }
+      })
+
+    await expect(
+      importExternalPathsToRuntime(
+        {
+          settings: { activeRuntimeEnvironmentId: 'env-1' },
+          worktreeId: 'wt-1',
+          worktreePath: '/remote/repo'
+        },
+        ['/Users/me/assets'],
+        '/remote/repo/uploads'
+      )
+    ).resolves.toMatchObject({
+      results: [{ status: 'failed', reason: 'disk full' }]
+    })
+
+    const writeCall = runtimeEnvironmentCall.mock.calls[3]?.[0] as
+      | { params: { relativePath: string } }
+      | undefined
+    if (!writeCall) {
+      throw new Error('missing failed file write call')
+    }
+    expect(writeCall.params.relativePath).toMatch(/^uploads\/assets\/\.logo\.png\.orca-upload-/)
+    expect(runtimeEnvironmentCall).toHaveBeenLastCalledWith({
+      selector: 'env-1',
+      method: 'files.delete',
+      params: { worktree: 'wt-1', relativePath: 'uploads/assets', recursive: true },
+      timeoutMs: 15_000
+    })
+  })
+
   it('keeps local external imports on filesystem IPC when no runtime is active', async () => {
     fsImportExternalPaths.mockResolvedValue({
       results: [
@@ -1181,6 +1264,78 @@ describe('runtime file client', () => {
         params: { subscriptionId: 'files-watch-1' },
         timeoutMs: 5_000
       })
+    )
+  })
+
+  it('delegates stopped pre-ready web shared file watch cleanup to the subscription handle', async () => {
+    ;(globalThis as { __ORCA_WEB_CLIENT__?: boolean }).__ORCA_WEB_CLIENT__ = true
+    const onPayload = vi.fn()
+    const unsubscribe = vi.fn()
+    let onResponse: ((response: unknown) => void) | undefined
+    runtimeEnvironmentSubscribe.mockImplementation((_args, callbacks) => {
+      onResponse = callbacks.onResponse
+      return Promise.resolve({ unsubscribe, sendBinary: vi.fn() })
+    })
+
+    const stop = await subscribeRuntimeFileChanges(
+      {
+        settings: { activeRuntimeEnvironmentId: 'env-1' },
+        worktreeId: 'wt-1',
+        worktreePath: '/remote/repo'
+      },
+      onPayload
+    )
+
+    stop()
+    expect(unsubscribe).toHaveBeenCalledTimes(1)
+    expect(runtimeEnvironmentCall).not.toHaveBeenCalledWith(
+      expect.objectContaining({ method: 'files.unwatch' })
+    )
+
+    onResponse?.({
+      id: 'ready',
+      ok: true,
+      result: { type: 'ready', subscriptionId: 'files-watch-late' },
+      _meta: { runtimeId: 'remote-runtime' }
+    })
+
+    expect(unsubscribe).toHaveBeenCalledTimes(1)
+    expect(runtimeEnvironmentCall).not.toHaveBeenCalledWith(
+      expect.objectContaining({ method: 'files.unwatch' })
+    )
+  })
+
+  it('delegates stopped ready web shared file watch cleanup to the subscription handle', async () => {
+    ;(globalThis as { __ORCA_WEB_CLIENT__?: boolean }).__ORCA_WEB_CLIENT__ = true
+    const onPayload = vi.fn()
+    const unsubscribe = vi.fn()
+    let onResponse: ((response: unknown) => void) | undefined
+    runtimeEnvironmentSubscribe.mockImplementation((_args, callbacks) => {
+      onResponse = callbacks.onResponse
+      return Promise.resolve({ unsubscribe, sendBinary: vi.fn() })
+    })
+
+    const stop = await subscribeRuntimeFileChanges(
+      {
+        settings: { activeRuntimeEnvironmentId: 'env-1' },
+        worktreeId: 'wt-1',
+        worktreePath: '/remote/repo'
+      },
+      onPayload
+    )
+
+    onResponse?.({
+      id: 'ready',
+      ok: true,
+      result: { type: 'ready', subscriptionId: 'files-watch-ready' },
+      _meta: { runtimeId: 'remote-runtime' }
+    })
+
+    stop()
+
+    expect(unsubscribe).toHaveBeenCalledTimes(1)
+    expect(runtimeEnvironmentCall).not.toHaveBeenCalledWith(
+      expect.objectContaining({ method: 'files.unwatch' })
     )
   })
 })

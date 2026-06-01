@@ -1,43 +1,59 @@
-import { lstat, readFile, readdir, realpath } from 'fs/promises'
+import { lstat, readFile } from 'fs/promises'
 import { homedir } from 'os'
 import { posix, win32 } from 'path'
-import type { GitWorktreeInfo } from '../shared/types'
+import { isWindowsAbsolutePathLike } from '../shared/cross-platform-path'
+import type { GitWorktreeInfo, OrcaWorkspaceLayout, Repo, WorktreeMeta } from '../shared/types'
+import { matchesStrongOrcaCreatePath } from '../shared/worktree-ownership'
 import { areWorktreePathsEqual } from './ipc/worktree-logic'
+import {
+  gitFileProvesOrphanedWorktreeDirectory,
+  type ReadPath,
+  type StatPath
+} from './worktree-orphan-gitdir-proof'
 
 type PathOps = typeof posix
 
-function looksLikeWindowsPath(pathValue: string): boolean {
-  return /^[A-Za-z]:[\\/]/.test(pathValue) || pathValue.startsWith('\\\\')
-}
+const ORCA_CREATION_SOURCES = new Set<NonNullable<WorktreeMeta['orcaCreationSource']>>([
+  'desktop',
+  'runtime',
+  'cli',
+  'ssh'
+])
+const ORCA_OWNED_PROVENANCE_META_KEYS = [
+  'orcaCreatedAt',
+  'orcaCreationSource',
+  'orcaCreationWorkspaceLayout'
+] as const
+type UnregisteredOrcaCleanupMeta = Pick<
+  WorktreeMeta,
+  | 'orcaCreatedAt'
+  | 'orcaCreationSource'
+  | 'createdAt'
+  | 'createdWithAgent'
+  | 'pushTarget'
+  | 'sparseBaseRef'
+  | 'sparsePresetId'
+  | 'preserveBranchOnDelete'
+>
 
-export function getPathOps(...paths: string[]): PathOps {
-  return paths.some(looksLikeWindowsPath) ? win32 : posix
+export const ORPHANED_WORKTREE_DIRECTORY_MESSAGE =
+  'Worktree is no longer registered with Git but its directory remains.'
+
+function getPathOps(...paths: string[]): PathOps {
+  // Why: forward-slash UNC roots need win32 ops; POSIX joins collapse `//Server` to `/Server`.
+  return paths.some(isWindowsAbsolutePathLike) ? win32 : posix
 }
 
 function containsPath(parentPath: string, childPath: string, pathOps: PathOps): boolean {
   const relativePath = pathOps.relative(parentPath, childPath)
+  // Why: `..name` is a valid child name; only `..` and `../...` escape.
   return (
     relativePath === '' ||
-    (!!relativePath && !relativePath.startsWith('..') && !pathOps.isAbsolute(relativePath))
+    (!!relativePath &&
+      relativePath !== '..' &&
+      !relativePath.startsWith(`..${pathOps.sep}`) &&
+      !pathOps.isAbsolute(relativePath))
   )
-}
-
-function getDepthFromRoot(resolvedPath: string, pathOps: PathOps): number {
-  const rootPath = pathOps.parse(resolvedPath).root
-  const relativePath = pathOps.relative(rootPath, resolvedPath)
-  if (!relativePath) {
-    return 0
-  }
-  return relativePath.split(pathOps.sep).filter(Boolean).length
-}
-
-function areSameDrive(pathA: string, pathB: string): boolean {
-  const driveA = /^([A-Za-z]):/.exec(pathA)
-  const driveB = /^([A-Za-z]):/.exec(pathB)
-  if (driveA && driveB) {
-    return driveA[1].toLowerCase() === driveB[1].toLowerCase()
-  }
-  return !driveA && !driveB
 }
 
 export function isDangerousWorktreeRemovalPath(worktreePath: string, repoPath: string): boolean {
@@ -56,20 +72,6 @@ export function isDangerousWorktreeRemovalPath(worktreePath: string, repoPath: s
     return true
   }
 
-  // Refuse to delete paths too close to the filesystem root.
-  // Worktrees at depth 1 (e.g. D:\orca) or 2 (e.g. D:\apps\orca) are almost
-  // certainly not disposable worktree directories.
-  const MIN_SAFE_DEPTH = 3
-  if (getDepthFromRoot(resolvedWorktreePath, pathOps) < MIN_SAFE_DEPTH) {
-    return true
-  }
-
-  // Worktrees on a different drive from the repo are suspect — normal
-  // `git worktree add` keeps worktrees on the same volume.
-  if (looksLikeWindowsPath(worktreePath) && !areSameDrive(worktreePath, repoPath)) {
-    return true
-  }
-
   const resolvedRepoPath = pathOps.resolve(repoPath)
   if (containsPath(resolvedWorktreePath, resolvedRepoPath, pathOps)) {
     return true
@@ -84,87 +86,153 @@ export function getRegisteredDeletableWorktree(
   requestedWorktreePath: string,
   worktrees: readonly GitWorktreeInfo[]
 ): GitWorktreeInfo {
-  const worktree = worktrees.find((item) => areWorktreePathsEqual(item.path, requestedWorktreePath))
+  const worktree = findRegisteredDeletableWorktree(repoPath, requestedWorktreePath, worktrees)
   if (!worktree) {
     throw new Error(`Refusing to delete unregistered worktree path: ${requestedWorktreePath}`)
-  }
-  if (worktree.isMainWorktree || isDangerousWorktreeRemovalPath(worktree.path, repoPath)) {
-    throw new Error(`Refusing to delete protected worktree path: ${worktree.path}`)
   }
   return worktree
 }
 
-/**
- * Verify the .git file inside a worktree directory actually points back to
- * the expected repo. A worktree's .git is a plain text file containing
- * `gitdir: <path-to-main-repo>/.git/worktrees/<name>`.
- */
-async function isGitFileLinkedToRepo(
-  worktreePath: string,
+export function findRegisteredDeletableWorktree(
   repoPath: string,
-  pathOps: PathOps
-): Promise<boolean> {
-  try {
-    const gitFilePath = pathOps.join(worktreePath, '.git')
-    const content = await readFile(gitFilePath, 'utf8')
-    const match = /^gitdir:\s*(.+)$/m.exec(content.trim())
-    if (!match) {
+  requestedWorktreePath: string,
+  worktrees: readonly GitWorktreeInfo[]
+): GitWorktreeInfo | null {
+  const worktree = worktrees.find((item) => areWorktreePathsEqual(item.path, requestedWorktreePath))
+  if (!worktree) {
+    return null
+  }
+  if (worktree.isMainWorktree || isDangerousWorktreeRemovalPath(worktree.path, repoPath)) {
+    throw new Error(`Refusing to delete protected worktree path: ${worktree.path}`)
+  }
+  assertWorktreeDoesNotContainRegisteredWorktree(worktree.path, worktrees)
+  return worktree
+}
+
+export function assertWorktreeDoesNotContainRegisteredWorktree(
+  worktreePath: string,
+  worktrees: readonly GitWorktreeInfo[]
+): void {
+  const nestedWorktree = worktrees.find((item) => {
+    if (areWorktreePathsEqual(item.path, worktreePath)) {
       return false
     }
-    const gitdir = match[1].trim()
-    // realpath resolves Windows 8.3 short names (e.g. ADMINI~1 → Administrator)
-    // so paths from git and from Node's tmpdir() compare correctly.
-    const resolvedGitdir = await realpath(pathOps.resolve(worktreePath, gitdir)).catch(
-      () => pathOps.resolve(worktreePath, gitdir)
+    return containsPath(worktreePath, item.path, getPathOps(worktreePath, item.path))
+  })
+  if (nestedWorktree) {
+    // Why: `git worktree remove --force` treats nested worktrees as ordinary
+    // untracked directories and deletes their working files while leaving Git
+    // with a prunable child worktree record.
+    throw new Error(
+      `Refusing to delete worktree because it contains another registered worktree: ${nestedWorktree.path}`
     )
-    const resolvedRepoGitDir = await realpath(pathOps.resolve(repoPath, '.git')).catch(
-      () => pathOps.resolve(repoPath, '.git')
-    )
-    // Verify gitdir is strictly inside <repo>/.git/ (path boundary check
-    // prevents ".git-evil" from matching ".git")
-    const lower = resolvedGitdir.toLowerCase()
-    const lowerRepo = resolvedRepoGitDir.toLowerCase()
-    return lower === lowerRepo || lower.startsWith(`${lowerRepo}${pathOps.sep}`)
-  } catch {
-    return false
   }
 }
 
 export async function canSafelyRemoveOrphanedWorktreeDirectory(
   worktreePath: string,
-  repoPath: string
+  repoPath: string,
+  statPath: StatPath = lstat,
+  readPath: ReadPath = (path) => readFile(path, 'utf8')
 ): Promise<boolean> {
   if (isDangerousWorktreeRemovalPath(worktreePath, repoPath)) {
     return false
   }
 
   const pathOps = getPathOps(worktreePath, repoPath)
+  const gitFilePath = pathOps.join(worktreePath, '.git')
+  return gitFileProvesOrphanedWorktreeDirectory({
+    gitFilePath,
+    worktreePath,
+    repoPath,
+    pathOps,
+    statPath,
+    readPath
+  })
+}
 
+export function canCleanupUnregisteredOrcaWorktreeDirectory(args: {
+  meta: UnregisteredOrcaCleanupMeta | null | undefined
+  worktreePath: string
+  repo: Pick<Repo, 'path'>
+  knownOrcaLayouts: readonly OrcaWorkspaceLayout[]
+}): boolean {
+  if (hasCurrentOrcaCreationProvenance(args.meta)) {
+    return true
+  }
+
+  if (hasLegacyOrcaCreationEvidence(args.meta)) {
+    return true
+  }
+
+  // Why: profiles created before explicit provenance can still contain Orca
+  // workspaces at the repo-specific workspaceDir/<repo>/<name> path shape.
+  return matchesStrongOrcaCreatePath(args.worktreePath, args.knownOrcaLayouts, args.repo)
+}
+
+function hasCurrentOrcaCreationProvenance(
+  meta: Pick<WorktreeMeta, 'orcaCreatedAt' | 'orcaCreationSource'> | null | undefined
+): boolean {
+  return (
+    typeof meta?.orcaCreatedAt === 'number' &&
+    !!meta.orcaCreationSource &&
+    ORCA_CREATION_SOURCES.has(meta.orcaCreationSource)
+  )
+}
+
+function hasLegacyOrcaCreationEvidence(
+  meta: UnregisteredOrcaCleanupMeta | null | undefined
+): boolean {
+  return Boolean(
+    meta?.createdAt ||
+    meta?.createdWithAgent ||
+    meta?.pushTarget ||
+    meta?.sparseBaseRef ||
+    meta?.sparsePresetId ||
+    meta?.preserveBranchOnDelete
+  )
+}
+
+export function stripOrcaProvenanceMetaUpdates(
+  updates: Partial<WorktreeMeta> | null | undefined
+): Partial<WorktreeMeta> {
+  const sanitized = { ...updates }
+  for (const key of ORCA_OWNED_PROVENANCE_META_KEYS) {
+    delete sanitized[key]
+  }
+  return sanitized
+}
+
+function isMissingPathError(error: unknown): boolean {
+  const code =
+    error && typeof error === 'object' && 'code' in error
+      ? String((error as NodeJS.ErrnoException).code)
+      : undefined
+  if (code === 'ENOENT' || code === 'ENOTDIR') {
+    return true
+  }
+
+  let message = ''
+  if (error instanceof Error) {
+    message = error.message
+  } else if (error && typeof error === 'object' && 'message' in error) {
+    message = String((error as { message: unknown }).message)
+  } else if (typeof error === 'string') {
+    message = error
+  }
+  return /\b(ENOENT|ENOTDIR)\b|no such file or directory|cannot find (?:the )?(?:file|path)|(?:file|path) not found/i.test(
+    message
+  )
+}
+
+export async function isWorktreePathMissing(
+  worktreePath: string,
+  statPath: (path: string) => Promise<unknown> = lstat
+): Promise<boolean> {
   try {
-    const gitEntry = await lstat(pathOps.join(worktreePath, '.git'))
-    if (!gitEntry.isFile()) {
-      return false
-    }
-  } catch {
+    await statPath(worktreePath)
     return false
+  } catch (error) {
+    return isMissingPathError(error)
   }
-
-  if (!(await isGitFileLinkedToRepo(worktreePath, repoPath, pathOps))) {
-    return false
-  }
-
-  // Refuse if the directory has too many top-level entries — a real worktree
-  // has roughly the same set of entries as the repo. A directory with dozens
-  // of extra unrelated items is probably not a pure worktree checkout.
-  try {
-    const MAX_TOPLEVEL_ENTRIES = 200
-    const entries = await readdir(worktreePath)
-    if (entries.length > MAX_TOPLEVEL_ENTRIES) {
-      return false
-    }
-  } catch {
-    return false
-  }
-
-  return true
 }

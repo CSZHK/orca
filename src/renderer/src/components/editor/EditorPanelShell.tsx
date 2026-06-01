@@ -1,4 +1,4 @@
-import { Suspense, type JSX, type RefObject } from 'react'
+import { Suspense, type JSX, type Ref } from 'react'
 import { useAppStore } from '@/store'
 import { findWorktreeById } from '@/store/slices/worktree-helpers'
 import type { OpenFile } from '@/store/slices/editor'
@@ -8,18 +8,19 @@ import { UntitledFileRenameDialog } from './UntitledFileRenameDialog'
 import type { getEditorPanelRenderModel } from './editor-panel-render-model'
 import type { DiffContent, FileContent } from './editor-panel-content-types'
 import type { EditorToggleValue } from './EditorViewToggle'
+import { getUntitledFileRoot } from './untitled-file-rename-path'
 
 type EditorPanelRenderModel = ReturnType<typeof getEditorPanelRenderModel>
 
 type EditorPanelShellProps = {
-  panelRef: RefObject<HTMLDivElement | null>
+  panelRef: Ref<HTMLDivElement>
   activeFile: OpenFile
   activeViewStateId: string | null | undefined
   model: EditorPanelRenderModel
   copiedPathVisible: boolean
   showMarkdownTableOfContents: boolean
-  markdownReviewToolsEnabled: boolean
   sideBySide: boolean
+  openFiles: OpenFile[]
   fileContents: Record<string, FileContent>
   diffContents: Record<string, DiffContent>
   editorDrafts: Record<string, string>
@@ -28,22 +29,24 @@ type EditorPanelShellProps = {
   renameError: string | null
   disableRenameBrowse: boolean
   onCopyPath: () => void
-  onOpenDiffTargetFile: () => void
+  onOpenDiffTargetFile: (preferredMarkdownViewMode?: 'rich') => void
   onOpenPreviewToSide: () => void
   onOpenMarkdownPreview: () => void
   onOpenContainingFolder: () => void
   onToggleSideBySide: () => void
   onEditorToggleChange: (next: EditorToggleValue) => void
   onToggleMarkdownTableOfContents: () => void
-  onToggleMarkdownReviewTools: () => void
   onExportMarkdownToPdf: () => void
   onContentChange: (content: string) => void
+  onContentChangeForFile: (file: OpenFile, content: string) => void
   onDirtyStateHint: (dirty: boolean) => void
   onSave: (content: string) => Promise<void>
+  onSaveForFile: (file: OpenFile, content: string) => Promise<void>
   onReloadFileContent: (file: OpenFile) => void
   onCloseMarkdownTableOfContents: () => void
   onCloseRenameDialog: () => void
   onRenameConfirm: (newRelPath: string) => Promise<void>
+  markdownAnnotationsEnabled: boolean
 }
 
 export function EditorPanelShell({
@@ -53,8 +56,8 @@ export function EditorPanelShell({
   model,
   copiedPathVisible,
   showMarkdownTableOfContents,
-  markdownReviewToolsEnabled,
   sideBySide,
+  openFiles,
   fileContents,
   diffContents,
   editorDrafts,
@@ -70,15 +73,17 @@ export function EditorPanelShell({
   onToggleSideBySide,
   onEditorToggleChange,
   onToggleMarkdownTableOfContents,
-  onToggleMarkdownReviewTools,
   onExportMarkdownToPdf,
   onContentChange,
+  onContentChangeForFile,
   onDirtyStateHint,
   onSave,
+  onSaveForFile,
   onReloadFileContent,
   onCloseMarkdownTableOfContents,
   onCloseRenameDialog,
-  onRenameConfirm
+  onRenameConfirm,
+  markdownAnnotationsEnabled
 }: EditorPanelShellProps): JSX.Element {
   return (
     <div ref={panelRef} className="flex flex-col flex-1 min-w-0 min-h-0">
@@ -101,7 +106,6 @@ export function EditorPanelShell({
           canShowMarkdownTableOfContents={model.canShowMarkdownTableOfContents}
           isMarkdownTableOfContentsDisabled={model.isMarkdownTableOfContentsDisabled}
           showMarkdownTableOfContents={showMarkdownTableOfContents}
-          markdownReviewToolsEnabled={markdownReviewToolsEnabled}
           sideBySide={sideBySide}
           openFileState={model.openFileState}
           onCopyPath={onCopyPath}
@@ -112,7 +116,6 @@ export function EditorPanelShell({
           onToggleSideBySide={onToggleSideBySide}
           onEditorToggleChange={onEditorToggleChange}
           onToggleMarkdownTableOfContents={onToggleMarkdownTableOfContents}
-          onToggleMarkdownReviewTools={onToggleMarkdownReviewTools}
           onExportMarkdownToPdf={onExportMarkdownToPdf}
         />
       )}
@@ -123,6 +126,7 @@ export function EditorPanelShell({
           fileContents={fileContents}
           diffContents={diffContents}
           editBuffers={editorDrafts}
+          openFiles={openFiles}
           worktreeEntries={model.worktreeEntries}
           resolvedLanguage={model.resolvedLanguage}
           isMarkdown={model.isMarkdown}
@@ -134,12 +138,14 @@ export function EditorPanelShell({
           sideBySide={sideBySide}
           pendingEditorReveal={pendingEditorReveal}
           handleContentChange={onContentChange}
+          handleContentChangeForFile={onContentChangeForFile}
           handleDirtyStateHint={onDirtyStateHint}
           handleSave={onSave}
+          handleSaveForFile={onSaveForFile}
           reloadFileContent={onReloadFileContent}
           showMarkdownTableOfContents={showMarkdownTableOfContents}
-          markdownReviewToolsEnabled={markdownReviewToolsEnabled}
           onCloseMarkdownTableOfContents={onCloseMarkdownTableOfContents}
+          markdownAnnotationsEnabled={markdownAnnotationsEnabled}
         />
       </Suspense>
       <UntitledFileRenameDialog
@@ -147,8 +153,13 @@ export function EditorPanelShell({
         currentName={renameDialogFile?.relativePath ?? ''}
         worktreePath={
           renameDialogFile
-            ? (findWorktreeById(useAppStore.getState().worktreesByRepo, renameDialogFile.worktreeId)
-                ?.path ?? '')
+            ? getUntitledFileRoot(
+                renameDialogFile,
+                findWorktreeById(
+                  useAppStore.getState().worktreesByRepo,
+                  renameDialogFile.worktreeId
+                )?.path
+              )
             : ''
         }
         disableBrowse={disableRenameBrowse}

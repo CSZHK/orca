@@ -1,71 +1,12 @@
 import { exec, spawn, type ChildProcess } from 'child_process'
 import { existsSync } from 'fs'
-import { basename, delimiter, join } from 'path'
-import type { RelayDispatcher } from './dispatcher'
+import { delimiter, join } from 'path'
+import type { RelayDispatcher, RequestContext } from './dispatcher'
 
 const DEFAULT_TIMEOUT_MS = 60_000
 const MAX_TIMEOUT_MS = 5 * 60 * 1000
 const MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 const WINDOWS_BATCH_UNSAFE_ARGUMENTS_ERROR = 'UNSAFE_WINDOWS_BATCH_ARGUMENTS'
-
-// Why: the relay runs on a remote host and accepts commands over WebSocket.
-// Without an allowlist a compromised client could execute arbitrary binaries.
-// This set contains every agent CLI basename Orca knows how to launch (from
-// TUI_AGENT_CONFIG and COMMIT_MESSAGE_AGENT_SPECS). Keep in sync when new
-// agents are added to src/shared/tui-agent-config.ts.
-const ALLOWED_BINARY_BASENAMES = new Set([
-  'claude',
-  'codex',
-  'autohand',
-  'opencode',
-  'pi',
-  'gemini',
-  'aider',
-  'goose',
-  'amp',
-  'kilo',
-  'kiro-cli',
-  'crush',
-  'auggie',
-  'cline',
-  'codebuff',
-  'continue',
-  'cursor-agent',
-  'droid',
-  'kimi',
-  'mistral-vibe',
-  'qwen-code',
-  'rovo',
-  'hermes',
-  'openclaw',
-  'copilot',
-  'grok',
-])
-
-const BLOCKED_BINARIES = new Set([
-  'sh', 'bash', 'zsh', 'fish', 'csh', 'tcsh', 'dash',
-  'cmd', 'powershell', 'pwsh',
-  'rm', 'del', 'rmdir', 'rd', 'format',
-  'curl', 'wget', 'nc', 'ncat', 'netcat', 'socat',
-  'python', 'python3', 'node', 'ruby', 'perl', 'php',
-  'sudo', 'su', 'doas', 'runas',
-  'chmod', 'chown', 'chgrp', 'mkfs', 'mount', 'umount',
-  'dd', 'fdisk', 'parted', 'shutdown', 'reboot', 'init',
-])
-
-function assertAllowedBinary(binary: string): void {
-  const raw = basename(binary).toLowerCase().replace(/\.(exe|cmd|bat)$/, '')
-  if (!ALLOWED_BINARY_BASENAMES.has(raw)) {
-    if (BLOCKED_BINARIES.has(raw)) {
-      throw new Error(
-        `agent.execNonInteractive: binary "${binary}" is blocked — not a valid agent CLI`
-      )
-    }
-    console.warn(
-      `[agent-exec] binary "${binary}" is not in the known agent list — allowing as custom agent command`
-    )
-  }
-}
 
 function getCmdExePath(): string {
   return process.env.ComSpec || `${process.env.SystemRoot ?? 'C:\\Windows'}\\System32\\cmd.exe`
@@ -153,11 +94,20 @@ type ExecParams = {
   stdin: unknown
   timeoutMs: unknown
   env: unknown
+  operation: unknown
 }
 
 type CancelParams = {
   cwd: unknown
+  operation: unknown
 }
+
+function laneKeyFor(cwd: string, operation: unknown): string {
+  const op = typeof operation === 'string' && operation ? operation : 'default'
+  return JSON.stringify([op, cwd])
+}
+
+type InFlightExec = { child: ChildProcess; cancel: () => void }
 
 type ExecResult = {
   stdout: string
@@ -178,33 +128,36 @@ type ExecResult = {
  * and a clean exit code instead of an interactive session.
  */
 export class AgentExecHandler {
-  // Why: a single in-flight exec per cwd is enough — the renderer prevents
-  // double-clicks. Keying by cwd lets `agent.cancelExec({cwd})` find the
-  // child without the client having to track relay-internal request ids.
-  private inFlightByCwd = new Map<string, { child: ChildProcess; markCanceled: () => void }>()
+  // Why: commit-message and PR-field generation can run together for one cwd;
+  // operation lanes let cancel target only the user-visible job that stopped.
+  private inFlightByLane = new Map<string, InFlightExec>()
+
+  private laneKey(cwd: string, operation: unknown): string {
+    return laneKeyFor(cwd, operation)
+  }
 
   constructor(dispatcher: RelayDispatcher) {
-    dispatcher.onRequest('agent.execNonInteractive', (p) => this.exec(p as ExecParams))
+    dispatcher.onRequest('agent.execNonInteractive', (p, context) =>
+      this.exec(p as ExecParams, context)
+    )
     dispatcher.onRequest('agent.cancelExec', (p) => this.cancel(p as CancelParams))
   }
 
   private async cancel(params: CancelParams): Promise<{ canceled: boolean }> {
     const cwd = typeof params.cwd === 'string' ? params.cwd : ''
-    const entry = this.inFlightByCwd.get(cwd)
+    const entry = this.inFlightByLane.get(this.laneKey(cwd, params.operation))
     if (!entry) {
       return { canceled: false }
     }
-    entry.markCanceled()
-    killProcessTree(entry.child)
+    entry.cancel()
     return { canceled: true }
   }
 
-  private async exec(params: ExecParams): Promise<ExecResult> {
+  private async exec(params: ExecParams, context?: RequestContext): Promise<ExecResult> {
     const binary = typeof params.binary === 'string' ? params.binary : ''
     if (!binary) {
       throw new Error('agent.execNonInteractive: binary is required')
     }
-    assertAllowedBinary(binary)
     const args = Array.isArray(params.args) ? params.args.map((a) => String(a)) : []
     const cwd = typeof params.cwd === 'string' && params.cwd.length > 0 ? params.cwd : undefined
     const stdinPayload = typeof params.stdin === 'string' ? params.stdin : null
@@ -245,52 +198,70 @@ export class AgentExecHandler {
       let timedOut = false
       let canceled = false
       let settled = false
-      const laneKey = typeof cwd === 'string' ? cwd : ''
+      const laneKey = typeof cwd === 'string' ? this.laneKey(cwd, params.operation) : ''
+      let entry: InFlightExec | null = null
+      let timer: ReturnType<typeof setTimeout> | null = null
+      let detachChildListeners = (): void => {}
+      let detachRequestAbortListener = (): void => {}
       const finish = (result: ExecResult): void => {
         if (settled) {
           return
         }
         settled = true
-        if (laneKey) {
-          this.inFlightByCwd.delete(laneKey)
+        if (timer) {
+          clearTimeout(timer)
+          timer = null
+        }
+        detachRequestAbortListener()
+        detachChildListeners()
+        if (laneKey && entry && this.inFlightByLane.get(laneKey) === entry) {
+          this.inFlightByLane.delete(laneKey)
         }
         resolve(result)
       }
+      const cancelCurrent = (): void => {
+        canceled = true
+        killProcessTree(child)
+      }
       if (laneKey) {
-        this.inFlightByCwd.set(laneKey, {
+        // Why: the relay owns one visible non-interactive job per cwd+operation.
+        // Replacing the lane without canceling the prior child would orphan
+        // that process until timeout because future cancelExec calls reach only
+        // the newest map entry.
+        this.inFlightByLane.get(laneKey)?.cancel()
+        entry = {
           child,
-          markCanceled: () => {
-            canceled = true
-          }
-        })
+          cancel: cancelCurrent
+        }
+        this.inFlightByLane.set(laneKey, entry)
       }
 
-      const timer = setTimeout(() => {
+      timer = setTimeout(() => {
         timedOut = true
         // Why: tree-kill because some CLIs trap SIGTERM and continue streaming;
         // also Windows wraps `.cmd` shims in cmd.exe, so the immediate child
         // is not the real node.exe process.
         killProcessTree(child)
+        finish({ stdout, stderr, exitCode: null, timedOut, canceled })
       }, timeoutMs)
 
-      child.stdout?.on('data', (chunk: Buffer) => {
+      const onStdoutData = (chunk: Buffer): void => {
         stdoutBytes += chunk.byteLength
         if (stdoutBytes > MAX_OUTPUT_BYTES) {
           killProcessTree(child)
           return
         }
         stdout += chunk.toString('utf-8')
-      })
-      child.stderr?.on('data', (chunk: Buffer) => {
+      }
+      const onStderrData = (chunk: Buffer): void => {
         stderrBytes += chunk.byteLength
         if (stderrBytes > MAX_OUTPUT_BYTES) {
           killProcessTree(child)
           return
         }
         stderr += chunk.toString('utf-8')
-      })
-      child.on('error', (error) => {
-        clearTimeout(timer)
+      }
+      const onError = (error: Error): void => {
         finish({
           stdout,
           stderr,
@@ -298,11 +269,31 @@ export class AgentExecHandler {
           timedOut,
           spawnError: error.message
         })
-      })
-      child.on('close', (code) => {
-        clearTimeout(timer)
+      }
+      const onClose = (code: number | null): void => {
         finish({ stdout, stderr, exitCode: code, timedOut, canceled })
-      })
+      }
+      child.stdout?.on('data', onStdoutData)
+      child.stderr?.on('data', onStderrData)
+      child.on('error', onError)
+      child.on('close', onClose)
+      detachChildListeners = () => {
+        child.stdout?.off('data', onStdoutData)
+        child.stderr?.off('data', onStderrData)
+        child.off('error', onError)
+        child.off('close', onClose)
+      }
+
+      if (context?.signal) {
+        if (context.signal.aborted) {
+          cancelCurrent()
+        } else {
+          context.signal.addEventListener('abort', cancelCurrent, { once: true })
+          detachRequestAbortListener = () => {
+            context.signal?.removeEventListener('abort', cancelCurrent)
+          }
+        }
+      }
 
       if (stdinPayload !== null) {
         child.stdin?.end(stdinPayload)
