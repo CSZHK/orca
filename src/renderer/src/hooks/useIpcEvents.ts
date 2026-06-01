@@ -98,6 +98,7 @@ import {
   syncAgentHookCompletionNotificationSettings
 } from './agent-hook-completion-notifications'
 import { showTerminalShortcutCaptureNotification } from '@/lib/terminal-shortcut-capture-notification'
+import { AgentStatusCoalescer } from './agent-status-coalescer'
 
 function getShortcutPlatform(): NodeJS.Platform {
   if (navigator.userAgent.includes('Mac')) {
@@ -2367,11 +2368,79 @@ export function useIpcEvents(): void {
         })
     }
 
+    // Why: coalesce rapid SAME-STATE agent-status IPC events per paneKey so the
+    // store receives at most one update per pane per animation frame. Agents
+    // that fire high-frequency hook pings (e.g. Codex reporting tool usage
+    // within one "working" state) can push 50-70+ IPC events/s; applying each
+    // one mints a new state object and schedules a React update, growing the
+    // pending-update queue faster than React can flush it until the renderer
+    // exhausts memory.
+    const agentStatusCoalescer = new AgentStatusCoalescer<
+      AgentStatusIpcPayload,
+      AgentStatusIpcPayload
+    >()
+    // Why: only same-state bursts are coalesced; transitions apply synchronously
+    // below, so this tracks the last APPLIED state per pane. Session-scoped
+    // (cleared on unmount) — one tiny string per pane seen, not worth per-pane pruning.
+    const lastAgentStateByPaneKey = new Map<string, string>()
+    let agentStatusFlushHandle = 0
+
+    const flushCoalescedAgentStatus = (): void => {
+      agentStatusFlushHandle = 0
+      // Why: applyAgentStatus owns the full apply semantics (store write,
+      // pending-retry enqueue, SSH ownership checks, completion notifications)
+      // and returns 'dropped' only for events that take no effect. Drive it
+      // through the coalescer's newest-first resolver so the latest event that
+      // actually applies wins per pane and a trailing stale/dropped event can't
+      // suppress an earlier valid one. apply is a no-op because the resolver
+      // already performed the update.
+      agentStatusCoalescer.flush(
+        (data) => (applyAgentStatus(data) === 'dropped' ? null : data),
+        () => {}
+      )
+    }
+
     unsubs.push(
       window.api.agentStatus.onSet((data) => {
-        applyAgentStatus(data)
+        // Why: apply state transitions synchronously instead of deferring to the
+        // animation frame. (1) The completion-notification edge detector must
+        // observe every working->done transition, which collapsing a frame to its
+        // newest event would erase. (2) requestAnimationFrame is throttled/paused
+        // for minimized windows on Windows/Linux, so a deferred 'done' would stall
+        // the "agent finished" notification exactly when the user has switched
+        // away. Only high-frequency same-state pings (the OOM source) are coalesced.
+        const previousState = lastAgentStateByPaneKey.get(data.paneKey)
+        if (previousState !== data.state) {
+          // Drain any coalesced same-state predecessors first so this pane's
+          // events stay in order, then apply the transition synchronously.
+          if (agentStatusFlushHandle !== 0) {
+            cancelAnimationFrame(agentStatusFlushHandle)
+          }
+          flushCoalescedAgentStatus()
+          // Why: advance the tracked state only when the event actually applied.
+          // A dropped/pending transition (stale SSH owner, unhydrated pane,
+          // suppressed child status) must not mark the pane as already in the new
+          // state, or the next genuine event of that state would be coalesced
+          // instead of re-applied synchronously — the exact stall this avoids.
+          if (applyAgentStatus(data) === 'applied') {
+            lastAgentStateByPaneKey.set(data.paneKey, data.state)
+          }
+          return
+        }
+        agentStatusCoalescer.enqueue(data.paneKey, data)
+        if (agentStatusFlushHandle === 0) {
+          agentStatusFlushHandle = requestAnimationFrame(flushCoalescedAgentStatus)
+        }
       })
     )
+    unsubs.push(() => {
+      if (agentStatusFlushHandle !== 0) {
+        cancelAnimationFrame(agentStatusFlushHandle)
+        agentStatusFlushHandle = 0
+      }
+      agentStatusCoalescer.clear()
+      lastAgentStateByPaneKey.clear()
+    })
     const unsubscribeMigrationUnsupported = window.api.agentStatus.onMigrationUnsupported?.(
       (entry) => {
         const store = useAppStore.getState()
