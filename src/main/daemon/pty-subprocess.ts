@@ -21,6 +21,7 @@ import { resolveEffectiveWindowsPowerShell } from '../providers/windows-powershe
 import { isPwshAvailable } from '../pwsh'
 import { isHostCodexHomeForWsl, isWslCodexHomeForHost } from '../pty/codex-home-wsl-env'
 import { removeInheritedNoColor } from '../pty/terminal-color-env'
+import { normalizeWindowsEnvPathKey } from '../pty/env-path-key'
 import { parseWslPath } from '../wsl'
 import { addWslEnvKeys } from '../wsl-env'
 import { getWslContextFromSessionId } from './wsl-session-context'
@@ -215,6 +216,12 @@ export function createPtySubprocess(opts: PtySubprocessOptions): SubprocessHandl
   removeInheritedDevAgentHookEndpoint(env, opts.env)
   removeInheritedElectronRunAsNode(env)
   removeInheritedNoColor(env)
+  // Why: this daemon subprocess re-spreads its own process.env (keyed `Path` on
+  // Windows) over opts.env (the authoritative PATH from the main process, often
+  // keyed `PATH`), which re-mints the duplicate Path/PATH key that shadows the
+  // real value in ConPTY. buildPtyHostEnv normalizes in the main process but
+  // cannot reach this separate fork, so collapse the duplicate here too.
+  normalizeWindowsEnvPathKey(env)
 
   env.LANG ??= 'en_US.UTF-8'
 

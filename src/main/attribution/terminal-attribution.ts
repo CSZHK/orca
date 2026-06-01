@@ -5,6 +5,7 @@ instead of scattering generated shell fragments across files. */
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
 import { join, win32 as pathWin32 } from 'path'
 import { ORCA_GIT_COMMIT_TRAILER } from '../../shared/orca-attribution'
+import { findEnvPathKey } from '../pty/env-path-key'
 
 const ATTRIBUTION_ROOT_DIR = 'orca-terminal-attribution'
 const ATTRIBUTION_SHIM_VERSION = '6'
@@ -73,7 +74,12 @@ export function applyTerminalAttributionEnv(
   }
 
   const pathDelimiter = platform === 'win32' ? ';' : ':'
-  const basePath = baseEnv.PATH ?? process.env.PATH ?? ''
+  // Why: Windows spreads process.env into a plain object keyed `Path`, so
+  // hardcoding `baseEnv.PATH` reads undefined and a later write would mint a
+  // duplicate key that shadows the real PATH in the ConPTY env block. Read and
+  // write the actual key so attribution-enabled Windows PTYs keep their PATH.
+  const pathKey = findEnvPathKey(baseEnv)
+  const basePath = baseEnv[pathKey] ?? process.env.PATH ?? ''
   // Why: resolve real Windows commands before prepending shims so cmd wrappers
   // cannot recursively point ORCA_REAL_* at themselves.
   const resolvedGit = platform === 'win32' ? resolveWindowsExecutable('git', basePath) : null
@@ -102,7 +108,7 @@ export function applyTerminalAttributionEnv(
   // shim directory here keeps the attribution behavior scoped to Orca's live
   // terminal environment instead of mutating global git/gh config or the
   // user's external shell PATH.
-  baseEnv.PATH = [...prependDirs, cleanedBasePath].filter(Boolean).join(pathDelimiter)
+  baseEnv[pathKey] = [...prependDirs, cleanedBasePath].filter(Boolean).join(pathDelimiter)
   baseEnv.ORCA_ENABLE_GIT_ATTRIBUTION = '1'
   baseEnv.ORCA_GIT_COMMIT_TRAILER = ORCA_GIT_COMMIT_TRAILER
   baseEnv.ORCA_GH_PR_FOOTER = ORCA_GH_FOOTER
@@ -131,11 +137,15 @@ function clearTerminalAttributionEnv(
     delete baseEnv[key]
   }
   const pathDelimiter = platform === 'win32' ? ';' : ':'
-  const cleanedPath = stripAttributionPathEntries(baseEnv.PATH ?? '', pathDelimiter)
+  // Why: mirror the read/write key resolution in applyTerminalAttributionEnv so
+  // clearing shims on Windows touches the real `Path` key instead of leaving a
+  // stale duplicate behind.
+  const pathKey = findEnvPathKey(baseEnv)
+  const cleanedPath = stripAttributionPathEntries(baseEnv[pathKey] ?? '', pathDelimiter)
   if (cleanedPath) {
-    baseEnv.PATH = cleanedPath
+    baseEnv[pathKey] = cleanedPath
   } else {
-    delete baseEnv.PATH
+    delete baseEnv[pathKey]
   }
 }
 

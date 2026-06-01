@@ -463,6 +463,53 @@ describe('createPtySubprocess', () => {
     expect(spawnEnv.MY_VAR).toBe('test-value')
   })
 
+  it('collapses a daemon Path / caller PATH duplicate into one authoritative PATH on Windows', () => {
+    // Why: the daemon re-spreads its own process.env (keyed `Path` on Windows)
+    // over opts.env (the authoritative PATH from main, keyed `PATH`). Without
+    // normalization both keys reach ConPTY and the stale `Path` can shadow the
+    // real value — the exact bug the main-process normalizer cannot reach here.
+    const proc = mockPtyProcess()
+    spawnMock.mockReturnValue(proc)
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform')
+    const savedPath = process.env.PATH
+    const savedPathCap = process.env.Path
+
+    Object.defineProperty(process, 'platform', { value: 'win32' })
+    // Simulate the daemon's Windows-cased inherited PATH; remove any uppercase
+    // key so the only conflict is the daemon `Path` vs the caller's `PATH`.
+    delete process.env.PATH
+    process.env.Path = 'C:\\Windows\\System32;C:\\daemon-inherited'
+
+    try {
+      createPtySubprocess({
+        sessionId: 'test',
+        cols: 80,
+        rows: 24,
+        shellOverride: 'cmd.exe',
+        env: { PATH: 'C:\\Program Files\\authoritative\\bin' }
+      })
+    } finally {
+      if (platform) {
+        Object.defineProperty(process, 'platform', platform)
+      }
+      if (savedPath === undefined) {
+        delete process.env.PATH
+      } else {
+        process.env.PATH = savedPath
+      }
+      if (savedPathCap === undefined) {
+        delete process.env.Path
+      } else {
+        process.env.Path = savedPathCap
+      }
+    }
+
+    const env = spawnMock.mock.calls.at(-1)![2].env
+    const pathKeys = Object.keys(env).filter((key) => key.toLowerCase() === 'path')
+    expect(pathKeys).toEqual(['PATH'])
+    expect(env.PATH).toBe('C:\\Program Files\\authoritative\\bin')
+  })
+
   it('uses shell wrapper when attribution shims must survive shell startup', () => {
     const proc = mockPtyProcess()
     spawnMock.mockReturnValue(proc)

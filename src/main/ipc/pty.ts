@@ -60,6 +60,7 @@ import {
 } from '../agent-hooks/migration-unsupported-pty-state'
 import { parseWslPath } from '../wsl'
 import { mergePersistedWindowsPath } from '../pty/windows-environment-path'
+import { findEnvPathKey, normalizeWindowsEnvPathKey } from '../pty/env-path-key'
 import { addOrcaWslInteropEnv } from '../pty/wsl-orca-env'
 import type { CodexAccountSelectionTarget } from '../codex-accounts/runtime-selection'
 import { isHostCodexHomeForWsl, isWslCodexHomeForHost } from '../pty/codex-home-wsl-env'
@@ -649,7 +650,10 @@ export function buildPtyHostEnv(
     // treat an empty segment as `.`, which would let commands resolve from
     // the current working directory (a foot-gun we don't want to create
     // for dev terminals).
-    baseEnv.PATH = inheritedPath ? `${devCliBin}${delimiter}${inheritedPath}` : devCliBin
+    // Why: write the real PATH key (Windows spreads it as `Path`) so prepending
+    // the dev CLI dir doesn't mint a duplicate that shadows PATH in ConPTY.
+    const pathKey = findEnvPathKey(baseEnv)
+    baseEnv[pathKey] = inheritedPath ? `${devCliBin}${delimiter}${inheritedPath}` : devCliBin
   }
 
   // Why: GitHub attribution should only affect commands launched from
@@ -671,6 +675,10 @@ export function buildPtyHostEnv(
       isWsl: opts.isWsl
     })
   })
+  // Why: on Windows the daemon and attribution paths can each touch a different
+  // case of the PATH key. Collapse any `Path`/`PATH` duplicate into one before
+  // the env reaches node-pty so ConPTY sees a single authoritative PATH.
+  normalizeWindowsEnvPathKey(baseEnv)
 
   return baseEnv
 }
