@@ -85,10 +85,6 @@ vi.mock('electron', () => ({
   }
 }))
 
-vi.mock('../startup/hydrate-shell-path', () => ({
-  ensureShellPathHydrated: vi.fn()
-}))
-
 vi.mock('fs/promises', () => ({
   readdir: readdirMock,
   readFile: readFileMock,

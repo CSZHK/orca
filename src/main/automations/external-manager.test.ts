@@ -35,10 +35,6 @@ function resolveExecFileMock(...args: unknown[]) {
 
 vi.mock('electron', () => ({ app: { isPackaged: false } }))
 
-vi.mock('../startup/hydrate-shell-path', () => ({
-  ensureShellPathHydrated: vi.fn()
-}))
-
 vi.mock('child_process', () => ({ execFile: execFileMock }))
 vi.mock('fs', async () => {
   const actual = await vi.importActual<typeof Fs>('fs')

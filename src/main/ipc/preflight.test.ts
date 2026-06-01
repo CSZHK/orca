@@ -43,8 +43,7 @@ vi.mock('child_process', () => {
 
 vi.mock('../startup/hydrate-shell-path', () => ({
   hydrateShellPath: hydrateShellPathMock,
-  mergePathSegments: mergePathSegmentsMock,
-  ensureShellPathHydrated: vi.fn()
+  mergePathSegments: mergePathSegmentsMock
 }))
 
 vi.mock('./ssh', () => ({
