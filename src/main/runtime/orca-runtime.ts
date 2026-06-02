@@ -10971,7 +10971,10 @@ export class OrcaRuntimeService {
     ptyId: string,
     worktreeId: string,
     state: Partial<
-      Pick<RuntimePtyWorktreeRecord, 'connected' | 'lastOutputAt' | 'preview' | 'tabId' | 'paneKey'>
+      Pick<
+        RuntimePtyWorktreeRecord,
+        'connected' | 'lastOutputAt' | 'preview' | 'tabId' | 'paneKey' | 'title'
+      >
     > = {}
   ): RuntimePtyWorktreeRecord {
     let pty = this.ptysById.get(ptyId)
@@ -10986,7 +10989,7 @@ export class OrcaRuntimeService {
         lastExitCode: null,
         lastAgentStatus: null,
         lastOscTitle: null,
-        title: null,
+        title: state.title ?? null,
         lastOutputAt: state.lastOutputAt ?? null,
         tailBuffer: [],
         tailPartialLine: '',
@@ -11017,6 +11020,9 @@ export class OrcaRuntimeService {
     }
     if (state.preview !== undefined && state.preview.length > 0) {
       pty.preview = state.preview
+    }
+    if (state.title !== undefined && state.title !== null && state.title.length > 0) {
+      pty.title = state.title
     }
     // Why: recordPtyWorktree is the common lifecycle point for every path that
     // resolves a PTY's worktree, including renderer restore and controller list.
@@ -11067,7 +11073,10 @@ export class OrcaRuntimeService {
         inferWorktreeIdFromPtyId(session.id) ??
         findResolvedWorktreeIdForPath(resolvedWorktrees, session.cwd)
       if (worktreeId) {
-        this.recordPtyWorktree(session.id, worktreeId, { connected: true })
+        this.recordPtyWorktree(session.id, worktreeId, {
+          connected: true,
+          title: session.title
+        })
       }
     }
     for (const pty of this.ptysById.values()) {
@@ -11816,7 +11825,7 @@ export class OrcaRuntimeService {
       branch: worktree?.branch ?? '',
       tabId: `pty:${pty.ptyId}`,
       leafId: `pty:${pty.ptyId}`,
-      title: pty.title ?? pty.lastOscTitle,
+      title: pty.lastOscTitle ?? pty.title,
       connected: pty.connected,
       writable: pty.connected,
       lastOutputAt: pty.lastOutputAt,
