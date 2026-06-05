@@ -3,6 +3,7 @@
 import { renderToStaticMarkup } from 'react-dom/server'
 import type { ReactNode } from 'react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import type { DashboardAgentRow as DashboardAgentRowData } from '@/components/dashboard/useDashboardData'
 
 type MockAgentOptions = {
   paneKey?: string
@@ -13,7 +14,12 @@ type MockAgentOptions = {
   prompt?: string
   lastAssistantMessage?: string
   stateStartedAt?: number
-  orchestration?: { parentPaneKey: string }
+  terminalHandle?: string
+  orchestration?: {
+    parentPaneKey?: string
+    parentTerminalHandle?: string
+    coordinatorHandle?: string
+  }
   lineage?: {
     depth: number
     isFirstSibling: boolean
@@ -31,6 +37,7 @@ function mockAgent({
   prompt,
   lastAssistantMessage,
   stateStartedAt = 1000,
+  terminalHandle,
   orchestration,
   lineage
 }: MockAgentOptions = {}): unknown {
@@ -46,6 +53,7 @@ function mockAgent({
       state,
       stateStartedAt,
       stateHistory: prompt === undefined ? undefined : [],
+      terminalHandle,
       orchestration
     },
     lineage
@@ -89,7 +97,8 @@ vi.mock('@/components/dashboard/DashboardAgentRow', () => ({
     onSendTargetClick,
     childAgentCount,
     childAgentsExpanded,
-    onToggleChildAgents
+    onToggleChildAgents,
+    reserveDisclosureGutter
   }: {
     agent: { paneKey: string }
     isFocusedPane?: boolean
@@ -99,6 +108,7 @@ vi.mock('@/components/dashboard/DashboardAgentRow', () => ({
     childAgentCount?: number
     childAgentsExpanded?: boolean
     onToggleChildAgents?: () => void
+    reserveDisclosureGutter?: boolean
   }) => (
     <div
       data-testid="agent-row"
@@ -107,6 +117,7 @@ vi.mock('@/components/dashboard/DashboardAgentRow', () => ({
       data-disabled-reason={sendTargetDisabledReason}
       data-has-send-handler={typeof onSendTargetClick === 'function' ? 'true' : 'false'}
       data-pane-key={agent.paneKey}
+      data-reserve-disclosure-gutter={reserveDisclosureGutter ? 'true' : 'false'}
     >
       {agent.paneKey}
       {typeof childAgentCount === 'number' && childAgentCount > 0 ? (
@@ -182,7 +193,7 @@ describe('WorktreeCardAgents', () => {
     expect(markup).toContain('data-pane-key="tab-1:2"')
   })
 
-  it('collapses orchestration child agent rows behind a parent disclosure by default', async () => {
+  it('shows orchestration child agent rows under their parent by default', async () => {
     mockAgentActivityDisplayMode = 'full'
     mockAgents = [
       mockAgent({
@@ -213,9 +224,58 @@ describe('WorktreeCardAgents', () => {
 
     expect(markup).toContain('role="tree"')
     expect(markup).toContain('data-pane-key="tab-parent:1"')
-    expect(markup).not.toContain('data-pane-key="tab-child:1"')
-    expect(markup).toContain('aria-label="Show 1 child agent"')
-    expect(markup).toContain('aria-expanded="false"')
+    expect(markup).toContain('data-pane-key="tab-child:1"')
+    expect(markup).toContain('data-pane-key="tab-child:1" data-reserve-disclosure-gutter="false"')
+    expect(markup).toContain('aria-label="Hide 1 child agent"')
+    expect(markup).toContain('aria-expanded="true"')
+  })
+
+  it('shows orchestration children under a retained parent matched by terminal handle', async () => {
+    mockAgentActivityDisplayMode = 'full'
+    mockAgents = [
+      mockAgent({
+        paneKey: 'tab-parent:1',
+        terminalHandle: 'term-parent'
+      }),
+      mockAgent({
+        paneKey: 'tab-child:1',
+        state: 'done',
+        stateStartedAt: 1500,
+        orchestration: { parentTerminalHandle: 'term-parent' }
+      })
+    ]
+    const { default: WorktreeCardAgents } = await import('./WorktreeCardAgents')
+
+    const markup = renderToStaticMarkup(<WorktreeCardAgents worktreeId="wt-1" />)
+
+    expect(markup).toContain('role="tree"')
+    expect(markup).toContain('data-pane-key="tab-parent:1"')
+    expect(markup).toContain('data-pane-key="tab-child:1"')
+    expect(markup).toContain('aria-label="Hide 1 child agent"')
+  })
+
+  it('shows orchestration children under a visible coordinator when parent handle is absent', async () => {
+    mockAgentActivityDisplayMode = 'full'
+    mockAgents = [
+      mockAgent({
+        paneKey: 'tab-parent:1',
+        terminalHandle: 'term-coordinator'
+      }),
+      mockAgent({
+        paneKey: 'tab-child:1',
+        state: 'done',
+        stateStartedAt: 1500,
+        orchestration: { coordinatorHandle: 'term-coordinator' }
+      })
+    ]
+    const { default: WorktreeCardAgents } = await import('./WorktreeCardAgents')
+
+    const markup = renderToStaticMarkup(<WorktreeCardAgents worktreeId="wt-1" />)
+
+    expect(markup).toContain('role="tree"')
+    expect(markup).toContain('data-pane-key="tab-parent:1"')
+    expect(markup).toContain('data-pane-key="tab-child:1"')
+    expect(markup).toContain('aria-label="Hide 1 child agent"')
   })
 
   it('keeps partially cyclic orchestration rows visible as flat roots', async () => {
@@ -283,6 +343,9 @@ describe('WorktreeCardAgents', () => {
 
     expect(markup).toContain('All 2 agents done')
     expect(markup).toContain('Expand All 2 agents done')
+    expect(markup).not.toContain('title="Codex done"')
+    expect(markup).not.toContain('title="Claude done"')
+    expect(markup).not.toContain('>2 done<')
     expect(markup).not.toContain('First agent')
     expect(markup).not.toContain('Second agent')
     expect(markup).not.toContain('data-testid="agent-row"')
@@ -303,6 +366,7 @@ describe('WorktreeCardAgents', () => {
 
     const markup = renderToStaticMarkup(<WorktreeCardAgents worktreeId="wt-1" />)
 
+    expect(markup).toContain('compact-agent-row')
     expect(markup).toContain('group/compact-agent-row')
     expect(markup).toContain('<img')
     expect(markup).toContain('alt="Image #1"')
@@ -361,10 +425,14 @@ describe('WorktreeCardAgents', () => {
     const markup = renderToStaticMarkup(<WorktreeCardAgents worktreeId="wt-1" />)
 
     expect(markup).toContain('aria-expanded="false"')
-    expect(markup).toContain('items-center gap-0.5')
-    expect(markup).not.toContain('-space-x-1')
+    expect(markup).toContain('-space-x-0.5')
+    expect(markup).toContain('inline-flex size-4 items-center justify-center')
+    expect(markup).toContain('width="13"')
     expect(markup).toContain('3 agents: 1 waiting, 1 working, 1 done')
     expect(markup).toContain('Expand 3 agents: 1 waiting, 1 working, 1 done')
+    expect(markup).not.toContain('title="Codex waiting"')
+    expect(markup).not.toContain('title="Claude working"')
+    expect(markup).not.toContain('title="Gemini done"')
     expect(markup).not.toContain('data-testid="agent-row"')
   })
 
@@ -413,8 +481,50 @@ describe('WorktreeCardAgents', () => {
     const markup = renderToStaticMarkup(<WorktreeCardAgents worktreeId="wt-1" />)
     const iconTitles = [...markup.matchAll(/title="([^"]+)"/g)].map((match) => match[1])
 
-    expect(iconTitles).toEqual(['Codex', 'Gemini', 'Claude'])
+    expect(iconTitles).toEqual([])
+    expect(markup).not.toContain('>5 working<')
     expect(markup).toContain('>+2<')
+  })
+
+  it('uses a neutral compact summary label while expanded', async () => {
+    const { CompactAgentSummaryButton } = await import('./worktree-card-compact-agents')
+    const agents = [
+      ['tab-1:1', 'codex', 'One'],
+      ['tab-1:2', 'codex', 'Two'],
+      ['tab-1:3', 'codex', 'Three'],
+      ['tab-1:4', 'gemini', 'Four'],
+      ['tab-1:5', 'claude', 'Five']
+    ].map(([paneKey, agentType, prompt]) =>
+      mockAgent({ paneKey, agentType, startedAt: 1000, prompt })
+    ) as DashboardAgentRowData[]
+
+    const markup = renderToStaticMarkup(
+      <CompactAgentSummaryButton
+        agents={agents}
+        subjectLabel="5 agents"
+        expanded
+        onToggle={vi.fn()}
+      />
+    )
+
+    expect(markup).toContain('aria-expanded="true"')
+    expect(markup).toContain('Collapse 5 agents')
+    expect(markup).toContain('compact-agent-summary-button-expanded')
+    expect(markup).toContain('>5 agents<')
+    expect(markup).not.toContain('>+2<')
+    expect(markup).not.toContain('Expand All 5 agents working')
+  })
+
+  it('can slightly indent expanded compact summary content', async () => {
+    const { CompactAgentExpansion } = await import('./worktree-card-compact-agents')
+
+    const markup = renderToStaticMarkup(
+      <CompactAgentExpansion expanded contentClassName="pl-1">
+        <div>Agent row</div>
+      </CompactAgentExpansion>
+    )
+
+    expect(markup).toContain('compact-agent-expansion-content flex flex-col gap-0.5 pt-0.5 pl-1')
   })
 
   it('summarizes compact lineage by parent rows before revealing children', async () => {
@@ -464,9 +574,14 @@ describe('WorktreeCardAgents', () => {
 
     const markup = renderToStaticMarkup(<WorktreeCardAgents worktreeId="wt-1" />)
 
+    expect(markup).toContain('data-compact-agent-list="true"')
     expect(markup).toContain('role="tree"')
-    expect(markup).toContain('3 parents: 1 waiting, 1 working, 1 done')
+    expect(markup).toContain('3 agents: 1 waiting, 1 working, 1 done')
+    expect(markup).not.toContain('title="Gemini waiting"')
+    expect(markup).not.toContain('title="Codex working"')
+    expect(markup).not.toContain('title="Codex done"')
     expect(markup).not.toContain('Parent A')
     expect(markup).not.toContain('Child A')
+    expect(markup).not.toContain('compact-agent-row')
   })
 })

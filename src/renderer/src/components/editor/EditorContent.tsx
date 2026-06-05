@@ -55,6 +55,8 @@ type FileContent = {
   loadError?: string
 }
 
+const noopCloseMarkdownTableOfContents = (): void => {}
+
 function matchesPendingEditorReveal(
   reveal: PendingEditorReveal | null,
   file: Pick<OpenFile, 'id' | 'filePath'>
@@ -106,7 +108,8 @@ export function EditorContent({
   isChangesMode,
   sideBySide,
   showMarkdownTableOfContents = false,
-  onCloseMarkdownTableOfContents = () => {},
+  showMarkdownFrontmatter = false,
+  onCloseMarkdownTableOfContents = noopCloseMarkdownTableOfContents,
   markdownAnnotationsEnabled = true,
   pendingEditorReveal,
   handleContentChange,
@@ -132,6 +135,7 @@ export function EditorContent({
   isChangesMode: boolean
   sideBySide: boolean
   showMarkdownTableOfContents?: boolean
+  showMarkdownFrontmatter?: boolean
   onCloseMarkdownTableOfContents?: () => void
   markdownAnnotationsEnabled?: boolean
   pendingEditorReveal: PendingEditorReveal | null
@@ -395,7 +399,9 @@ export function EditorContent({
                 // (inside the editor shell) so formatting controls remain at
                 // the top of the pane — the banner is read-only context, not
                 // a header above the toolbar.
-                headerSlot={fm ? <FrontMatterBanner raw={fm.raw} /> : null}
+                headerSlot={
+                  fm && showMarkdownFrontmatter ? <FrontMatterBanner raw={fm.raw} /> : null
+                }
               />
             </RichMarkdownErrorBoundary>
           </div>

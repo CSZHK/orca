@@ -5,9 +5,9 @@ import { resolveWorktreeStatus, type WorktreeStatus } from '@/lib/worktree-statu
 import { EMPTY_BROWSER_TABS, EMPTY_TABS } from './WorktreeCardHelpers'
 import {
   selectLivePtyIdsForWorktree,
+  selectTerminalLayoutRootsForWorktree,
   selectRuntimePaneTitlesForWorktree
 } from './worktree-card-status-inputs'
-import { selectTerminalLayoutsForWorktree } from './worktree-agent-row-selectors'
 import { selectWorktreeAgentActivitySummary } from './worktree-agent-activity-summary'
 
 export function useWorktreeActivityStatus(worktreeId: string): WorktreeStatus {
@@ -19,10 +19,10 @@ export function useWorktreeActivityStatus(worktreeId: string): WorktreeStatus {
   const ptyIdsForWorktree = useAppStore(
     useShallow((s) => selectLivePtyIdsForWorktree(s, worktreeId))
   )
-  const terminalLayoutsByTabId = useAppStore(
-    useShallow((s) => selectTerminalLayoutsForWorktree(s, worktreeId))
+  const terminalLayoutRootsByTabId = useAppStore(
+    useShallow((s) => selectTerminalLayoutRootsForWorktree(s, worktreeId))
   )
-  const { hasPermission, hasLiveWorking, hasLiveDone, hasRetainedDone, freshHookLeafIdsByTabId } =
+  const { hasPermission, hasLiveWorking, hasLiveDone, hasRetainedDone, agentStatusPaneIdsByTabId } =
     useAppStore(useShallow((s) => selectWorktreeAgentActivitySummary(s, worktreeId)))
 
   // Why: compact and detailed cards need the same status-dot semantics:
@@ -35,8 +35,8 @@ export function useWorktreeActivityStatus(worktreeId: string): WorktreeStatus {
         browserTabs,
         ptyIdsByTabId: ptyIdsForWorktree,
         runtimePaneTitlesByTabId: runtimePaneTitlesForWorktree,
-        freshHookLeafIdsByTabId,
-        terminalLayoutsByTabId,
+        agentStatusPaneIdsByTabId,
+        terminalLayoutRootsByTabId,
         hasPermission,
         hasLiveWorking,
         hasLiveDone,
@@ -47,8 +47,8 @@ export function useWorktreeActivityStatus(worktreeId: string): WorktreeStatus {
       browserTabs,
       ptyIdsForWorktree,
       runtimePaneTitlesForWorktree,
-      freshHookLeafIdsByTabId,
-      terminalLayoutsByTabId,
+      agentStatusPaneIdsByTabId,
+      terminalLayoutRootsByTabId,
       hasPermission,
       hasLiveWorking,
       hasLiveDone,

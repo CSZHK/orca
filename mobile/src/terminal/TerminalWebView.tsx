@@ -280,8 +280,7 @@ const XTERM_HTML = `<!DOCTYPE html>
   var ready = false;
   var currentScale = 1;
   var userScale = 1;
-  var panX = 0;
-  var panY = 0;
+  var panX = 0, panY = 0;
   var smoothScrollOffsetY = 0;
   var pendingNormalScrollDeltaY = 0;
   var normalScrollFrameId = null;
@@ -2059,7 +2058,9 @@ export const TerminalWebView = forwardRef<TerminalWebViewHandle, Props>(function
         })
       } else if (msg.type === 'terminal-input') {
         const bytes = typeof msg.bytes === 'string' ? msg.bytes : ''
-        if (bytes.length > 0) onTerminalInput?.(bytes)
+        if (bytes.length > 0) {
+          onTerminalInput?.(bytes)
+        }
       } else if (msg.type === 'terminal-tap') {
         onTerminalTap?.()
       } else if (msg.type === 'keyboard-avoidance-metrics') {
@@ -2144,7 +2145,9 @@ export const TerminalWebView = forwardRef<TerminalWebViewHandle, Props>(function
       measureFitDimensions(
         containerHeight?: number
       ): Promise<{ cols: number; rows: number } | null> {
-        if (!isWebReadyRef.current) return Promise.resolve(null)
+        if (!isWebReadyRef.current) {
+          return Promise.resolve(null)
+        }
         return new Promise((resolve) => {
           measureResolveRef.current?.(null)
           let timeout: ReturnType<typeof setTimeout> | null = null
@@ -2184,7 +2187,9 @@ export const TerminalWebView = forwardRef<TerminalWebViewHandle, Props>(function
         // immediately if no init is pending. Capped at 3s so a stuck
         // WebView doesn't hang the caller.
         const p = readyPromiseRef.current
-        if (!p) return
+        if (!p) {
+          return
+        }
         await new Promise<void>((resolve) => {
           let settled = false
           const timeout = setTimeout(() => {
@@ -2213,6 +2218,9 @@ export const TerminalWebView = forwardRef<TerminalWebViewHandle, Props>(function
       javaScriptEnabled
       scrollEnabled={false}
       scalesPageToFit={false}
+      // Why: Android WebView defaults textZoom to the system font scale, inflating
+      // xterm's DOM glyphs past its canvas-measured cell grid (#4579). iOS ignores it.
+      textZoom={100}
       onLoadStart={handleLoadStart}
       onMessage={handleMessage}
     />

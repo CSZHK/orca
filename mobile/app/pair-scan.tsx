@@ -1,5 +1,13 @@
 import { useState, useRef, useCallback } from 'react'
-import { View, Text, StyleSheet, Pressable, ActivityIndicator, Linking } from 'react-native'
+import {
+  View,
+  Text,
+  StyleSheet,
+  Pressable,
+  ActivityIndicator,
+  Linking,
+  type LayoutChangeEvent
+} from 'react-native'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { CameraView, useCameraPermissions } from 'expo-camera'
 import { useRouter } from 'expo-router'
@@ -20,6 +28,8 @@ import { ConnectionLog } from '../src/components/ConnectionLog'
 // route surfaces as a real error with the log visible instead of a
 // silent infinite spinner.
 const PAIRING_OVERALL_TIMEOUT_MS = 25_000
+const SCAN_RETICLE_SCALE = 0.62
+const SCAN_RETICLE_MAX_SIZE = 360
 
 function Step({ number, text }: { number: number; text: string }) {
   return (
@@ -39,6 +49,7 @@ export default function PairScanScreen() {
   const [status, setStatus] = useState<'scanning' | 'connecting' | 'error'>('scanning')
   const [errorMessage, setErrorMessage] = useState('')
   const [pasteVisible, setPasteVisible] = useState(false)
+  const [cameraBounds, setCameraBounds] = useState({ width: 0, height: 0 })
   const [logs, setLogs] = useState<ConnectionLogEntry[]>([])
   const logsRef = useRef<ConnectionLogEntry[]>([])
   const processingRef = useRef(false)
@@ -59,7 +70,9 @@ export default function PairScanScreen() {
 
   const handleBarCodeScanned = useCallback(
     ({ data }: { data: string }) => {
-      if (processingRef.current) return
+      if (processingRef.current) {
+        return
+      }
       processingRef.current = true
 
       const offer = decodePairingUrl(data)
@@ -77,7 +90,9 @@ export default function PairScanScreen() {
 
   const handlePasteSubmit = useCallback((input: string) => {
     setPasteVisible(false)
-    if (processingRef.current) return
+    if (processingRef.current) {
+      return
+    }
     processingRef.current = true
 
     const offer = parsePairingCode(input)
@@ -89,6 +104,19 @@ export default function PairScanScreen() {
     }
 
     void testAndSave(offer)
+  }, [])
+
+  const handleCameraLayout = useCallback((event: LayoutChangeEvent) => {
+    const { width, height } = event.nativeEvent.layout
+    const nextBounds = {
+      width: Math.round(width),
+      height: Math.round(height)
+    }
+    setCameraBounds((currentBounds) =>
+      currentBounds.width === nextBounds.width && currentBounds.height === nextBounds.height
+        ? currentBounds
+        : nextBounds
+    )
   }, [])
 
   async function testAndSave(offer: PairingOffer) {
@@ -111,7 +139,9 @@ export default function PairScanScreen() {
     try {
       client = connect(offer.endpoint, offer.deviceToken, offer.publicKeyB64, {
         onLog: (entry) => {
-          if (!mountedRef.current || activePairingAttemptRef.current !== attempt) return
+          if (!mountedRef.current || activePairingAttemptRef.current !== attempt) {
+            return
+          }
           logsRef.current = [...logsRef.current, entry]
           setLogs(logsRef.current)
         }
@@ -122,7 +152,9 @@ export default function PairScanScreen() {
       if (activePairingAttemptRef.current === attempt) {
         activePairingAttemptRef.current = null
       }
-      if (!mountedRef.current || !attemptIsCurrent) return
+      if (!mountedRef.current || !attemptIsCurrent) {
+        return
+      }
     } catch (err) {
       const timedOut = attempt.timedOut
       const attemptIsCurrent = activePairingAttemptRef.current === attempt
@@ -130,7 +162,9 @@ export default function PairScanScreen() {
       if (activePairingAttemptRef.current === attempt) {
         activePairingAttemptRef.current = null
       }
-      if (!mountedRef.current || !attemptIsCurrent) return
+      if (!mountedRef.current || !attemptIsCurrent) {
+        return
+      }
       console.warn('[pair] connect failed', err)
       setStatus('error')
       setErrorMessage(
@@ -143,7 +177,9 @@ export default function PairScanScreen() {
     }
 
     if (!response.ok) {
-      if (!mountedRef.current) return
+      if (!mountedRef.current) {
+        return
+      }
       if (response.error.code === 'unauthorized') {
         setStatus('error')
         setErrorMessage('Authentication failed — token may be expired')
@@ -167,10 +203,14 @@ export default function PairScanScreen() {
         publicKeyB64: offer.publicKeyB64,
         lastConnected: Date.now()
       })
-      if (!mountedRef.current) return
+      if (!mountedRef.current) {
+        return
+      }
       router.replace(`/h/${hostId}`)
     } catch (err) {
-      if (!mountedRef.current) return
+      if (!mountedRef.current) {
+        return
+      }
       console.warn('[pair] save failed', err)
       setStatus('error')
       setErrorMessage(
@@ -195,6 +235,12 @@ export default function PairScanScreen() {
     paddingTop: insets.top + spacing.sm,
     paddingBottom: insets.bottom + spacing.sm
   }
+  // Why: iPad camera previews are often rectangular, but QR guides should
+  // stay square so the corners still describe the code shape.
+  const reticleSize = Math.min(
+    Math.round(Math.min(cameraBounds.width, cameraBounds.height) * SCAN_RETICLE_SCALE),
+    SCAN_RETICLE_MAX_SIZE
+  )
 
   if (!permission) {
     return (
@@ -269,7 +315,7 @@ export default function PairScanScreen() {
               they cancel the sheet and the QR was scanned silently in
               the meantime. */}
           {!pasteVisible && (
-            <View style={styles.cameraWrap}>
+            <View style={styles.cameraWrap} onLayout={handleCameraLayout}>
               <CameraView
                 style={styles.camera}
                 facing="back"
@@ -277,10 +323,12 @@ export default function PairScanScreen() {
                 onBarcodeScanned={handleBarCodeScanned}
               />
               <View style={styles.reticle} pointerEvents="none">
-                <View style={[styles.corner, styles.cornerTL]} />
-                <View style={[styles.corner, styles.cornerTR]} />
-                <View style={[styles.corner, styles.cornerBL]} />
-                <View style={[styles.corner, styles.cornerBR]} />
+                <View style={[styles.reticleFrame, { width: reticleSize, height: reticleSize }]}>
+                  <View style={[styles.corner, styles.cornerTL]} />
+                  <View style={[styles.corner, styles.cornerTR]} />
+                  <View style={[styles.corner, styles.cornerBL]} />
+                  <View style={[styles.corner, styles.cornerBR]} />
+                </View>
               </View>
             </View>
           )}
@@ -407,6 +455,9 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center'
   },
+  reticleFrame: {
+    position: 'relative'
+  },
   corner: {
     position: 'absolute',
     width: 28,
@@ -414,29 +465,29 @@ const styles = StyleSheet.create({
     borderColor: 'rgba(255,255,255,0.7)'
   },
   cornerTL: {
-    top: '30%',
-    left: '20%',
+    top: 0,
+    left: 0,
     borderTopWidth: 2.5,
     borderLeftWidth: 2.5,
     borderTopLeftRadius: 6
   },
   cornerTR: {
-    top: '30%',
-    right: '20%',
+    top: 0,
+    right: 0,
     borderTopWidth: 2.5,
     borderRightWidth: 2.5,
     borderTopRightRadius: 6
   },
   cornerBL: {
-    bottom: '30%',
-    left: '20%',
+    bottom: 0,
+    left: 0,
     borderBottomWidth: 2.5,
     borderLeftWidth: 2.5,
     borderBottomLeftRadius: 6
   },
   cornerBR: {
-    bottom: '30%',
-    right: '20%',
+    bottom: 0,
+    right: 0,
     borderBottomWidth: 2.5,
     borderRightWidth: 2.5,
     borderBottomRightRadius: 6

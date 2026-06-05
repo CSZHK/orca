@@ -131,10 +131,9 @@ describe('AgentsPane', () => {
 
   it('renders the keep-awake toggle from settings', () => {
     const markup = renderPane(getDefaultSettings('/tmp'))
-    const hostRuntimeLabel = navigator.userAgent.includes('Windows') ? 'Windows' : 'This device'
 
-    expect(markup).toContain('Agent location')
-    expect(markup).toContain(`Show installed agents from ${hostRuntimeLabel}`)
+    expect(markup).not.toContain('Agent location')
+    expect(markup).not.toContain('aria-label="Agent location"')
     expect(markup).toContain('Keep computer awake while agents are working')
     expect(markup).toContain(
       'Keeps this computer and display awake while agents are working. Orca also asks this device to stay awake when the lid is closed, subject to its power policy.'
@@ -148,11 +147,23 @@ describe('AgentsPane', () => {
         ...getDefaultSettings('/tmp'),
         terminalWindowsShell: 'wsl.exe'
       },
-      { wslCapabilitiesLoading: true }
+      { wslSupportedPlatform: true, wslCapabilitiesLoading: true }
     )
 
     expect(markup).toContain('Show installed agents from WSL default.')
     expect(markup).toContain('role="radio" aria-checked="true" disabled=""')
+  })
+
+  it('hides the WSL agent location controls on platforms without WSL support', () => {
+    const markup = renderPane({
+      ...getDefaultSettings('/tmp'),
+      localAgentRuntime: 'wsl',
+      terminalWindowsShell: 'wsl.exe'
+    })
+
+    expect(markup).not.toContain('Agent location')
+    expect(markup).not.toContain('aria-label="Agent location"')
+    expect(markup).not.toContain('WSL is not available on this machine.')
   })
 
   it('describes Windows lid behavior according to the device', () => {
@@ -262,7 +273,7 @@ describe('AgentsPane', () => {
     expect(matchesSettingsSearch('cursor-agent', AGENTS_PANE_SEARCH_ENTRIES)).toBe(true)
   })
 
-  it('renders per-agent availability as labeled status choices with explicit row copy', () => {
+  it('renders per-agent availability as labeled status choices without row explanation copy', () => {
     const markup = renderPane({
       ...getDefaultSettings('/tmp'),
       disabledTuiAgents: ['claude']
@@ -271,7 +282,9 @@ describe('AgentsPane', () => {
     expect(markup).toContain('aria-label="Claude availability"')
     expect(markup).toContain('Enabled')
     expect(markup).toContain('Disabled')
-    expect(markup).toContain('Hidden from launch and default choices.')
+    expect(markup).not.toContain('Shown in launch and default choices.')
+    expect(markup).not.toContain('Install to use in launch and default choices.')
+    expect(markup).not.toContain('Hidden from launch and default choices.')
     expect(markup).not.toContain('aria-label="Enable Claude"')
     expect(markup).not.toContain('aria-label="Disable Claude"')
   })

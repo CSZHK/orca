@@ -6,17 +6,17 @@ import { grantDirAcl } from './win32-utils'
 import { existsSync } from 'fs'
 import { join } from 'path'
 import os from 'node:os'
-import { app, BrowserWindow, nativeImage, nativeTheme } from 'electron'
+import { app, BrowserWindow, nativeTheme } from 'electron'
 import { electronApp, is } from '@electron-toolkit/utils'
 import * as QRCode from 'qrcode'
-import devIcon from '../../resources/icon-dev.png?asset'
 import { Store, initDataPath } from './persistence'
+import { applyAppIcon } from './app-icon'
 import { StatsCollector, initStatsPath } from './stats/collector'
 import { ClaudeUsageStore, initClaudeUsagePath } from './claude-usage/store'
 import { CodexUsageStore, initCodexUsagePath } from './codex-usage/store'
 import { OpenCodeUsageStore, initOpenCodeUsagePath } from './opencode-usage/store'
 import { killAllPty } from './ipc/pty'
-import { initDaemonPtyProvider, disconnectDaemon } from './daemon/daemon-init'
+import { initDaemonPtyProvider, disconnectDaemon, shutdownDaemon } from './daemon/daemon-init'
 import { closeAllWatchers } from './ipc/filesystem-watcher'
 import { registerCoreHandlers } from './ipc/register-core-handlers'
 import { initObservability, shutdownObservability } from './observability'
@@ -44,14 +44,22 @@ import {
 } from './menu/register-app-menu'
 import { checkForUpdatesFromMenu, isQuittingForUpdate } from './updater'
 import {
+  configureElectronNetworkCompatibility,
   configureDevUserDataPath,
+  configureOrcaUserDataPathEnv,
   enableMainProcessGpuFeatures,
   installDevParentDisconnectQuit,
+  installDevParentSignalQuit,
   installDevParentWatchdog,
   installUncaughtPipeErrorGuard,
+  isDevParentShutdownRequested,
   patchPackagedProcessPath,
   shouldInstallManagedHooks
 } from './startup/configure-process'
+import {
+  shouldSuppressDevEducation,
+  suppressDevEducationForStore
+} from './startup/dev-education-suppression'
 import { maybeRedirectAppImageCliLaunch } from './startup/appimage-cli-redirect'
 import { startFirstWindowStartupServices } from './startup/first-window-startup-services'
 import { getDevInstanceIdentity } from './startup/dev-instance-identity'
@@ -68,6 +76,7 @@ import { getInitialClaudeRateLimitTarget } from './rate-limits/claude-rate-limit
 import { getInitialCodexRateLimitTarget } from './rate-limits/codex-rate-limit-target'
 import { attachMainWindowServices } from './window/attach-main-window-services'
 import { createMainWindow, loadMainWindow } from './window/createMainWindow'
+import { focusExistingMainWindow } from './window/focus-existing-window'
 import { CodexAccountService } from './codex-accounts/service'
 import { CodexRuntimeHomeService } from './codex-accounts/runtime-home-service'
 import {
@@ -83,6 +92,7 @@ import { agentHookServer } from './agent-hooks/server'
 import { maybeAutoRenameBranchOnFirstWork } from './agent-hooks/first-work-branch-rename'
 import { setMigrationUnsupportedPtyListener } from './agent-hooks/migration-unsupported-pty-state'
 import {
+  clearProviderPtyState,
   getPtyIdForPaneKey,
   registerPaneKeyTeardownListener,
   getLocalPtyProvider,
@@ -104,6 +114,10 @@ import {
   shouldRecoverRendererAfterProcessGone,
   type ExpectedTeardownScope
 } from './crash-reporting/process-gone-classification'
+import {
+  buildProcessGoneCrashDetails,
+  buildSuppressedProcessGoneBreadcrumbData
+} from './crash-reporting/process-gone-diagnostics'
 import { getProcessGoneDedupeKey, processGoneDedupe } from './crash-reporting/process-gone-dedupe'
 import {
   advanceSyntheticTitleSpinnerEntries,
@@ -111,6 +125,12 @@ import {
 } from './synthetic-title-spinner'
 import { shouldSendSyntheticTitleFrame } from './synthetic-title-visibility'
 import { isCrashReportReason } from '../shared/crash-reporting'
+import {
+  getSyntheticAgentTitleProfile,
+  shouldDriveSyntheticAgentTitleFromHook,
+  type SyntheticAgentTitleProfile
+} from '../shared/synthetic-agent-title'
+import type { AgentStatusState } from '../shared/agent-status-types'
 import { KeybindingService } from './keybindings/keybinding-service'
 import { applyElectronProxySettings } from './network/proxy-settings'
 
@@ -187,7 +207,10 @@ function maybeAutoRenameBranchOnFirstWorkFromHook(event: {
         return !!meta?.orcaCreationSource && meta.preserveBranchOnDelete !== true
       },
       setDisplayName: (worktreeId, displayName) => {
-        currentStore.setWorktreeMeta(worktreeId, { displayName })
+        currentStore.setWorktreeMeta(worktreeId, {
+          displayName,
+          pendingFirstAgentMessageRename: false
+        })
       },
       resolveWorktreeIdForTab: (tabId) => currentStore.getWorktreeIdForTab(tabId),
       onRenamed: (repoId) => currentRuntime.notifyBranchRenamed(repoId)
@@ -223,9 +246,7 @@ if (app.isPackaged && process.platform !== 'win32') {
   })
 }
 configureDevUserDataPath(is.dev)
-// Why: CLI-shared Codex helpers cannot import Electron. Seed the resolved
-// app userData path once Electron has applied dev/e2e overrides.
-process.env.ORCA_USER_DATA_PATH ??= app.getPath('userData')
+configureOrcaUserDataPathEnv()
 const startupDiagnosticsEnabled = isStartupDiagnosticsEnabled()
 if (startupDiagnosticsEnabled) {
   logStartupDiagnostic('before-single-instance-lock', {
@@ -239,27 +260,12 @@ if (startupDiagnosticsEnabled) {
 }
 
 function focusExistingWindow(): void {
-  // Why: the second-instance event fires on the *primary* Electron process
-  // after another launch tries (and fails) to acquire the lock. Bring the
-  // existing window forward so the user sees the same focus behaviour as
-  // re-clicking the dock/taskbar icon, rather than a silent no-op.
-  //
-  // Why show() as well as restore() + focus(): isMinimized() only covers the
-  // dock-minimised case. A hidden window (close-to-tray on macOS via Cmd+W,
-  // or a window on a different macOS Space) is NOT minimised, so focus()
-  // alone is a silent no-op. show() handles those plus Windows taskbar
-  // focus-steal, which focus() alone does not reliably trigger.
-  if (mainWindow) {
-    if (mainWindow.isMinimized()) {
-      mainWindow.restore()
-    }
-    if (!mainWindow.isVisible()) {
-      mainWindow.show()
-    }
-    mainWindow.focus()
-  }
-  // Pre-window case: the primary is still booting and will call
-  // openMainWindow() from whenReady(). No action needed here.
+  focusExistingMainWindow({
+    app,
+    getWindow: () => mainWindow,
+    openWindow: openMainWindow,
+    warn: console.warn
+  })
 }
 
 function markExpectedRendererReload(webContentsId: number, durationMs = 10_000): void {
@@ -353,6 +359,7 @@ if (hasSingleInstanceLock) {
   const shouldCoupleToDevParent = is.dev && !isServeMode
   installDevParentDisconnectQuit(shouldCoupleToDevParent)
   installDevParentWatchdog(shouldCoupleToDevParent)
+  installDevParentSignalQuit(shouldCoupleToDevParent)
   // Why: must run after configureDevUserDataPath (which redirects userData to
   // orca-dev in dev mode) but before app.setName('Orca') inside whenReady
   // (which would change the resolved path on case-sensitive filesystems).
@@ -368,6 +375,7 @@ if (hasSingleInstanceLock) {
     packaged: app.isPackaged,
     platform: process.platform
   })
+  configureElectronNetworkCompatibility()
   enableMainProcessGpuFeatures()
 }
 
@@ -397,9 +405,6 @@ function prepareCodexRuntimeHomeForLaunch(target?: CodexAccountSelectionTarget):
       } runtime hooks before launch`,
       error
     )
-  }
-  if (target?.runtime !== 'wsl') {
-    return codexRuntimeHome!.refreshCurrentHostLaunchHome() ?? runtimeHomePath
   }
   return runtimeHomePath
 }
@@ -544,6 +549,7 @@ function openMainWindow(): BrowserWindow {
     {
       onBeforeRelaunch: () => {
         isQuitting = true
+        store?.flush()
       }
     }
   )
@@ -578,6 +584,7 @@ function openMainWindow(): BrowserWindow {
     // replay-loop through lastStatusByPaneKey runs only on deliberate
     // window recreations instead of stacking on top of stale listeners.
     agentHookServer.setListener(null)
+    agentHookServer.setPaneStatusClearListener(null)
     setMigrationUnsupportedPtyListener(null)
     // Why: any running synthesized-title spinner timer would fire into a
     // destroyed webContents; stop it here instead of deferring to per-pane
@@ -606,9 +613,11 @@ function openMainWindow(): BrowserWindow {
       }
       maybeAutoRenameBranchOnFirstWorkFromHook({ paneKey, tabId, worktreeId, payload, isReplay })
       const orchestration = runtime?.getAgentStatusOrchestrationContextForPaneKey(paneKey)
+      const terminalHandle = runtime?.getAgentStatusTerminalHandleForPaneKey(paneKey)
       mainWindow?.webContents.send('agentStatus:set', {
         ...payload,
         paneKey,
+        ...(terminalHandle ? { terminalHandle } : {}),
         tabId,
         worktreeId,
         connectionId,
@@ -617,20 +626,20 @@ function openMainWindow(): BrowserWindow {
         ...(orchestration ? { orchestration } : {})
       })
       recordAgentStateCrashBreadcrumb(payload.agentType ?? 'unknown', payload.state)
-      // Why: cursor-agent's OSC title stays "Cursor Agent" for the whole turn,
-      // and opencode's stays bare "OpenCode" — neither carries a working/idle
-      // signal the title heuristic can read. Synthesize an OSC title update
-      // from the hook state and inject it into the pane's data stream so the
-      // existing renderer-side title tracker (which drives the sidebar
-      // spinner, unread badge, and worktree status dot for every other agent)
-      // lights up for these panes too. Braille prefix → working keyword path;
-      // "action required" → permission; bare label → idle.
-      const profile = SYNTHETIC_TITLE_PROFILES[payload.agentType ?? '']
-      if (profile) {
+      // Why: some native OSC titles miss terminal idle/permission frames.
+      // Inject hook-derived frames so the renderer title tracker updates too.
+      const profile = getSyntheticAgentTitleProfile(payload.agentType)
+      if (profile && shouldDriveSyntheticAgentTitleFromHook(payload.agentType, payload.state)) {
         driveSyntheticTitleFromHook(paneKey, payload.state, profile)
       }
     }
   )
+  agentHookServer.setPaneStatusClearListener((paneKey) => {
+    if (mainWindow?.isDestroyed()) {
+      return
+    }
+    mainWindow?.webContents.send('agentStatus:clear', { paneKey })
+  })
   setMigrationUnsupportedPtyListener((event) => {
     if (mainWindow?.isDestroyed()) {
       return
@@ -651,6 +660,12 @@ function sendOpenFeatureTour(targetWindow?: BrowserWindow | null): void {
   const webContents =
     targetWindow && !targetWindow.isDestroyed() ? targetWindow.webContents : mainWindow?.webContents
   webContents?.send('ui:openFeatureTour')
+}
+
+function sendOpenSetupGuide(targetWindow?: BrowserWindow | null): void {
+  const webContents =
+    targetWindow && !targetWindow.isDestroyed() ? targetWindow.webContents : mainWindow?.webContents
+  webContents?.send('ui:openSetupGuide')
 }
 
 function sendOpenCrashReport(targetWindow?: BrowserWindow | null): void {
@@ -680,18 +695,23 @@ function recordProcessGoneCrash(
       expectedTeardown: getExpectedTeardownScope(webContentsId)
     })
   ) {
-    recordCrashBreadcrumb('process_gone_suppressed', {
-      source,
-      processType,
-      reason,
-      exitCode
-    })
+    recordCrashBreadcrumb(
+      'process_gone_suppressed',
+      buildSuppressedProcessGoneBreadcrumbData({
+        source,
+        processType,
+        reason,
+        exitCode,
+        details
+      })
+    )
     return
   }
   const key = getProcessGoneDedupeKey(processType, reason, exitCode)
   if (!processGoneDedupe.shouldRecord(key)) {
     return
   }
+  const crashDetails = buildProcessGoneCrashDetails(details)
   const span = startSpan('electron.process_gone', {
     attributes: {
       'crash.source': source,
@@ -704,7 +724,7 @@ function recordProcessGoneCrash(
       arch: process.arch,
       electronVersion: process.versions.electron,
       chromeVersion: process.versions.chrome,
-      details,
+      details: crashDetails,
       breadcrumbs: getCrashBreadcrumbSnapshot()
     }
   })
@@ -723,7 +743,7 @@ function recordProcessGoneCrash(
       arch: process.arch,
       electronVersion: process.versions.electron,
       chromeVersion: process.versions.chrome,
-      details,
+      details: crashDetails,
       // Why: breadcrumbs stay memory-only during normal operation. Persist a
       // snapshot only after Electron reports a crash-like process exit.
       breadcrumbs: getCrashBreadcrumbSnapshot()
@@ -765,41 +785,9 @@ function shutdownWatchersOnce(): Promise<void> {
 const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 const SPINNER_INTERVAL_MS = 80
 
-// Why: per-agent labels for the synthesized titles. The detector classifies
-// these labels via `containsAgentName` + spinner/keyword rules, so the chosen
-// strings must round-trip through detectAgentStatusFromTitle to the right
-// status. See agent-status.test.ts for the pinned classifications.
-type SyntheticTitleProfile = {
-  workingLabel: string
-  permissionLabel: string
-  idleLabel: string
-}
-const SYNTHETIC_TITLE_PROFILES: Record<string, SyntheticTitleProfile> = {
-  cursor: {
-    workingLabel: 'Cursor Agent',
-    permissionLabel: 'Cursor - action required',
-    idleLabel: 'Cursor ready'
-  },
-  opencode: {
-    workingLabel: 'OpenCode',
-    permissionLabel: 'OpenCode - action required',
-    idleLabel: 'OpenCode ready'
-  },
-  droid: {
-    workingLabel: 'Droid',
-    permissionLabel: 'Droid - action required',
-    idleLabel: 'Droid ready'
-  },
-  hermes: {
-    workingLabel: 'Hermes',
-    permissionLabel: 'Hermes - action required',
-    idleLabel: 'Hermes ready'
-  }
-}
-
 const syntheticTitleSpinnerByPaneKey = new Map<
   string,
-  SyntheticTitleSpinnerEntry<SyntheticTitleProfile>
+  SyntheticTitleSpinnerEntry<SyntheticAgentTitleProfile>
 >()
 let syntheticTitleSpinnerTimer: ReturnType<typeof setInterval> | null = null
 
@@ -1017,8 +1005,8 @@ function resumeSyntheticTitleSpinnerTimer(): void {
 
 function driveSyntheticTitleFromHook(
   paneKey: string,
-  state: string,
-  profile: SyntheticTitleProfile
+  state: AgentStatusState,
+  profile: SyntheticAgentTitleProfile
 ): void {
   const ptyId = getPtyIdForPaneKey(paneKey)
   if (!ptyId) {
@@ -1064,12 +1052,11 @@ app.whenReady().then(async () => {
   electronApp.setAppUserModelId(devInstanceIdentity.appUserModelId)
   app.setName(devInstanceIdentity.name)
 
-  if (process.platform === 'darwin' && is.dev) {
-    const dockIcon = nativeImage.createFromPath(devIcon)
-    app.dock?.setIcon(dockIcon)
-  }
-
   store = new Store()
+  applyAppIcon(store.getSettings().appIcon)
+  if (shouldSuppressDevEducation({ isDev: is.dev })) {
+    suppressDevEducationForStore(store)
+  }
   try {
     // Why: Dock/Launchpad launches do not inherit shell proxy env vars, so the
     // persisted proxy must be applied before any app-owned network fetchers run.
@@ -1167,7 +1154,8 @@ app.whenReady().then(async () => {
     // to swap the in-process provider for the daemon-routed one. Capturing the
     // provider reference eagerly here would freeze the pre-daemon LocalPtyProvider
     // and defeat the teardown helper's prefix sweep (design §4.3 wire-up).
-    getLocalProvider: () => getLocalPtyProvider()
+    getLocalProvider: () => getLocalPtyProvider(),
+    onPtyStopped: clearProviderPtyState
   })
   runtime = runtimeService
   automations = new AutomationService(store, { claudeUsage, codexUsage })
@@ -1218,6 +1206,11 @@ app.whenReady().then(async () => {
     onOpenSettings: () => {
       recordCrashBreadcrumb('settings_opened')
       mainWindow?.webContents.send('ui:openSettings')
+    },
+    onOpenSetupGuide: (targetWindow) => {
+      recordCrashBreadcrumb('setup_guide_opened')
+      const targetBrowserWindow = targetWindow instanceof BrowserWindow ? targetWindow : null
+      sendOpenSetupGuide(targetBrowserWindow)
     },
     onOpenCrashReport: (targetWindow) => {
       recordCrashBreadcrumb('crash_report_opened')
@@ -1271,6 +1264,7 @@ app.whenReady().then(async () => {
       const ui = store?.getUI()
       return {
         showTasksButton: settings?.showTasksButton !== false,
+        showAutomationsButton: settings?.showAutomationsButton !== false,
         showMobileButton: settings?.showMobileButton !== false,
         showTitlebarAppName: settings?.showTitlebarAppName !== false,
         statusBarVisible: ui?.statusBarVisible !== false
@@ -1471,7 +1465,10 @@ app.on('will-quit', (e) => {
     // inside `shutdownTelemetry()` are caught by the client itself — we
     // catch again here defensively so a flush failure cannot cancel the
     // quit chain.
-    Promise.allSettled([disconnectDaemon(), rpcStopAndClear, watcherShutdown])
+    // Why: normal quits preserve the detached daemon for warm reattach, but a
+    // dev parent dying means the temp/dev profile has no owner left to reattach.
+    const daemonTeardown = isDevParentShutdownRequested() ? shutdownDaemon() : disconnectDaemon()
+    Promise.allSettled([daemonTeardown, rpcStopAndClear, watcherShutdown])
       .then(() => shutdownTelemetry())
       .then(() => shutdownObservability())
       .catch(() => {

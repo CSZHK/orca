@@ -65,6 +65,7 @@ import {
   setDriverForBrowserPage
 } from '@/lib/pane-manager/browser-mobile-driver-state'
 import { destroyPersistentWebview } from '@/components/browser-pane/webview-registry'
+import { dispatchBrowserPageZoomEvent } from '@/components/browser-pane/browser-page-zoom'
 import {
   acquireBrowserAutomationVisibility,
   releaseBrowserAutomationVisibility
@@ -76,7 +77,7 @@ import { collectLeafIdsInOrder } from '@/components/terminal-pane/layout-seriali
 import { track } from '@/lib/telemetry'
 import { singlePaneLayoutSnapshot } from '@/store/slices/terminal-helpers'
 import { buildWorkspaceSessionPayload } from '@/lib/workspace-session'
-import { getLinkedWorkItemSuggestedName } from '../../../shared/workspace-name'
+import { getLinearIssueWorkspaceName } from '../../../shared/workspace-name'
 import type { AppState } from '../store/types'
 import {
   closeWebRuntimeSessionTab,
@@ -99,6 +100,7 @@ import {
 } from './agent-hook-completion-notifications'
 import { showTerminalShortcutCaptureNotification } from '@/lib/terminal-shortcut-capture-notification'
 import { AgentStatusCoalescer } from './agent-status-coalescer'
+import { resolveAgentStatusTerminalTitle } from '@/lib/agent-status-terminal-title'
 
 function getShortcutPlatform(): NodeJS.Platform {
   if (navigator.userAgent.includes('Mac')) {
@@ -129,12 +131,38 @@ function releaseBrowserAutomationBootstrapLease(browserPageId: string): void {
   browserAutomationBootstrapLeaseByPageId.delete(browserPageId)
 }
 
+function findBrowserPageWorktreeId(store: AppState, browserPageId: string): string | null {
+  for (const [worktreeId, browserTabs] of Object.entries(store.browserTabsByWorktree)) {
+    for (const workspace of browserTabs) {
+      if (
+        workspace.id === browserPageId ||
+        workspace.activePageId === browserPageId ||
+        workspace.pageIds?.includes(browserPageId)
+      ) {
+        return worktreeId
+      }
+    }
+  }
+
+  for (const pages of Object.values(store.browserPagesByWorkspace)) {
+    const page = pages.find((candidate) => candidate.id === browserPageId)
+    if (page) {
+      return page.worktreeId
+    }
+  }
+
+  return null
+}
+
 function acquireBrowserAutomationBootstrapLease(
   worktreeId: string | null | undefined,
   browserPageId?: string | null
 ): void {
   const store = useAppStore.getState()
-  const targetWorktreeId = worktreeId ?? store.activeWorktreeId
+  const targetWorktreeId =
+    worktreeId ??
+    (browserPageId ? findBrowserPageWorktreeId(store, browserPageId) : null) ??
+    store.activeWorktreeId
   if (!targetWorktreeId) {
     return
   }
@@ -187,6 +215,23 @@ function getAuthoritativeDetectedWorktreeIds(state: AppState, repoId: string): S
 
 function getVisibleWorktreeIdsForRepo(state: AppState, repoId: string): Set<string> {
   return new Set((state.worktreesByRepo[repoId] ?? []).map((worktree) => worktree.id))
+}
+
+function resolveActiveBrowserPageId(state: AppState): string | null {
+  const worktreeId = state.activeWorktreeId
+  if (!worktreeId) {
+    return null
+  }
+  const activeWorkspaceId =
+    state.activeBrowserTabIdByWorktree[worktreeId] ?? state.activeBrowserTabId ?? null
+  const browserWorkspaces = state.browserTabsByWorktree[worktreeId] ?? []
+  const workspace =
+    browserWorkspaces.find((candidate) => candidate.id === activeWorkspaceId) ?? null
+  if (!workspace) {
+    return null
+  }
+  const pages = state.browserPagesByWorkspace[workspace.id] ?? []
+  return workspace.activePageId ?? workspace.pageIds?.[0] ?? pages[0]?.id ?? null
 }
 
 type TerminalSplitDirection = 'horizontal' | 'vertical'
@@ -583,7 +628,7 @@ export function buildNewWorkspaceShortcutModalData(
 
   return {
     telemetrySource: 'shortcut',
-    prefilledName: getLinkedWorkItemSuggestedName(linearIssue),
+    prefilledName: getLinearIssueWorkspaceName(linearIssue),
     // Why: Cmd+N from a Linear issue should behave like the issue's Start
     // workspace action; otherwise the agent launches without source context.
     linkedWorkItem: buildLinearIssueLinkedWorkItem(linearIssue)
@@ -716,6 +761,12 @@ export function useIpcEvents(): void {
       window.api.ui.onOpenSettings(() => {
         useAppStore.getState().openSettingsPage()
       })
+    )
+
+    unsubs.push(
+      window.api.ui.onOpenSetupGuide?.(() => {
+        useAppStore.getState().openModal('setup-guide', { telemetrySource: 'help_menu' })
+      }) ?? (() => {})
     )
 
     unsubs.push(
@@ -941,7 +992,8 @@ export function useIpcEvents(): void {
           tabId,
           leafId,
           splitFromLeafId,
-          splitDirection
+          splitDirection,
+          splitTelemetrySource
         }) => {
           try {
             if (isRuntimeEnvironmentActive()) {
@@ -1018,10 +1070,12 @@ export function useIpcEvents(): void {
                 // paneKey. Reusing the existing tab preserves native split-pane
                 // behavior instead of letting createTab mint a collision tab.
                 store.updateTabPtyId(tab.id, ptyId)
+                const existingLayout = store.terminalLayoutsByTabId?.[tab.id]
+                const sourcePtyId = existingLayout?.ptyIdsByLeafId?.[splitFromLeafId]
                 store.setTabLayout(
                   tab.id,
                   addSplitLeafToLayout(
-                    store.terminalLayoutsByTabId?.[tab.id],
+                    existingLayout,
                     splitFromLeafId,
                     leafId,
                     ptyId,
@@ -1037,6 +1091,8 @@ export function useIpcEvents(): void {
                       paneRuntimeId: -1,
                       direction: splitDirection ?? 'horizontal',
                       sourceLeafId: splitFromLeafId,
+                      sourcePtyId,
+                      telemetrySource: splitTelemetrySource,
                       newLeafId: leafId,
                       ptyId
                     }
@@ -1182,10 +1238,18 @@ export function useIpcEvents(): void {
     )
 
     unsubs.push(
-      window.api.ui.onSplitTerminal(({ tabId, paneRuntimeId, direction, command }) => {
-        const detail: SplitTerminalPaneDetail = { tabId, paneRuntimeId, direction, command }
-        window.dispatchEvent(new CustomEvent(SPLIT_TERMINAL_PANE_EVENT, { detail }))
-      })
+      window.api.ui.onSplitTerminal(
+        ({ tabId, paneRuntimeId, direction, command, telemetrySource }) => {
+          const detail: SplitTerminalPaneDetail = {
+            tabId,
+            paneRuntimeId,
+            direction,
+            command,
+            telemetrySource
+          }
+          window.dispatchEvent(new CustomEvent(SPLIT_TERMINAL_PANE_EVENT, { detail }))
+        }
+      )
     )
 
     unsubs.push(
@@ -1303,41 +1367,48 @@ export function useIpcEvents(): void {
     )
 
     unsubs.push(
-      window.api.ui.onOpenFileFromMobile(({ worktreeId, filePath, relativePath }) => {
-        const store = useAppStore.getState()
-        const basename = relativePath.split(/[\\/]/).pop() || relativePath
-        store.setActiveWorktree(worktreeId)
-        store.markWorktreeVisited(worktreeId)
-        store.setActiveView('terminal')
-        // Why: mobile only sends a desktop-backed path. The renderer owns
-        // editor tab creation so grouped tab order and markdown bridges update
-        // through the same store path as desktop File Explorer.
-        store.openFile({
-          filePath,
-          relativePath,
-          worktreeId,
-          language: detectLanguage(basename),
-          mode: 'edit'
-        })
-        store.setActiveTabType('editor')
-        store.revealWorktreeInSidebar(worktreeId)
-      })
+      window.api.ui.onOpenFileFromMobile(
+        ({ worktreeId, filePath, relativePath, runtimeEnvironmentId }) => {
+          const store = useAppStore.getState()
+          const basename = relativePath.split(/[\\/]/).pop() || relativePath
+          store.setActiveWorktree(worktreeId)
+          store.markWorktreeVisited(worktreeId)
+          store.setActiveView('terminal')
+          // Why: mobile only sends a desktop-backed path. The renderer owns
+          // editor tab creation so grouped tab order and markdown bridges update
+          // through the same store path as desktop File Explorer.
+          store.openFile({
+            filePath,
+            relativePath,
+            worktreeId,
+            language: detectLanguage(basename),
+            runtimeEnvironmentId,
+            mode: 'edit'
+          })
+          store.setActiveTabType('editor')
+          store.revealWorktreeInSidebar(worktreeId)
+        }
+      )
     )
 
     unsubs.push(
-      window.api.ui.onOpenDiffFromMobile(({ worktreeId, filePath, relativePath, staged }) => {
-        const store = useAppStore.getState()
-        const language = detectLanguage(relativePath)
-        store.setActiveWorktree(worktreeId)
-        store.markWorktreeVisited(worktreeId)
-        store.setActiveView('terminal')
-        // Why: mobile renders diff tabs from diff metadata. The desktop
-        // markdown Changes-mode shortcut is editor-local and would publish
-        // plain markdown content back to mobile.
-        store.openDiff(worktreeId, filePath, relativePath, language, staged)
-        store.setActiveTabType('editor')
-        store.revealWorktreeInSidebar(worktreeId)
-      })
+      window.api.ui.onOpenDiffFromMobile(
+        ({ worktreeId, filePath, relativePath, staged, runtimeEnvironmentId }) => {
+          const store = useAppStore.getState()
+          const language = detectLanguage(relativePath)
+          store.setActiveWorktree(worktreeId)
+          store.markWorktreeVisited(worktreeId)
+          store.setActiveView('terminal')
+          // Why: mobile renders diff tabs from diff metadata. The desktop
+          // markdown Changes-mode shortcut is editor-local and would publish
+          // plain markdown content back to mobile.
+          store.openDiff(worktreeId, filePath, relativePath, language, staged, {
+            runtimeEnvironmentId
+          })
+          store.setActiveTabType('editor')
+          store.revealWorktreeInSidebar(worktreeId)
+        }
+      )
     )
 
     unsubs.push(
@@ -1425,11 +1496,11 @@ export function useIpcEvents(): void {
     // has display != none. Main sends this before browser automation commands
     // so persisted hidden tabs mount without changing the user's active pane.
     unsubs.push(
-      window.api.browser.onActivateView(({ worktreeId }) => {
+      window.api.browser.onActivateView(({ worktreeId, browserPageId }) => {
         if (isRuntimeEnvironmentActive()) {
           return
         }
-        acquireBrowserAutomationBootstrapLease(worktreeId)
+        acquireBrowserAutomationBootstrapLease(worktreeId, browserPageId)
       })
     )
 
@@ -2099,14 +2170,24 @@ export function useIpcEvents(): void {
     // Zoom handling for menu accelerators and keyboard fallback paths.
     unsubs.push(
       window.api.ui.onTerminalZoom((direction) => {
+        const store = useAppStore.getState()
         const { activeView, activeTabType, editorFontZoomLevel, setEditorFontZoomLevel, settings } =
-          useAppStore.getState()
+          store
+        const activeBrowserPageId = resolveActiveBrowserPageId(store)
         const target = resolveZoomTarget({
           activeView,
           activeTabType,
+          activeBrowserPageId,
           activeElement: document.activeElement
         })
         if (target === 'terminal') {
+          return
+        }
+        if (target === 'browser') {
+          if (!activeBrowserPageId) {
+            return
+          }
+          dispatchBrowserPageZoomEvent({ browserPageId: activeBrowserPageId, direction })
           return
         }
         if (target === 'editor') {
@@ -2204,7 +2285,7 @@ export function useIpcEvents(): void {
       if (!payload) {
         return 'dropped'
       }
-      const {
+      let {
         exists,
         title,
         identityTitle,
@@ -2212,6 +2293,19 @@ export function useIpcEvents(): void {
         repoConnectionResolved,
         owningWorktreeId
       } = resolvePaneKey(store, data.paneKey)
+      if (!exists && data.worktreeId && hasRuntimeBackedWorktreeAttribution(data)) {
+        // Why: orchestration worker hooks can carry main-side worktree
+        // attribution before this renderer has a terminal tab for the pane.
+        // Require runtime identity too; durable snapshots with only worktreeId
+        // can be stale cached rows from closed/remounted panes.
+        const fallbackOwnership = resolveWorktreeConnection(store, data.worktreeId)
+        if (fallbackOwnership.worktreeExists) {
+          owningWorktreeId = data.worktreeId
+          repoConnectionId = fallbackOwnership.repoConnectionId
+          repoConnectionResolved = fallbackOwnership.repoConnectionResolved
+          exists = true
+        }
+      }
       if (!exists) {
         // Why: empty paneKeys are dropped in main before IPC fanout. Reaching
         // this branch means a non-empty paneKey escaped without a matching
@@ -2292,11 +2386,23 @@ export function useIpcEvents(): void {
         // Keep the defensive store guard and completion notification path in sync.
         return 'dropped'
       }
-      store.setAgentStatus(data.paneKey, statusPayload, title, {
-        updatedAt: data.receivedAt,
-        stateStartedAt: data.stateStartedAt
-      })
+      const terminalTitle = resolveAgentStatusTerminalTitle(statusPayload, title)
       const statusWorktreeId = data.worktreeId ?? owningWorktreeId
+      store.setAgentStatus(
+        data.paneKey,
+        statusPayload,
+        terminalTitle,
+        {
+          updatedAt: data.receivedAt,
+          stateStartedAt: data.stateStartedAt
+        },
+        {
+          tabId: data.tabId,
+          worktreeId: statusWorktreeId,
+          terminalHandle: data.terminalHandle
+        }
+      )
+      applyResolvedAgentTerminalTitleToTab(store, data.paneKey, title, terminalTitle)
       if (options?.replay !== true && statusWorktreeId) {
         // Why: local Codex/Claude hooks arrive through this main-process IPC
         // path, not the PTY OSC fallback, so task-complete notifications must
@@ -2441,6 +2547,19 @@ export function useIpcEvents(): void {
       agentStatusCoalescer.clear()
       lastAgentStateByPaneKey.clear()
     })
+    const unsubscribeAgentStatusClear = window.api.agentStatus.onClear?.((data) => {
+      if (typeof data?.paneKey !== 'string') {
+        return
+      }
+      const store = useAppStore.getState()
+      if (store.agentStatusByPaneKey[data.paneKey]?.state === 'done') {
+        return
+      }
+      store.removeAgentStatus(data.paneKey)
+    })
+    if (unsubscribeAgentStatusClear) {
+      unsubs.push(unsubscribeAgentStatusClear)
+    }
     const unsubscribeMigrationUnsupported = window.api.agentStatus.onMigrationUnsupported?.(
       (entry) => {
         const store = useAppStore.getState()
@@ -2610,6 +2729,35 @@ export function useIpcEvents(): void {
   }, [])
 }
 
+function hasRuntimeBackedWorktreeAttribution(data: AgentStatusIpcPayload): boolean {
+  return (
+    (typeof data.terminalHandle === 'string' && data.terminalHandle.length > 0) ||
+    data.orchestration !== undefined
+  )
+}
+
+function applyResolvedAgentTerminalTitleToTab(
+  store: ReturnType<typeof useAppStore.getState>,
+  paneKey: string,
+  previousTitle: string | undefined,
+  nextTitle: string | undefined
+): void {
+  if (!nextTitle || nextTitle === previousTitle) {
+    return
+  }
+  const parsed = parsePaneKey(paneKey)
+  if (!parsed) {
+    return
+  }
+  const layout = store.terminalLayoutsByTabId?.[parsed.tabId]
+  if (layout?.root && layout.activeLeafId && layout.activeLeafId !== parsed.leafId) {
+    return
+  }
+  // Why: hook completion can arrive while the pane transport is unmounted.
+  // Keep the active terminal tab label in sync with the resolved state title.
+  store.updateTabTitle(parsed.tabId, nextTitle)
+}
+
 /** Resolve a paneKey (tabId:leafId) to both a liveness check and the current
  *  title, the pane's worktree, and the connectionId of the repo that owns it.
  *  Walks tabsByWorktree to locate the tab, then resolves the owning worktree
@@ -2724,6 +2872,26 @@ function resolvePaneKey(
     repoConnectionId,
     repoConnectionResolved,
     owningWorktreeId
+  }
+}
+
+function resolveWorktreeConnection(
+  store: ReturnType<typeof useAppStore.getState>,
+  worktreeId: string
+): {
+  worktreeExists: boolean
+  repoConnectionId: string | null
+  repoConnectionResolved: boolean
+} {
+  const worktree = getWorktreeMapFromState(store).get(worktreeId)
+  if (!worktree) {
+    return { worktreeExists: false, repoConnectionId: null, repoConnectionResolved: false }
+  }
+  const repo = getRepoMapFromState(store).get(worktree.repoId)
+  return {
+    worktreeExists: true,
+    repoConnectionId: repo?.connectionId ?? null,
+    repoConnectionResolved: repo !== undefined
   }
 }
 

@@ -15,6 +15,10 @@ import { registerSshHandlers } from '../ipc/ssh'
 import { registerRemoteWorkspaceHandlers } from '../ipc/remote-workspace'
 import { browserManager } from '../browser/browser-manager'
 import { hasSystemMediaAccess, requestSystemMediaAccess } from '../browser/browser-media-access'
+import {
+  allowsBrowserWebAuthnPermission,
+  installBrowserWebAuthnAccessHandlers
+} from '../browser/browser-webauthn-access'
 import type { OrcaRuntimeService } from '../runtime/orca-runtime'
 import {
   checkForUpdatesFromMenu,
@@ -196,8 +200,12 @@ export function attachMainWindowServices(
     if (permission === 'media') {
       return hasSystemMediaAccess(details?.mediaType)
     }
+    if (allowsBrowserWebAuthnPermission(permission, details)) {
+      return true
+    }
     return false
   })
+  installBrowserWebAuthnAccessHandlers(browserSession)
   browserSession.setDisplayMediaRequestHandler((_request, callback) => {
     // Why: arbitrary sites inside Orca should never be able to capture the
     // desktop or application windows until there is explicit product UX for
@@ -209,10 +217,9 @@ export function attachMainWindowServices(
   registerBrowserDownloadHandler(browserSession)
 
   mainWindow.on('closed', () => {
-    // Why: parked browser webviews can outlive the visible tab body until the
-    // renderer process exits. Clearing main-owned guest registrations on window
-    // close prevents stale tab→webContents ids from leaking across app relaunch
-    // or hot-reload cycles.
+    // Why: browser webviews are renderer-owned guest surfaces. Clearing
+    // main-owned guest registrations on window close prevents stale
+    // tab→webContents ids from leaking across app relaunch or hot-reload cycles.
     browserManager.unregisterAll()
   })
 }
@@ -336,7 +343,10 @@ function registerRuntimeWindowLifecycle(
           ...(opts.tabId !== undefined ? { tabId: opts.tabId } : {}),
           ...(opts.leafId !== undefined ? { leafId: opts.leafId } : {}),
           ...(opts.splitFromLeafId !== undefined ? { splitFromLeafId: opts.splitFromLeafId } : {}),
-          ...(opts.splitDirection !== undefined ? { splitDirection: opts.splitDirection } : {})
+          ...(opts.splitDirection !== undefined ? { splitDirection: opts.splitDirection } : {}),
+          ...(opts.splitTelemetrySource !== undefined
+            ? { splitTelemetrySource: opts.splitTelemetrySource }
+            : {})
         })
       }),
     splitTerminal: (tabId, paneRuntimeId, opts) => {
@@ -344,7 +354,8 @@ function registerRuntimeWindowLifecycle(
         tabId,
         paneRuntimeId,
         direction: opts.direction,
-        command: opts.command
+        command: opts.command,
+        telemetrySource: opts.telemetrySource
       })
     },
     renameTerminal: (tabId, title) => send('ui:renameTerminal', { tabId, title }),
@@ -354,10 +365,21 @@ function registerRuntimeWindowLifecycle(
     closeSessionTab: (tabId, worktreeId) => send('ui:closeSessionTab', { tabId, worktreeId }),
     moveSessionTab: (worktreeId: string, move: RuntimeMobileSessionTabMove) =>
       send('ui:moveSessionTab', { worktreeId, ...move }),
-    openFile: (worktreeId, filePath, relativePath) =>
-      send('ui:openFileFromMobile', { worktreeId, filePath, relativePath }),
-    openDiff: (worktreeId, filePath, relativePath, staged) =>
-      send('ui:openDiffFromMobile', { worktreeId, filePath, relativePath, staged }),
+    openFile: (worktreeId, filePath, relativePath, runtimeEnvironmentId) =>
+      send('ui:openFileFromMobile', {
+        worktreeId,
+        filePath,
+        relativePath,
+        runtimeEnvironmentId
+      }),
+    openDiff: (worktreeId, filePath, relativePath, staged, runtimeEnvironmentId) =>
+      send('ui:openDiffFromMobile', {
+        worktreeId,
+        filePath,
+        relativePath,
+        staged,
+        runtimeEnvironmentId
+      }),
     readMobileMarkdownTab: (worktreeId, tabId) =>
       requestMobileMarkdownFromRenderer(mainWindow, {
         operation: 'read',

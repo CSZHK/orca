@@ -12,16 +12,16 @@ import {
   Copy,
   Check,
   MessageSquare,
+  Plus,
   ChevronDown,
   ChevronRight,
   Sparkles,
   RefreshCw,
-  Wrench,
-  AlertTriangle,
-  Maximize2
+  AlertTriangle
 } from 'lucide-react'
 import { ExternalLink } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import {
   Accordion,
   AccordionContent,
@@ -160,7 +160,9 @@ export function MergeConflictNotice({
 }
 
 export function PRTriageStrip({
+  review,
   pr,
+  reviewKind = 'PR',
   checks,
   isResolvingConflictsWithAI,
   onResolveConflictsWithAI,
@@ -171,7 +173,9 @@ export function PRTriageStrip({
   fixChecksDisabled,
   fixChecksDisabledReason
 }: {
-  pr: PRInfo
+  review?: ConflictReview
+  pr?: ConflictReview
+  reviewKind?: 'PR' | 'MR'
   checks: PRCheckDetail[]
   isResolvingConflictsWithAI: boolean
   onResolveConflictsWithAI: () => void
@@ -182,15 +186,16 @@ export function PRTriageStrip({
   fixChecksDisabled?: boolean
   fixChecksDisabledReason?: string
 }): React.JSX.Element {
+  const resolvedReview = review ?? pr
   const failingCount = checks.filter((check) => isFailedCheck(check)).length
   const pendingCount = checks.filter(
     (check) => check.conclusion === 'pending' || check.conclusion === null
   ).length
 
-  if (pr.mergeable === 'CONFLICTING') {
+  if (resolvedReview?.mergeable === 'CONFLICTING') {
     return (
       <ConflictTriageStrip
-        reviewKind="PR"
+        reviewKind={reviewKind}
         isResolvingConflictsWithAI={isResolvingConflictsWithAI}
         onResolveConflictsWithAI={onResolveConflictsWithAI}
         resolveConflictsDisabled={resolveConflictsDisabled}
@@ -214,7 +219,7 @@ export function PRTriageStrip({
           </div>
           <Button
             type="button"
-            variant="default"
+            variant="outline"
             size="xs"
             disabled={isFixingChecksWithAI || fixChecksDisabled}
             title={fixChecksDisabled ? fixChecksDisabledReason : undefined}
@@ -223,7 +228,7 @@ export function PRTriageStrip({
             {isFixingChecksWithAI ? (
               <RefreshCw className="size-3 animate-spin" />
             ) : (
-              <Wrench className="size-3" />
+              <Sparkles className="size-3" />
             )}
             Fix
           </Button>
@@ -484,7 +489,7 @@ function CheckRunDetails({
               <div className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
                 Annotations
               </div>
-              <div className="flex max-h-40 flex-col gap-2 overflow-y-auto scrollbar-sleek">
+              <div className="flex flex-col gap-2">
                 {details!.annotations.map((annotation, index) => (
                   <div key={`${annotation.path ?? 'annotation'}-${index}`} className="min-w-0">
                     <div className="flex min-w-0 items-center gap-2">
@@ -507,7 +512,7 @@ function CheckRunDetails({
                       {annotation.message}
                     </div>
                     {annotation.rawDetails && (
-                      <pre className="mt-1 max-h-28 overflow-auto whitespace-pre-wrap rounded bg-muted/40 p-2 font-mono text-[11px] text-muted-foreground scrollbar-sleek">
+                      <pre className="mt-1 whitespace-pre-wrap rounded bg-muted/40 p-2 font-mono text-[11px] text-muted-foreground">
                         {annotation.rawDetails}
                       </pre>
                     )}
@@ -527,7 +532,7 @@ function CheckRunDetails({
               <div className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
                 {failedJobs.length > 0 ? 'Failed jobs' : 'Jobs'}
               </div>
-              <div className="flex max-h-48 flex-col gap-2 overflow-y-auto scrollbar-sleek">
+              <div className="flex flex-col gap-2">
                 {jobs.map((job, index) => (
                   <div key={`${job.name}-${index}`} className="min-w-0">
                     <div className="flex min-w-0 items-center gap-2">
@@ -579,19 +584,18 @@ function CheckRunDetails({
             </div>
           )}
 
-          <div className="flex flex-wrap items-center gap-1">
+          <div className="flex justify-end pt-1">
             {!state?.loading && (
               <Dialog>
                 <DialogTrigger asChild>
                   <Button
                     type="button"
-                    variant="ghost"
+                    variant="outline"
                     size="xs"
                     className="h-7 gap-1 px-2 text-[11px]"
                     onClick={(event) => event.stopPropagation()}
                   >
                     View full details
-                    <Maximize2 className="size-3" />
                   </Button>
                 </DialogTrigger>
                 <CheckRunDetailsDialog
@@ -602,21 +606,6 @@ function CheckRunDetails({
                   openUrl={openUrl}
                 />
               </Dialog>
-            )}
-            {openUrl && (
-              <Button
-                type="button"
-                variant="ghost"
-                size="xs"
-                className="h-7 gap-1 px-2 text-[11px]"
-                onClick={(event) => {
-                  event.stopPropagation()
-                  window.api.shell.openUrl(openUrl)
-                }}
-              >
-                Open details
-                <ExternalLink className="size-3" />
-              </Button>
             )}
           </div>
         </div>
@@ -827,8 +816,11 @@ export function ChecksList({
   )
   const detailsContextRef = useRef(checkDetailsContextKey)
   const autoExpandedContextRef = useRef<string | null>(null)
+  // Why: expanded check details already sit inside the sidebar scroller; keeping
+  // the list scroller too creates nested scrollbars around CI annotations.
+  const shouldConstrainCheckList = checksExpanded && expandedCheckKeys.size === 0
   const { detailsHeight, handleResizeStart } = useCheckDetailsResize(
-    checksExpanded && checks.length > 0
+    shouldConstrainCheckList && checks.length > 0
   )
   detailsContextRef.current = checkDetailsContextKey
   const sorted = React.useMemo(
@@ -1022,8 +1014,8 @@ export function ChecksList({
       ) : !checksExpanded ? null : (
         <>
           <div
-            className="overflow-y-auto py-1 scrollbar-sleek"
-            style={{ maxHeight: detailsHeight }}
+            className={cn('py-1', shouldConstrainCheckList && 'overflow-y-auto scrollbar-sleek')}
+            style={shouldConstrainCheckList ? { maxHeight: detailsHeight } : undefined}
           >
             {rows.map((row) => {
               const check = row.check
@@ -1031,11 +1023,12 @@ export function ChecksList({
               const Icon = CHECK_ICON[conclusion] ?? CircleDashed
               const color = CHECK_COLOR[conclusion] ?? 'text-muted-foreground'
               const expanded = expandedCheckKeys.has(row.key)
+              const openUrl = check.url
               return (
                 <div key={row.key} className="min-w-0">
                   <div
                     className={cn(
-                      'flex min-w-0 cursor-pointer items-center gap-2 px-3 py-1.5 transition-colors hover:bg-accent/40',
+                      'group/check-row flex min-w-0 cursor-pointer items-center gap-2 px-3 py-1.5 transition-colors hover:bg-accent/40',
                       expanded && 'bg-accent/25'
                     )}
                     onClick={() => toggleCheckExpanded(row)}
@@ -1056,8 +1049,32 @@ export function ChecksList({
                     <span className="flex-1 truncate text-[12px] text-foreground">
                       {check.name}
                     </span>
-                    <span className="shrink-0 text-[11px] text-muted-foreground">
-                      {getCheckStatusLabel(check)}
+                    <span className="flex shrink-0 items-center gap-1">
+                      <span className="text-[11px] text-muted-foreground">
+                        {getCheckStatusLabel(check)}
+                      </span>
+                      {openUrl && (
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="icon-xs"
+                              className="size-6 text-muted-foreground hover:text-foreground focus-visible:text-foreground"
+                              aria-label="Open check details"
+                              onClick={(event) => {
+                                event.stopPropagation()
+                                window.api.shell.openUrl(openUrl)
+                              }}
+                            >
+                              <ExternalLink className="size-3" />
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent side="left" sideOffset={4}>
+                            Open check details
+                          </TooltipContent>
+                        </Tooltip>
+                      )}
                     </span>
                   </div>
                   {expanded && <CheckRunDetails check={check} state={detailsByCheckKey[row.key]} />}
@@ -1065,15 +1082,17 @@ export function ChecksList({
               )
             })}
           </div>
-          <div
-            role="separator"
-            aria-orientation="horizontal"
-            title="Drag to resize checks"
-            className="group flex h-2 cursor-row-resize items-center border-b border-border"
-            onMouseDown={handleResizeStart}
-          >
-            <div className="h-px w-full bg-transparent transition-colors group-hover:bg-ring/40" />
-          </div>
+          {shouldConstrainCheckList && (
+            <div
+              role="separator"
+              aria-orientation="horizontal"
+              title="Drag to resize checks"
+              className="group flex h-2 cursor-row-resize items-center border-b border-border"
+              onMouseDown={handleResizeStart}
+            >
+              <div className="h-px w-full bg-transparent transition-colors group-hover:bg-ring/40" />
+            </div>
+          )}
           {checks.length >= 100 && (
             <div className="border-b border-border px-3 py-1.5 text-[10px] text-muted-foreground">
               Showing first 100 checks
@@ -1457,6 +1476,47 @@ function ResolvedCommentGroupAccordion({
   )
 }
 
+function findVerticalScrollParent(element: HTMLElement): HTMLElement | null {
+  let parent = element.parentElement
+  while (parent) {
+    const style = window.getComputedStyle(parent)
+    const canScroll = style.overflowY === 'auto' || style.overflowY === 'scroll'
+    if (canScroll && parent.scrollHeight > parent.clientHeight) {
+      return parent
+    }
+    parent = parent.parentElement
+  }
+  return null
+}
+
+function scrollElementBottomIntoView(element: HTMLElement): void {
+  const scrollParent = findVerticalScrollParent(element)
+  if (!scrollParent) {
+    element.scrollIntoView({ block: 'end', behavior: 'smooth' })
+    return
+  }
+
+  const padding = 8
+  const parentRect = scrollParent.getBoundingClientRect()
+  const elementRect = element.getBoundingClientRect()
+  const bottomOverflow = elementRect.bottom - parentRect.bottom + padding
+  if (bottomOverflow > 0) {
+    scrollParent.scrollTo({
+      top: scrollParent.scrollTop + bottomOverflow,
+      behavior: 'smooth'
+    })
+    return
+  }
+
+  const topOverflow = elementRect.top - parentRect.top - padding
+  if (topOverflow < 0) {
+    scrollParent.scrollTo({
+      top: Math.max(0, scrollParent.scrollTop + topOverflow),
+      behavior: 'smooth'
+    })
+  }
+}
+
 /** Renders the PR comments section below checks. */
 export function PRCommentsList({
   comments,
@@ -1478,22 +1538,102 @@ export function PRCommentsList({
   const [commentFilter, setCommentFilter] = useState<PRCommentAudienceFilter>('all')
   const [replyingGroupId, setReplyingGroupId] = useState<string | null>(null)
   const [isAddingComment, setIsAddingComment] = useState(false)
+  const addCommentSurfaceRef = useRef<HTMLDivElement>(null)
+  const shouldScrollAddCommentRef = useRef(false)
   const commentCounts = React.useMemo(() => getPRCommentAudienceCounts(comments), [comments])
   const visibleComments = React.useMemo(
     () => filterPRCommentsByAudience(comments, commentFilter),
     [commentFilter, comments]
   )
   const groups = React.useMemo(() => groupPRComments(visibleComments), [visibleComments])
+  useEffect(() => {
+    if (!isAddingComment || !shouldScrollAddCommentRef.current) {
+      return
+    }
+    shouldScrollAddCommentRef.current = false
+    let secondFrame: number | null = null
+    const scrollComposerIntoView = (): void => {
+      const surface = addCommentSurfaceRef.current
+      if (surface) {
+        scrollElementBottomIntoView(surface)
+      }
+    }
+    const firstFrame = window.requestAnimationFrame(() => {
+      secondFrame = window.requestAnimationFrame(scrollComposerIntoView)
+    })
+    // Why: the composer expands and focuses in separate layout passes; the
+    // timeout catches the final height so the footer is visible in short panels.
+    const settledTimer = window.setTimeout(scrollComposerIntoView, 120)
+    return () => {
+      window.cancelAnimationFrame(firstFrame)
+      if (secondFrame !== null) {
+        window.cancelAnimationFrame(secondFrame)
+      }
+      window.clearTimeout(settledTimer)
+    }
+  }, [isAddingComment])
+
+  const startAddComment = useCallback(() => {
+    shouldScrollAddCommentRef.current = true
+    setIsAddingComment(true)
+  }, [])
+
+  const cancelAddComment = useCallback(() => {
+    shouldScrollAddCommentRef.current = false
+    setIsAddingComment(false)
+  }, [])
+
+  const renderAddCommentComposer = (empty: boolean): React.JSX.Element => (
+    <div
+      ref={addCommentSurfaceRef}
+      className={cn(empty ? 'px-3 py-2' : 'border-t border-border px-3 py-2')}
+    >
+      <RightPanelCommentComposer
+        placeholder={empty ? 'Start conversation...' : 'Add a PR comment'}
+        submitLabel="Send"
+        autoFocus
+        disabled={commentsDisabled}
+        disabledReason={commentsDisabledReason}
+        onCancel={cancelAddComment}
+        onSubmit={onAddComment ?? (async () => ({ ok: false, error: 'Commenting unavailable.' }))}
+      />
+    </div>
+  )
 
   return (
     <div className="border-t border-border">
       {/* Header */}
       <div className="border-b border-border px-3 py-2">
-        <div className="flex items-center gap-2">
+        <div className="flex min-w-0 items-center gap-2">
           <MessageSquare className="size-3.5 text-muted-foreground" />
           <span className="text-[11px] font-medium text-foreground">Comments</span>
           {comments.length > 0 && (
             <span className="text-[10px] text-muted-foreground">{comments.length}</span>
+          )}
+          {onAddComment && !isAddingComment && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label={comments.length === 0 ? 'Start conversation' : 'Add comment'}
+                  disabled={commentsDisabled}
+                  title={commentsDisabled ? commentsDisabledReason : undefined}
+                  className="-mr-1 ml-auto text-muted-foreground hover:text-foreground"
+                  onClick={startAddComment}
+                >
+                  <Plus className="size-3" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="top" sideOffset={4}>
+                {commentsDisabled && commentsDisabledReason
+                  ? commentsDisabledReason
+                  : comments.length === 0
+                    ? 'Start conversation'
+                    : 'Add comment'}
+              </TooltipContent>
+            </Tooltip>
           )}
         </div>
         {comments.length > 0 && (
@@ -1530,12 +1670,14 @@ export function PRCommentsList({
         <div className="flex items-center justify-center py-6">
           <LoaderCircle className="size-4 animate-spin text-muted-foreground" />
         </div>
+      ) : comments.length === 0 && isAddingComment && onAddComment ? (
+        renderAddCommentComposer(true)
       ) : comments.length === 0 ? (
-        // Why: with the composer pinned below as the call to action, the empty
-        // state stays a quiet caption instead of competing for attention.
-        <div className="flex items-center justify-center py-5 text-[11px] text-muted-foreground">
-          {onAddComment ? 'No comments yet — start the conversation below.' : 'No comments'}
-        </div>
+        !onAddComment && (
+          <div className="flex items-center justify-center py-5 text-[11px] text-muted-foreground">
+            No comments
+          </div>
+        )
       ) : visibleComments.length === 0 ? (
         <div className="flex items-center justify-center py-5 text-[11px] text-muted-foreground">
           {getPRCommentAudienceEmptyLabel(commentFilter)}
@@ -1574,34 +1716,7 @@ export function PRCommentsList({
           })}
         </div>
       )}
-      {onAddComment && (
-        <div className="border-t border-border px-3 py-2">
-          {isAddingComment ? (
-            <RightPanelCommentComposer
-              placeholder="Add a PR comment"
-              submitLabel="Comment"
-              autoFocus
-              disabled={commentsDisabled}
-              disabledReason={commentsDisabledReason}
-              onCancel={() => setIsAddingComment(false)}
-              onSubmit={onAddComment}
-            />
-          ) : (
-            // Quiet full-width affordance that reads as a composer field, not a
-            // lonely button; clicking expands the markdown editor in place.
-            <button
-              type="button"
-              disabled={commentsDisabled}
-              title={commentsDisabled ? commentsDisabledReason : undefined}
-              className="flex h-9 w-full min-w-0 items-center gap-2 rounded-md border border-border bg-background px-2.5 text-left text-[12px] text-muted-foreground transition-colors hover:border-ring/50 hover:bg-accent/30 disabled:cursor-not-allowed disabled:opacity-60"
-              onClick={() => setIsAddingComment(true)}
-            >
-              <MessageSquare className="size-3.5 shrink-0 text-muted-foreground" />
-              <span className="truncate">Add a comment…</span>
-            </button>
-          )}
-        </div>
-      )}
+      {onAddComment && comments.length > 0 && isAddingComment && renderAddCommentComposer(false)}
     </div>
   )
 }
