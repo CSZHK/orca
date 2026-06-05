@@ -20,6 +20,7 @@ node_modules/
 
 # Build output
 dist/
+dist-new/
 dist-electron/
 out/
 /build/
@@ -104,3 +105,6 @@ playwright-report/
 
 # Agent hook runtime endpoints (machine-local secrets)
 /agent-hooks/
+
+# Local CLI deploy artifacts (machine-local, not part of the repo)
+/tmp-cli-deploy/
