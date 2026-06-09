@@ -815,6 +815,10 @@ export type UISlice = {
   // rich content (title/media/description) during downloading, error, and downloaded
   // states. Cleared on idle/checking/not-available to prevent stale leakage.
   updateChangelog: ChangelogData | null
+  // Why: UpdateCard is lazy-loaded, so it may miss the transient
+  // checking/userInitiated status. Keep manual-check intent in the store until
+  // the resulting available/error/not-available state can consume it.
+  updateUserInitiatedCycle: boolean
   dismissedUpdateVersion: string | null
   dismissUpdate: (versionOverride?: string) => void
   clearDismissedUpdateVersion: () => void
@@ -938,7 +942,12 @@ export const createUISlice: StateCreator<AppState, [], [], UISlice> = (set, get)
           : s
       )
       const { toast } = await import('sonner')
-      toast.error(translate("auto.store.slices.ui.53883b7bc3", "Couldn't send to {{value0}}", { value0: label }), { description: message })
+      toast.error(
+        translate('auto.store.slices.ui.53883b7bc3', "Couldn't send to {{value0}}", {
+          value0: label
+        }),
+        { description: message }
+      )
       return false
     }
 
@@ -949,7 +958,9 @@ export const createUISlice: StateCreator<AppState, [], [], UISlice> = (set, get)
       launch_source: mode.launchSource,
       request_kind: 'followup'
     })
-    toast.success(translate("auto.store.slices.ui.66e3bd7ce6", "Sent to {{value0}}", { value0: label }))
+    toast.success(
+      translate('auto.store.slices.ui.66e3bd7ce6', 'Sent to {{value0}}', { value0: label })
+    )
     get().closeAgentSendPopoverTargetMode(mode.id, mode.instanceId)
     return true
   },
@@ -2030,9 +2041,17 @@ export const createUISlice: StateCreator<AppState, [], [], UISlice> = (set, get)
   setUpdateStatus: (status) => {
     const prevState = get().updateStatus.state
     const update: Partial<
-      Pick<UISlice, 'updateStatus' | 'updateChangelog' | 'updateCardCollapsed'>
+      Pick<
+        UISlice,
+        'updateStatus' | 'updateChangelog' | 'updateCardCollapsed' | 'updateUserInitiatedCycle'
+      >
     > = {
       updateStatus: status
+    }
+    if (status.state === 'checking') {
+      update.updateUserInitiatedCycle = status.userInitiated === true
+    } else if (status.state === 'idle') {
+      update.updateUserInitiatedCycle = false
     }
     if (status.state === 'available') {
       // Why: cache changelog from each 'available' payload so the card retains
@@ -2059,6 +2078,7 @@ export const createUISlice: StateCreator<AppState, [], [], UISlice> = (set, get)
     set(update)
   },
   updateChangelog: null,
+  updateUserInitiatedCycle: false,
   dismissedUpdateVersion: null,
   clearDismissedUpdateVersion: () => {
     set({ dismissedUpdateVersion: null })
@@ -2081,7 +2101,7 @@ export const createUISlice: StateCreator<AppState, [], [], UISlice> = (set, get)
       if (activeNudgeId) {
         void window.api.updater.dismissNudge().catch(console.error)
       }
-      return { dismissedUpdateVersion }
+      return { dismissedUpdateVersion, updateUserInitiatedCycle: false }
     }),
   updateCardCollapsed: false,
   setUpdateCardCollapsed: (collapsed) => set({ updateCardCollapsed: collapsed }),
