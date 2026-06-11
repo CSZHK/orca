@@ -52,9 +52,14 @@ export class CdpWsProxy {
             this.client = null
           }
         }
+        const onError = (): void => {
+          onClose()
+          ws.terminate()
+        }
         const detach = (): void => {
           ws.off('message', onMessage)
           ws.off('close', onClose)
+          ws.off('error', onError)
           if (this.detachClientListeners === detach) {
             this.detachClientListeners = null
           }
@@ -62,6 +67,7 @@ export class CdpWsProxy {
         this.detachClientListeners = detach
         ws.on('message', onMessage)
         ws.on('close', onClose)
+        ws.on('error', onError)
       })
       this.httpServer.listen(0, '127.0.0.1', () => {
         this.httpServer?.removeListener('error', onListenError)

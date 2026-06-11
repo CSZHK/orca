@@ -22,7 +22,7 @@ describe('installUncaughtPipeErrorGuard', () => {
     vi.restoreAllMocks()
   })
 
-  it('suppresses uncaught pipe errors', async () => {
+  it.each(['ECONNRESET', 'EIO', 'EPIPE'])('suppresses uncaught stream %s errors', async (code) => {
     const { installUncaughtPipeErrorGuard } = await import('./configure-process')
     const originalOn = process.on.bind(process)
     let handler: ((error: unknown) => void) | null = null
@@ -36,9 +36,11 @@ describe('installUncaughtPipeErrorGuard', () => {
 
     installUncaughtPipeErrorGuard()
 
-    const pipeError = new Error('broken pipe') as NodeJS.ErrnoException
-    pipeError.code = 'EPIPE'
-    expect(() => handler?.(pipeError)).not.toThrow()
+    const streamError = new Error(
+      code === 'ECONNRESET' ? 'read ECONNRESET' : 'broken pipe'
+    ) as NodeJS.ErrnoException
+    streamError.code = code
+    expect(() => handler?.(streamError)).not.toThrow()
     expect(onSpy).toHaveBeenCalledWith('uncaughtException', expect.any(Function))
   })
 

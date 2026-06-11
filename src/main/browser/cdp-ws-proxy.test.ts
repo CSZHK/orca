@@ -352,6 +352,19 @@ describe('CdpWsProxy', () => {
     offSpy.mockRestore()
   })
 
+  it('treats client websocket ECONNRESET as a disconnect', async () => {
+    const client = await connect()
+    const serverClient = (proxy as unknown as { client: WebSocket | null }).client
+    expect(serverClient).toBeTruthy()
+
+    const error = new Error('read ECONNRESET') as NodeJS.ErrnoException
+    error.code = 'ECONNRESET'
+    expect(() => serverClient!.emit('error', error)).not.toThrow()
+
+    expect((proxy as unknown as { client: WebSocket | null }).client).toBeNull()
+    client.close()
+  })
+
   it('rejects inflight requests on stop', async () => {
     let resolveCommand: (v: unknown) => void
     mock.webContents.debugger.sendCommand.mockImplementation(

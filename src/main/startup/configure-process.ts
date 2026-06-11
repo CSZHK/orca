@@ -15,6 +15,8 @@ type NetworkCompatibilityOptions = {
   userDataPath?: string
 }
 
+const RECOVERABLE_STREAM_ERROR_CODES = new Set(['ECONNRESET', 'EIO', 'EPIPE'])
+
 function parseBooleanEnvFlag(value: string | undefined): boolean | null {
   if (value === undefined) {
     return null
@@ -100,8 +102,7 @@ export function installUncaughtPipeErrorGuard(): void {
       error &&
       typeof error === 'object' &&
       'code' in error &&
-      ((error as NodeJS.ErrnoException).code === 'EIO' ||
-        (error as NodeJS.ErrnoException).code === 'EPIPE')
+      RECOVERABLE_STREAM_ERROR_CODES.has(String((error as NodeJS.ErrnoException).code))
     ) {
       return
     }

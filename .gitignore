@@ -108,3 +108,8 @@ playwright-report/
 
 # Local CLI deploy artifacts (machine-local, not part of the repo)
 /tmp-cli-deploy/
+
+# Machine-local build/deploy scratch (packaging leftovers, never committed)
+/*.tar.gz
+/.locked-watcher-bak/
+/test-e2e.txt
