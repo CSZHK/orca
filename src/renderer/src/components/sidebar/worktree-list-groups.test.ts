@@ -9,10 +9,12 @@ import {
   getGroupKeysForWorktree,
   getLineageGroupKey,
   getLineageRenderInfo,
-  getPRGroupKey
+  getPRGroupKey,
+  type PendingCreationRef
 } from './worktree-list-groups'
 import type {
   DetectedWorktree,
+  FolderWorkspace,
   Repo,
   ProjectGroup,
   Worktree,
@@ -1313,6 +1315,209 @@ describe('project groups', () => {
     expect(rows[0]).toMatchObject({ count: 1 })
   })
 
+  it('renders folder workspaces under their owning folder-backed Project Group', () => {
+    const group: ProjectGroup = {
+      id: 'group-root',
+      name: 'Platform',
+      parentPath: '/monorepo',
+      parentGroupId: null,
+      createdFrom: 'folder-scan',
+      tabOrder: 0,
+      isCollapsed: false,
+      color: null,
+      createdAt: 1,
+      updatedAt: 1
+    }
+    const folderWorkspace: FolderWorkspace = {
+      id: 'folder-workspace-1',
+      projectGroupId: group.id,
+      name: 'Refund fix',
+      folderPath: '/monorepo',
+      linkedTask: null,
+      comment: '',
+      isArchived: false,
+      isUnread: false,
+      isPinned: false,
+      sortOrder: 10,
+      lastActivityAt: 0,
+      createdAt: 1,
+      updatedAt: 1
+    }
+
+    const rows = buildRows(
+      'repo',
+      [],
+      new Map(),
+      null,
+      new Set(),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      false,
+      undefined,
+      [group],
+      new Set(),
+      new Map(),
+      [],
+      [folderWorkspace]
+    )
+
+    expect(rows).toMatchObject([
+      {
+        type: 'header',
+        key: 'project-group:group-root',
+        count: 1
+      },
+      {
+        type: 'folder-workspace',
+        folderWorkspace: { id: 'folder-workspace-1' },
+        projectGroup: { id: 'group-root' },
+        groupDepth: 1
+      }
+    ])
+  })
+
+  it('preserves nested Project Group depth for folder workspace rows', () => {
+    const rootGroup: ProjectGroup = {
+      id: 'group-root',
+      name: 'Platform',
+      parentPath: '/monorepo',
+      parentGroupId: null,
+      createdFrom: 'folder-scan',
+      tabOrder: 0,
+      isCollapsed: false,
+      color: null,
+      createdAt: 1,
+      updatedAt: 1
+    }
+    const childGroup: ProjectGroup = {
+      id: 'group-shared',
+      name: 'packages/shared',
+      parentPath: '/monorepo/packages/shared',
+      parentGroupId: rootGroup.id,
+      createdFrom: 'folder-scan',
+      tabOrder: 1,
+      isCollapsed: false,
+      color: null,
+      createdAt: 2,
+      updatedAt: 2
+    }
+    const folderWorkspace: FolderWorkspace = {
+      id: 'folder-workspace-nested',
+      projectGroupId: childGroup.id,
+      name: 'Shared package work',
+      folderPath: '/monorepo/packages/shared',
+      linkedTask: null,
+      comment: '',
+      isArchived: false,
+      isUnread: false,
+      isPinned: false,
+      sortOrder: 10,
+      lastActivityAt: 0,
+      createdAt: 3,
+      updatedAt: 3
+    }
+
+    const rows = buildRows(
+      'repo',
+      [],
+      new Map(),
+      null,
+      new Set(),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      false,
+      undefined,
+      [rootGroup, childGroup],
+      new Set(),
+      new Map(),
+      [],
+      [folderWorkspace]
+    )
+
+    expect(rows).toMatchObject([
+      {
+        type: 'header',
+        key: 'project-group:group-root',
+        projectGroupDepth: 0
+      },
+      {
+        type: 'header',
+        key: 'project-group:group-shared',
+        projectGroupDepth: 1
+      },
+      {
+        type: 'folder-workspace',
+        folderWorkspace: { id: 'folder-workspace-nested' },
+        groupDepth: 2
+      }
+    ])
+  })
+
+  it('does not render folder workspaces under non-folder Project Groups', () => {
+    const group: ProjectGroup = {
+      id: 'group-manual',
+      name: 'Manual',
+      parentPath: null,
+      parentGroupId: null,
+      createdFrom: 'manual',
+      tabOrder: 0,
+      isCollapsed: false,
+      color: null,
+      createdAt: 1,
+      updatedAt: 1
+    }
+    const folderWorkspace: FolderWorkspace = {
+      id: 'folder-workspace-1',
+      projectGroupId: group.id,
+      name: 'Hidden',
+      folderPath: '/monorepo',
+      linkedTask: null,
+      comment: '',
+      isArchived: false,
+      isUnread: false,
+      isPinned: false,
+      sortOrder: 10,
+      lastActivityAt: 0,
+      createdAt: 1,
+      updatedAt: 1
+    }
+
+    const rows = buildRows(
+      'repo',
+      [],
+      new Map(),
+      null,
+      new Set(),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      false,
+      undefined,
+      [group],
+      new Set(),
+      new Map(),
+      [],
+      [folderWorkspace]
+    )
+
+    expect(rows).toMatchObject([
+      {
+        type: 'header',
+        key: 'project-group:group-manual',
+        count: 0
+      }
+    ])
+    expect(rows.some((row) => row.type === 'folder-workspace')).toBe(false)
+  })
+
   it('renders imported repos under nested Project Groups before worktree rows load', () => {
     const rootGroup: ProjectGroup = {
       id: 'group-root',
@@ -1661,5 +1866,114 @@ describe('WorktreeList header styles', () => {
     expect(source).toContain('resolveProjectGroupHeaderColor({')
     expect(source).toContain('headerKey: row.key')
     expect(source).toContain('color={repoHeaderColor}')
+  })
+})
+
+describe('buildRows pending creations', () => {
+  function makePendingCreation(creationId: string, repoId: string): PendingCreationRef {
+    return { creationId, repoId }
+  }
+
+  it('nests a pending creation under its repo, above the repo worktrees', () => {
+    const rows = buildRows(
+      'repo',
+      [worktree],
+      repoMap,
+      null,
+      new Set(),
+      undefined,
+      undefined,
+      undefined,
+      {},
+      new Map([[worktree.id, worktree]]),
+      false,
+      undefined,
+      [],
+      new Set(),
+      new Map(),
+      [makePendingCreation('c1', repo.id)]
+    )
+
+    const types = rows.map((row) => row.type)
+    const headerIndex = types.indexOf('header')
+    const pendingIndex = rows.findIndex(
+      (row) => row.type === 'pending-creation' && row.creationId === 'c1'
+    )
+    const itemIndex = types.indexOf('item')
+    expect(headerIndex).toBeGreaterThanOrEqual(0)
+    expect(pendingIndex).toBe(headerIndex + 1)
+    expect(pendingIndex).toBeLessThan(itemIndex)
+  })
+
+  it('creates a repo group for a pending creation in a repo with no worktrees yet', () => {
+    const rows = buildRows(
+      'repo',
+      [],
+      repoMap,
+      null,
+      new Set(),
+      undefined,
+      undefined,
+      undefined,
+      {},
+      new Map(),
+      false,
+      undefined,
+      [],
+      new Set(),
+      new Map(),
+      [makePendingCreation('c1', repo.id)]
+    )
+
+    expect(rows.map((row) => row.type)).toEqual(['header', 'pending-creation'])
+  })
+
+  it('keeps a pending creation visible when its repo metadata is temporarily missing', () => {
+    const rows = buildRows(
+      'repo',
+      [],
+      new Map(),
+      null,
+      new Set(),
+      undefined,
+      undefined,
+      undefined,
+      {},
+      new Map(),
+      false,
+      undefined,
+      [],
+      new Set(),
+      new Map(),
+      [makePendingCreation('c1', repo.id)]
+    )
+
+    expect(rows).toMatchObject([
+      { type: 'header', key: `repo:${repo.id}`, label: 'Unknown' },
+      { type: 'pending-creation', creationId: 'c1', repo: undefined }
+    ])
+  })
+
+  it('surfaces pending creations at the top for non-repo groupings', () => {
+    const rows = buildRows(
+      'none',
+      [worktree],
+      repoMap,
+      null,
+      new Set(),
+      undefined,
+      undefined,
+      undefined,
+      {},
+      new Map([[worktree.id, worktree]]),
+      false,
+      undefined,
+      [],
+      new Set(),
+      new Map(),
+      [makePendingCreation('c1', repo.id)]
+    )
+
+    expect(rows[0]).toMatchObject({ type: 'pending-creation', creationId: 'c1' })
   })
 })

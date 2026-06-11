@@ -18,6 +18,7 @@ export {
   normalizeTerminalTitle,
   isGeminiTerminalTitle,
   isClaudeAgent,
+  isClaudeManagementTitle,
   getAgentLabel
 } from '../../../shared/agent-detection'
 import {
@@ -151,6 +152,7 @@ export function formatAgentTypeLabel(agentType: AgentType | null | undefined): s
 // would silently accept a subset of the union.
 const ICONABLE_AGENT_TYPES: Record<TuiAgent, true> = {
   claude: true,
+  'claude-agent-teams': true,
   openclaude: true,
   codex: true,
   autohand: true,

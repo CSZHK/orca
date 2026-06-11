@@ -1,8 +1,10 @@
 /* oxlint-disable max-lines -- Why: pid validation shares process-identity
 helpers with kill escalation so the SIGKILL safety checks stay co-located. */
-import { execFileSync } from 'child_process'
+import { execFile, execFileSync } from 'child_process'
 import { existsSync, readFileSync, unlinkSync } from 'fs'
 import { connect, type Socket } from 'net'
+import { promisify } from 'util'
+import { isStartupDiagnosticsEnabled, logStartupDiagnostic } from '../startup/startup-diagnostics'
 import { encodeNdjson } from './ndjson'
 import { getDaemonPidPath } from './daemon-spawner'
 import {
@@ -18,6 +20,8 @@ const RESOLVER_HEALTH_CHECK_TIMEOUT_MS = 3_000
 const KILL_WAIT_MS = 3_000
 const KILL_POLL_MS = 100
 const START_TIME_TOLERANCE_MS = 1_500
+
+export type DaemonHealthCheckResult = 'healthy' | 'unhealthy' | 'pty-spawn-unhealthy'
 
 type ParsedDaemonPid = {
   pid: number
@@ -63,10 +67,13 @@ function canConnectSocket(socketPath: string): Promise<boolean> {
   })
 }
 
-export function healthCheckDaemon(socketPath: string, tokenPath: string): Promise<boolean> {
+export function checkDaemonHealth(
+  socketPath: string,
+  tokenPath: string
+): Promise<DaemonHealthCheckResult> {
   return new Promise((resolve) => {
     if (process.platform !== 'win32' && !existsSync(socketPath)) {
-      resolve(false)
+      resolve('unhealthy')
       return
     }
 
@@ -74,13 +81,13 @@ export function healthCheckDaemon(socketPath: string, tokenPath: string): Promis
     try {
       token = readFileSync(tokenPath, 'utf8').trim()
     } catch {
-      resolve(false)
+      resolve('unhealthy')
       return
     }
 
     let settled = false
     let sock: Socket | null = null
-    const settle = (result: boolean): void => {
+    const settle = (result: DaemonHealthCheckResult): void => {
       if (settled) {
         return
       }
@@ -95,7 +102,7 @@ export function healthCheckDaemon(socketPath: string, tokenPath: string): Promis
       sock?.off('connect', onConnect)
       sock?.off('data', onData)
     }
-    const onError = (): void => settle(false)
+    const onError = (): void => settle('unhealthy')
     const onConnect = (): void => {
       const hello: HelloMessage = {
         type: 'hello',
@@ -126,13 +133,13 @@ export function healthCheckDaemon(socketPath: string, tokenPath: string): Promis
         try {
           message = JSON.parse(line) as Record<string, unknown>
         } catch {
-          settle(false)
+          settle('unhealthy')
           return
         }
 
         if (message.type === 'hello') {
           if (!(message as HelloResponse).ok) {
-            settle(false)
+            settle('unhealthy')
             return
           }
           sock?.write(encodeNdjson({ id: 'health-1', type: 'ping' }))
@@ -140,12 +147,24 @@ export function healthCheckDaemon(socketPath: string, tokenPath: string): Promis
         }
 
         if (message.id === 'health-1') {
-          settle(Boolean(message.ok))
+          if (!message.ok) {
+            settle('unhealthy')
+            return
+          }
+          // Why: protocol ping only proves the socket loop is alive. New
+          // terminals also depend on node-pty's native helper state inside
+          // the daemon process, which can go stale after dev rebuilds.
+          sock?.write(encodeNdjson({ id: 'health-2', type: 'ptySpawnHealth' }))
+          continue
+        }
+
+        if (message.id === 'health-2') {
+          settle(message.ok ? 'healthy' : 'pty-spawn-unhealthy')
           return
         }
       }
     }
-    const timer = setTimeout(() => settle(false), HEALTH_CHECK_TIMEOUT_MS)
+    const timer = setTimeout(() => settle('unhealthy'), HEALTH_CHECK_TIMEOUT_MS)
 
     sock = connect({ path: socketPath })
     sock.on('error', onError)
@@ -154,6 +173,10 @@ export function healthCheckDaemon(socketPath: string, tokenPath: string): Promis
     let buffer = ''
     sock.on('data', onData)
   })
+}
+
+export async function healthCheckDaemon(socketPath: string, tokenPath: string): Promise<boolean> {
+  return (await checkDaemonHealth(socketPath, tokenPath)) === 'healthy'
 }
 
 function isSystemResolverHealth(value: unknown): value is SystemResolverHealth {
@@ -369,12 +392,50 @@ export function startTimeMatches(pid: number, expectedStartedAtMs: number | null
   return Math.abs(actualStartedAtMs - expectedStartedAtMs) <= START_TIME_TOLERANCE_MS
 }
 
-function isDaemonProcess(
+const execFileAsync = promisify(execFile)
+
+// Why: the only reliable command-line source on Windows is a CIM query, which
+// costs a full powershell.exe spawn (300-800ms cold, worse under Defender).
+// Async because the sync version measurably froze the Electron main thread at
+// startup for the whole spawn (benchmark: ~0.5s warm, 3s timeout cap cold).
+// Timed under ORCA_STARTUP_DIAGNOSTICS so the cold-start benchmark can
+// attribute startup cost to these checks.
+async function queryWindowsProcessCommandLine(pid: number): Promise<string | null> {
+  const startedAt = performance.now()
+  try {
+    const { stdout } = await execFileAsync(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        `(Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}").CommandLine`
+      ],
+      {
+        encoding: 'utf8',
+        timeout: 3_000
+      }
+    )
+    return stdout
+  } catch {
+    return null
+  } finally {
+    if (isStartupDiagnosticsEnabled()) {
+      logStartupDiagnostic('daemon-pid-check', {
+        t: Math.round(performance.now()),
+        pid,
+        ms: Math.round(performance.now() - startedAt)
+      })
+    }
+  }
+}
+
+async function isDaemonProcess(
   pid: number,
   socketPath: string,
   tokenPath: string,
   startedAtMs: number | null
-): boolean {
+): Promise<boolean> {
   try {
     process.kill(pid, 0)
   } catch {
@@ -382,30 +443,16 @@ function isDaemonProcess(
   }
 
   if (process.platform === 'win32') {
-    try {
-      const output = execFileSync(
-        'powershell.exe',
-        [
-          '-NoProfile',
-          '-NonInteractive',
-          '-Command',
-          `(Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}").CommandLine`
-        ],
-        {
-          encoding: 'utf8',
-          timeout: 3_000
-        }
-      )
-      // Why: image names are too broad after PID reuse. Match the daemon entry
-      // plus the exact socket/token args so we only kill the daemon for this
-      // userData protocol endpoint.
-      return (
-        commandLineMatchesDaemon(output, socketPath, tokenPath) &&
-        startTimeMatches(pid, startedAtMs)
-      )
-    } catch {
+    const output = await queryWindowsProcessCommandLine(pid)
+    if (output === null) {
       return false
     }
+    // Why: image names are too broad after PID reuse. Match the daemon entry
+    // plus the exact socket/token args so we only kill the daemon for this
+    // userData protocol endpoint.
+    return (
+      commandLineMatchesDaemon(output, socketPath, tokenPath) && startTimeMatches(pid, startedAtMs)
+    )
   }
 
   try {
@@ -429,25 +476,9 @@ function isDaemonProcess(
   }
 }
 
-function getDaemonCommandLine(pid: number): string | null {
+async function getDaemonCommandLine(pid: number): Promise<string | null> {
   if (process.platform === 'win32') {
-    try {
-      return execFileSync(
-        'powershell.exe',
-        [
-          '-NoProfile',
-          '-NonInteractive',
-          '-Command',
-          `(Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}").CommandLine`
-        ],
-        {
-          encoding: 'utf8',
-          timeout: 3_000
-        }
-      )
-    } catch {
-      return null
-    }
+    return queryWindowsProcessCommandLine(pid)
   }
 
   try {
@@ -466,14 +497,14 @@ function getDaemonCommandLine(pid: number): string | null {
 
 export type DaemonLaunchIdentity = 'match' | 'mismatch' | 'unknown'
 
-export function getDaemonLaunchIdentity(
+export async function getDaemonLaunchIdentity(
   runtimeDir: string,
   socketPath: string,
   tokenPath: string,
   expectedEntryPath: string,
   protocolVersion = PROTOCOL_VERSION
-): DaemonLaunchIdentity {
-  const parsedPid = readVerifiedDaemonPid(runtimeDir, socketPath, tokenPath, protocolVersion)
+): Promise<DaemonLaunchIdentity> {
+  const parsedPid = await readVerifiedDaemonPid(runtimeDir, socketPath, tokenPath, protocolVersion)
   if (!parsedPid) {
     return 'unknown'
   }
@@ -486,19 +517,19 @@ export function getDaemonLaunchIdentity(
   // carries daemon-entry.js, so use it to stop dev worktrees from reusing a
   // daemon forked from a deleted sibling checkout. If command-line probing is
   // unavailable, fail open so we don't kill live sessions unnecessarily.
-  const commandLine = getDaemonCommandLine(parsedPid.pid)
+  const commandLine = await getDaemonCommandLine(parsedPid.pid)
   if (!commandLine) {
     return 'unknown'
   }
   return commandLine.includes(expectedEntryPath) ? 'match' : 'mismatch'
 }
 
-function readVerifiedDaemonPid(
+async function readVerifiedDaemonPid(
   runtimeDir: string,
   socketPath: string,
   tokenPath: string,
   protocolVersion = PROTOCOL_VERSION
-): ParsedDaemonPid | null {
+): Promise<ParsedDaemonPid | null> {
   let parsedPid: ParsedDaemonPid | null
   try {
     parsedPid = parseDaemonPidFile(
@@ -508,21 +539,24 @@ function readVerifiedDaemonPid(
     return null
   }
 
-  if (!parsedPid || !isDaemonProcess(parsedPid.pid, socketPath, tokenPath, parsedPid.startedAtMs)) {
+  if (
+    !parsedPid ||
+    !(await isDaemonProcess(parsedPid.pid, socketPath, tokenPath, parsedPid.startedAtMs))
+  ) {
     return null
   }
 
   return parsedPid
 }
 
-export function isDaemonStaleForCurrentBundle(
+export async function isDaemonStaleForCurrentBundle(
   runtimeDir: string,
   socketPath: string,
   tokenPath: string,
   currentAppVersion: string,
   protocolVersion = PROTOCOL_VERSION
-): boolean {
-  const parsedPid = readVerifiedDaemonPid(runtimeDir, socketPath, tokenPath, protocolVersion)
+): Promise<boolean> {
+  const parsedPid = await readVerifiedDaemonPid(runtimeDir, socketPath, tokenPath, protocolVersion)
   if (!parsedPid) {
     return false
   }
@@ -547,7 +581,10 @@ export async function killStaleDaemon(
   let killedDaemon = false
   try {
     const parsedPid = parseDaemonPidFile(readFileSync(pidPath, 'utf8'))
-    if (parsedPid && isDaemonProcess(parsedPid.pid, socketPath, tokenPath, parsedPid.startedAtMs)) {
+    if (
+      parsedPid &&
+      (await isDaemonProcess(parsedPid.pid, socketPath, tokenPath, parsedPid.startedAtMs))
+    ) {
       const { pid, startedAtMs } = parsedPid
       process.kill(pid, 'SIGTERM')
       const deadline = Date.now() + KILL_WAIT_MS
@@ -566,7 +603,7 @@ export async function killStaleDaemon(
         // window is long enough for the pid to be recycled if the original
         // daemon died during the wait. Without this, we'd SIGKILL an unrelated
         // process that happens to now own the same pid.
-        if (!isDaemonProcess(pid, socketPath, tokenPath, startedAtMs)) {
+        if (!(await isDaemonProcess(pid, socketPath, tokenPath, startedAtMs))) {
           console.warn('[daemon] Skipping SIGKILL for stale daemon: reason=pid_recycled')
           exited = true
           killedDaemon = true

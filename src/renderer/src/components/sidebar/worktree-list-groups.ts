@@ -3,6 +3,7 @@ import { CircleX, FolderTree, List, Pin } from 'lucide-react'
 import type React from 'react'
 import type {
   DetectedWorktree,
+  FolderWorkspace,
   Repo,
   ProjectGroup,
   ProjectOrderBy,
@@ -10,7 +11,7 @@ import type {
   WorktreeLineage,
   WorkspaceStatusDefinition
 } from '../../../../shared/types'
-import { branchName } from '@/lib/git-utils'
+import { branchName } from '../../lib/git-utils'
 import {
   getWorkspaceStatus,
   getWorkspaceStatusFromGroupKey,
@@ -23,10 +24,11 @@ import {
   ConductorReviewIcon
 } from './workspace-status-icons'
 import { cloneDefaultWorkspaceStatuses } from '../../../../shared/workspace-statuses'
-import type { AppState } from '@/store/types'
-import { getGitHubPRCacheKey, getLegacyGitHubPRCacheKey } from '@/store/slices/github-cache-key'
+import type { AppState } from '../../store/types'
+import { getGitHubPRCacheKey, getLegacyGitHubPRCacheKey } from '../../store/slices/github-cache-key'
 import { UNGROUPED_PROJECT_GROUP_KEY } from '../../../../shared/project-groups'
-import { getRepoDisplayLabelsByPath } from '@/lib/repo-display-labels'
+import { getRepoDisplayLabelsByPath } from '../../lib/repo-display-labels'
+import { translate } from '../../i18n/i18n'
 
 export { branchName }
 
@@ -70,7 +72,46 @@ export type ImportedWorktreesCardRow = {
   placement: 'repo-group' | 'pinned-fallback'
 }
 
-export type Row = GroupHeaderRow | WorktreeRow | ImportedWorktreesCardRow
+export type PendingCreationRow = {
+  type: 'pending-creation'
+  key: string
+  creationId: string
+  repo: Repo | undefined
+}
+
+export type FolderWorkspaceRow = {
+  type: 'folder-workspace'
+  key: string
+  folderWorkspace: FolderWorkspace
+  projectGroup: ProjectGroup
+  depth: number
+  groupDepth: number
+}
+
+/** Minimal shape buildRows needs for an in-flight create. Deliberately not the
+ *  full PendingWorktreeCreation: row identity depends only on which creates
+ *  exist and their repo, so callers can subscribe on this stable shape and keep
+ *  progress-field churn (phase/loaderVisible) from rebuilding the whole list. */
+export type PendingCreationRef = { creationId: string; repoId: string }
+
+export type Row =
+  | GroupHeaderRow
+  | WorktreeRow
+  | ImportedWorktreesCardRow
+  | PendingCreationRow
+  | FolderWorkspaceRow
+
+function buildPendingCreationRow(
+  creation: PendingCreationRef,
+  repoMap: Map<string, Repo>
+): PendingCreationRow {
+  return {
+    type: 'pending-creation',
+    key: `pending:${creation.creationId}`,
+    creationId: creation.creationId,
+    repo: repoMap.get(creation.repoId)
+  }
+}
 
 type OrderedGroupEntry = [string, { label: string; items: Worktree[]; repo?: Repo }]
 
@@ -87,22 +128,22 @@ export const PR_GROUP_META: Record<
   }
 > = {
   done: {
-    label: 'Done',
+    label: translate('auto.components.sidebar.worktree.list.groups.5076efc3d2', 'Done'),
     icon: ConductorDoneIcon,
     tone: 'text-[#c7a594]'
   },
   'in-review': {
-    label: 'In review',
+    label: translate('auto.components.sidebar.worktree.list.groups.6798dc7c94', 'In review'),
     icon: ConductorReviewIcon,
     tone: 'text-[#16a34a]'
   },
   'in-progress': {
-    label: 'In progress',
+    label: translate('auto.components.sidebar.worktree.list.groups.7c2f009786', 'In progress'),
     icon: ConductorProgressIcon,
     tone: 'text-[#d4a300]'
   },
   closed: {
-    label: 'Closed',
+    label: translate('auto.components.sidebar.worktree.list.groups.682ed5d551', 'Closed'),
     icon: CircleX,
     tone: 'text-zinc-600 dark:text-zinc-300'
   }
@@ -120,7 +161,7 @@ export function getProjectGroupHeaderKey(groupId: string | null): string {
 export const PINNED_GROUP_KEY = 'pinned'
 
 export const PINNED_GROUP_META = {
-  label: 'Pinned',
+  label: translate('auto.components.sidebar.worktree.list.groups.4aeefc5996', 'Pinned'),
   tone: 'text-foreground',
   icon: Pin
 } as const
@@ -128,7 +169,7 @@ export const PINNED_GROUP_META = {
 export const ALL_GROUP_KEY = 'all'
 
 export const ALL_GROUP_META = {
-  label: 'All',
+  label: translate('auto.components.sidebar.worktree.list.groups.0ed04075b8', 'All'),
   tone: 'text-foreground',
   icon: List
 } as const
@@ -506,9 +547,27 @@ export function buildRows(
   settings?: AppState['settings'],
   projectGroups: readonly ProjectGroup[] = [],
   placeholderRepoIds: ReadonlySet<string> = new Set(),
-  importedWorktreesByRepo: ReadonlyMap<string, ImportedWorktreesCardCandidate> = new Map()
+  importedWorktreesByRepo: ReadonlyMap<string, ImportedWorktreesCardCandidate> = new Map(),
+  pendingCreations: readonly PendingCreationRef[] = [],
+  folderWorkspaces: readonly FolderWorkspace[] = []
 ): Row[] {
   const result: Row[] = []
+
+  const pendingByRepo = new Map<string, PendingCreationRef[]>()
+  for (const creation of pendingCreations) {
+    const list = pendingByRepo.get(creation.repoId) ?? []
+    list.push(creation)
+    pendingByRepo.set(creation.repoId, list)
+  }
+
+  // Why: non-repo groupings have no repo section to nest an in-progress create
+  // under, so surface them at the very top (where the old global strip sat)
+  // rather than dropping them. Repo grouping nests them under their repo below.
+  if (groupBy !== 'repo' && pendingCreations.length > 0) {
+    for (const creation of pendingCreations) {
+      result.push(buildPendingCreationRow(creation, repoMap))
+    }
+  }
 
   const visibleUnpinnedRepoIds = new Set(
     worktrees.filter((worktree) => !worktree.isPinned).map((worktree) => worktree.repoId)
@@ -597,6 +656,18 @@ export function buildRows(
       }
     }
   }
+  if (groupBy === 'repo') {
+    for (const repoId of pendingByRepo.keys()) {
+      const key = `repo:${repoId}`
+      if (!grouped.has(key)) {
+        // Why: creating the first worktree in a repo leaves it with no group yet;
+        // ensure one so the in-progress row nests under its repo instead of being
+        // dropped.
+        const repo = repoMap.get(repoId)
+        grouped.set(key, { label: repo?.displayName ?? 'Unknown', items: [], repo })
+      }
+    }
+  }
 
   const orderedGroups: OrderedGroupEntry[] = []
   if (groupBy === 'pr-status') {
@@ -680,10 +751,17 @@ export function buildRows(
 
       result.push(header)
       if (!isCollapsed) {
-        if (groupBy === 'repo' && repo) {
-          const candidate = importedWorktreesByRepo.get(repo.id)
+        if (groupBy === 'repo') {
+          const repoId = repo?.id ?? key.slice('repo:'.length)
+          const candidate = importedWorktreesByRepo.get(repoId)
           if (candidate) {
             result.push(buildImportedWorktreesCardRow(candidate, 'repo-group'))
+          }
+          // Why: surface in-progress creates at the top of their own repo so the
+          // new workspace appears where it will land, not flashed to the very top
+          // of the sidebar.
+          for (const creation of pendingByRepo.get(repoId) ?? []) {
+            result.push(buildPendingCreationRow(creation, repoMap))
           }
         }
         const items = groupBy === 'repo' ? orderMainWorktreeFirst(group.items) : group.items
@@ -736,6 +814,23 @@ export function buildRows(
   }
 
   const projectGroupsById = new Map(projectGroups.map((group) => [group.id, group]))
+  const folderWorkspacesByProjectGroupId = new Map<string, FolderWorkspace[]>()
+  for (const workspace of folderWorkspaces) {
+    const group = projectGroupsById.get(workspace.projectGroupId)
+    if (!group?.parentPath) {
+      continue
+    }
+    const list = folderWorkspacesByProjectGroupId.get(workspace.projectGroupId) ?? []
+    list.push(workspace)
+    folderWorkspacesByProjectGroupId.set(workspace.projectGroupId, list)
+  }
+  for (const list of folderWorkspacesByProjectGroupId.values()) {
+    list.sort((left, right) => {
+      const leftOrder = left.manualOrder ?? left.sortOrder
+      const rightOrder = right.manualOrder ?? right.sortOrder
+      return rightOrder - leftOrder || left.name.localeCompare(right.name)
+    })
+  }
   const childGroupsByParentId = new Map<string | null, ProjectGroup[]>()
   for (const group of projectGroups) {
     const parentId =
@@ -752,10 +847,11 @@ export function buildRows(
 
   const getProjectGroupSubtreeCount = (groupId: string): number => {
     const directCount = groupByProjectGroupId.get(groupId)?.length ?? 0
+    const folderWorkspaceCount = folderWorkspacesByProjectGroupId.get(groupId)?.length ?? 0
     const children = childGroupsByParentId.get(groupId) ?? []
     return children.reduce(
       (count, child) => count + getProjectGroupSubtreeCount(child.id),
-      directCount
+      directCount + folderWorkspaceCount
     )
   }
 
@@ -774,6 +870,16 @@ export function buildRows(
       projectGroupDepth: depth
     })
     if (!collapsedGroups.has(key)) {
+      for (const folderWorkspace of folderWorkspacesByProjectGroupId.get(projectGroup.id) ?? []) {
+        result.push({
+          type: 'folder-workspace',
+          key: `folder-workspace:${folderWorkspace.id}`,
+          folderWorkspace,
+          projectGroup,
+          depth: 0,
+          groupDepth: depth + 1
+        })
+      }
       appendOrderedGroups(withRepoSectionDisplayLabels(repoEntries), depth + 1)
       for (const childGroup of childGroups) {
         appendProjectGroup(childGroup, depth + 1)
