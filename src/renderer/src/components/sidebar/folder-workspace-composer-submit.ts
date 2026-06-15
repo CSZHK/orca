@@ -4,6 +4,7 @@ import {
   type LinkedWorkItemSummary
 } from '@/lib/new-workspace'
 import { getLinkedWorkItemPromptContext } from '@/lib/linked-work-item-context'
+import { isOrcaCliAvailableForLaunch } from '@/lib/orca-cli-launch-availability'
 import { buildAgentStartupPlan } from '@/lib/tui-agent-startup'
 import { tuiAgentToAgentKind } from '@/lib/telemetry'
 import { activateAndRevealFolderWorkspace } from '@/lib/worktree-activation'
@@ -29,6 +30,7 @@ type SubmitFolderWorkspaceCreateParams = {
   linkedWorkItem: LinkedWorkItemSummary | null
   note: string
   quickAgent: TuiAgent | null
+  isRemote: boolean
   autoRenameBranchFromWork: boolean | undefined
   agentCmdOverrides: Record<string, string> | undefined
   createFolderWorkspace: (input: FolderWorkspaceCreateInput) => Promise<FolderWorkspace | null>
@@ -42,6 +44,7 @@ export async function submitFolderWorkspaceCreate({
   linkedWorkItem,
   note,
   quickAgent,
+  isRemote,
   autoRenameBranchFromWork,
   agentCmdOverrides,
   createFolderWorkspace,
@@ -67,7 +70,14 @@ export async function submitFolderWorkspaceCreate({
     return
   }
 
-  const linkedPromptContext = getLinkedWorkItemPromptContext(linkedWorkItem)
+  // Why: launch prompts must not recommend local-only CLI commands when the CLI
+  // is missing; SSH workspaces get the relay-provided shim.
+  const linearCliAvailable = linkedWorkItem?.linearIdentifier
+    ? await isOrcaCliAvailableForLaunch({ remote: isRemote })
+    : false
+  const linkedPromptContext = getLinkedWorkItemPromptContext(linkedWorkItem, {
+    cliAvailable: linearCliAvailable
+  })
   const startupPrompt = buildAgentPromptWithContext(
     note,
     [],

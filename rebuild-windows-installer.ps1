@@ -1,20 +1,19 @@
 <#
-  rebuild-windows-installer.ps1 — 重新打包 Orca 的 Windows 安装包 (NSIS)
+  Rebuild the Orca Windows installer (NSIS).
 
-  为什么需要它:electron-builder 打包前要清空 dist\win-unpacked,但上一个打好的
-  Orca.exe 在运行时会把 d3dcompiler_47.dll 等 DLL 锁住,导致 "Access is denied"。
-  本脚本先关停锁目录的旧 Orca,再清理目录后重新打包。
+  Why: electron-builder clears <OutDir>\win-unpacked before packaging. If an
+  Orca instance launched from that directory still holds DLLs, Windows returns
+  "Access is denied". This script closes only those matching instances, clears
+  the target unpacked directory, then rebuilds.
 
-  ⚠️ 请在【不是跑在 Orca 内】的终端执行(否则关停 Orca 会一并关掉本终端)。
-     推荐用 Windows Terminal / 独立 PowerShell。
-
-  用法:
+  Usage:
     powershell -NoProfile -ExecutionPolicy Bypass -File .\rebuild-windows-installer.ps1
-    参数:
-      -RepackageOnly  跳过编译,复用现有 out/(刚成功编译过时最快,几分钟出包)
-      -Force          跳过关停 Orca 前的确认提示
-      -OutDir <dir>   输出目录(相对仓库根),默认 dist。指定 dist-new 等全新目录可
-                      绕开正在运行的 Orca 对 dist\win-unpacked 的文件锁,无需关停它。
+
+  Parameters:
+    -RepackageOnly  Skip compilation and reuse existing out/ and web build output.
+    -Force          Skip the confirmation before stopping matching Orca processes.
+    -OutDir <dir>   Output directory relative to the repo root. Defaults to dist.
+                    Use dist-new to avoid locks from a running dist\win-unpacked app.
 #>
 [CmdletBinding()]
 param(
@@ -25,52 +24,60 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-# 始终在脚本所在目录(仓库根)下执行,这样 pnpm 能找到 package.json。
+# Run from the repo root so pnpm resolves package.json and local config paths.
 $RepoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $RepoRoot
-Write-Host "仓库根: $RepoRoot" -ForegroundColor Cyan
+Write-Host "Repo root: $RepoRoot" -ForegroundColor Cyan
 
-# pnpm 可用性检查
 if (-not (Get-Command pnpm -ErrorAction SilentlyContinue)) {
-  throw "找不到 pnpm,请先确保已通过 corepack 启用 pnpm 10.24+。"
+  throw "pnpm was not found. Enable corepack and install pnpm 10.24+ first."
 }
 
-# Electron 运行时与 NSIS 工具链默认从 GitHub releases 下载,国内网络会连接超时导致打包中断。
-# 走 npmmirror 镜像;这是两个独立的下载源,必须都配。若用户已自定义则尊重不覆盖。
+# Electron and NSIS downloads default to GitHub releases, which can time out on
+# some networks. Respect caller-provided mirrors and fill in stable defaults.
 if (-not $env:ELECTRON_MIRROR) {
   $env:ELECTRON_MIRROR = 'https://npmmirror.com/mirrors/electron/'
 }
 if (-not $env:ELECTRON_BUILDER_BINARIES_MIRROR) {
   $env:ELECTRON_BUILDER_BINARIES_MIRROR = 'https://npmmirror.com/mirrors/electron-builder-binaries/'
 }
-Write-Host "Electron 镜像: $env:ELECTRON_MIRROR" -ForegroundColor DarkCyan
-Write-Host "Builder 二进制镜像: $env:ELECTRON_BUILDER_BINARIES_MIRROR" -ForegroundColor DarkCyan
+Write-Host "Electron mirror: $env:ELECTRON_MIRROR" -ForegroundColor DarkCyan
+Write-Host "Builder binaries mirror: $env:ELECTRON_BUILDER_BINARIES_MIRROR" -ForegroundColor DarkCyan
 
-# 输出目录可由 -OutDir 覆盖;electron-builder 把它当作 directories.output(相对仓库根)。
+# Why: 7zip-bin's bundled Windows 7za.exe can access-violate on this large
+# package at electron-builder's default -mx=9. Keep the rebuild script reliable
+# while still allowing callers to override the compression level.
+if (-not $env:ELECTRON_BUILDER_COMPRESSION_LEVEL) {
+  $env:ELECTRON_BUILDER_COMPRESSION_LEVEL = '1'
+}
+Write-Host "Builder compression level: $env:ELECTRON_BUILDER_COMPRESSION_LEVEL" -ForegroundColor DarkCyan
+
 $OutDirFull = Join-Path $RepoRoot $OutDir
 $distUnpacked = Join-Path $OutDirFull 'win-unpacked'
-Write-Host "输出目录: $OutDirFull" -ForegroundColor Cyan
+Write-Host "Output directory: $OutDirFull" -ForegroundColor Cyan
 
-# 1) 关停从 <OutDir>\win-unpacked 运行、锁住输出目录的旧 Orca 进程
 $orca = @(Get-Process -Name 'Orca' -ErrorAction SilentlyContinue) | Where-Object {
-  try { $_.Path -and $_.Path.StartsWith($distUnpacked, [System.StringComparison]::OrdinalIgnoreCase) }
-  catch { $false }
+  try {
+    $_.Path -and $_.Path.StartsWith($distUnpacked, [System.StringComparison]::OrdinalIgnoreCase)
+  } catch {
+    $false
+  }
 }
+
 if ($orca.Count -gt 0) {
-  Write-Host "发现 $($orca.Count) 个运行中的 Orca 进程,正锁住 ${distUnpacked}:" -ForegroundColor Yellow
+  Write-Host "Found $($orca.Count) running Orca process(es) locking ${distUnpacked}:" -ForegroundColor Yellow
   $orca | Select-Object Id, Path | Format-Table -AutoSize | Out-Host
   if (-not $Force) {
-    Write-Host "即将结束这些进程。如果本终端就跑在该 Orca 内,请立即按 Ctrl+C。" -ForegroundColor Red
-    [void](Read-Host "按 Enter 关停并继续")
+    Write-Host "These processes will be stopped. Press Ctrl+C now to abort." -ForegroundColor Red
+    [void](Read-Host 'Press Enter to stop them and continue')
   }
   $orca | Stop-Process -Force
   Start-Sleep -Seconds 2
-  Write-Host "已关停旧 Orca。" -ForegroundColor Green
+  Write-Host "Stopped old Orca process(es)." -ForegroundColor Green
 } else {
-  Write-Host "未发现从 $distUnpacked 运行的 Orca,跳过关停。" -ForegroundColor Green
+  Write-Host "No Orca process is running from $distUnpacked; skipping process stop." -ForegroundColor Green
 }
 
-# 2) 删除被锁的旧 win-unpacked,让 electron-builder 能干净地重新打包(带重试,等句柄释放)
 if (Test-Path $distUnpacked) {
   $removed = $false
   foreach ($attempt in 1..5) {
@@ -79,41 +86,43 @@ if (Test-Path $distUnpacked) {
       $removed = $true
       break
     } catch {
-      Write-Host "删除 win-unpacked 失败(第 $attempt 次),2 秒后重试: $($_.Exception.Message)" -ForegroundColor DarkYellow
+      Write-Host "Failed to remove win-unpacked on attempt $attempt; retrying in 2 seconds: $($_.Exception.Message)" -ForegroundColor DarkYellow
       Start-Sleep -Seconds 2
     }
   }
   if (-not $removed) {
-    throw "无法删除 $distUnpacked —— 仍有进程占用。请确认所有 Orca 实例已关闭后重试。"
+    throw "Could not remove $distUnpacked. Close every Orca instance using that directory and retry."
   }
-  Write-Host "已删除旧 dist\win-unpacked。" -ForegroundColor Green
+  Write-Host "Removed old win-unpacked directory." -ForegroundColor Green
 }
 
-# 3) 构建
-# 把输出目录覆盖透传给 electron-builder(directories.output)。完整模式下经由 pnpm 的
-# `--` 分隔符,参数会附加到 build:win 链尾的 electron-builder 命令。
 $outputOverride = "--config.directories.output=$OutDir"
 if ($RepackageOnly) {
-  Write-Host "仅重新打包(复用现有 out/ 与 web 构建)..." -ForegroundColor Cyan
+  Write-Host "Repackaging only; reusing existing build output..." -ForegroundColor Cyan
   & pnpm run ensure:electron-runtime
-  if ($LASTEXITCODE -ne 0) { throw "ensure:electron-runtime 失败 (exit $LASTEXITCODE)" }
+  if ($LASTEXITCODE -ne 0) { throw "ensure:electron-runtime failed (exit $LASTEXITCODE)" }
   & pnpm exec electron-builder --config config/electron-builder.config.cjs --win $outputOverride
-  if ($LASTEXITCODE -ne 0) { throw "electron-builder 失败 (exit $LASTEXITCODE)" }
+  if ($LASTEXITCODE -ne 0) { throw "electron-builder failed (exit $LASTEXITCODE)" }
 } else {
-  Write-Host "完整重建(pnpm build:win:typecheck → relay → cli → electron-vite → web → 打包)..." -ForegroundColor Cyan
-  & pnpm run build:win '--' $outputOverride
-  if ($LASTEXITCODE -ne 0) { throw "build:win 失败 (exit $LASTEXITCODE)" }
+  Write-Host "Full rebuild and Windows packaging..." -ForegroundColor Cyan
+  & pnpm run build:desktop
+  if ($LASTEXITCODE -ne 0) { throw "build:desktop failed (exit $LASTEXITCODE)" }
+  & pnpm run ensure:electron-runtime
+  if ($LASTEXITCODE -ne 0) { throw "ensure:electron-runtime failed (exit $LASTEXITCODE)" }
+  & pnpm exec electron-builder --config config/electron-builder.config.cjs --win $outputOverride
+  if ($LASTEXITCODE -ne 0) { throw "electron-builder failed (exit $LASTEXITCODE)" }
 }
 
-# 4) 输出安装包产物
-Write-Host "`n=== 构建成功。$OutDir\ 下的安装包产物 ===" -ForegroundColor Green
+Write-Host "`n=== Build succeeded. Installer artifact(s) under $OutDir ===" -ForegroundColor Green
 $artifacts = Get-ChildItem -Path $OutDirFull -Filter '*.exe' -File -ErrorAction SilentlyContinue |
   Sort-Object LastWriteTime -Descending
+
 if ($artifacts) {
   $artifacts | Select-Object Name,
-    @{N='SizeMB'; E={ [math]::Round($_.Length / 1MB, 1) }},
-    LastWriteTime, @{N='FullPath'; E={ $_.FullName }} |
+    @{N = 'SizeMB'; E = { [math]::Round($_.Length / 1MB, 1) }},
+    LastWriteTime,
+    @{N = 'FullPath'; E = { $_.FullName }} |
     Format-Table -AutoSize -Wrap | Out-Host
 } else {
-  Write-Host "未在 $OutDir\ 找到 .exe 安装包,请检查上面的构建日志。" -ForegroundColor Yellow
+  Write-Host "No .exe installer was found under $OutDir. Check the build log above." -ForegroundColor Yellow
 }

@@ -20,6 +20,7 @@
     "check:styled-scrollbars": "node config/scripts/check-styled-scrollbars.mjs",
     "check:feature-wall-assets": "node config/scripts/check-feature-wall-assets.mjs",
     "verify:macos-entitlements": "node config/scripts/verify-macos-entitlements.mjs",
+    "ops": "node config/scripts/orca-ops.mjs",
     "vendor:feature-wall-assets": "node config/scripts/vendor-feature-wall-assets.mjs",
     "tc:node": "pnpm run typecheck:node",
     "tc:cli": "pnpm run typecheck:cli",
