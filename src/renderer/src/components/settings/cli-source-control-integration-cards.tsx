@@ -1,13 +1,45 @@
 import { ExternalLink, Github, Gitlab, Terminal } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { useAppStore } from '@/store'
 import { IntegrationCardDetails, IntegrationCardShell } from './integration-card-shell'
+import {
+  useIntegrationCommandRowClass,
+  useIntegrationSubordinateRowClass
+} from './integration-card-presentation'
+import { getProviderAccountScope } from './provider-account-scope'
+import { ProviderHostScopeControl } from './ProviderHostScopeControl'
 import { usePreflightCardStatuses } from './source-control-preflight-card-status'
 import { translate } from '@/i18n/i18n'
+
+function ProviderAccountScopeDetails({
+  children
+}: {
+  children?: React.ReactNode
+}): React.JSX.Element {
+  const settings = useAppStore((s) => s.settings)
+  const accountScope = getProviderAccountScope(settings)
+  const subordinateRowClass = useIntegrationSubordinateRowClass('text-xs')
+
+  return (
+    <IntegrationCardDetails>
+      <ProviderHostScopeControl
+        labelPrefix={translate(
+          'auto.components.settings.cli.source.control.integration.cards.account_scope_prefix',
+          'Account scope'
+        )}
+        scope={accountScope}
+        className={subordinateRowClass}
+      />
+      {children}
+    </IntegrationCardDetails>
+  )
+}
 
 export function GitHubIntegrationCard(): React.JSX.Element {
   const { statuses, unavailable, refresh } = usePreflightCardStatuses('gh')
   const status = unavailable ? 'unavailable' : statuses.ghStatus
   const connected = status === 'connected'
+  const commandRowClass = useIntegrationCommandRowClass()
 
   return (
     <IntegrationCardShell
@@ -43,9 +75,9 @@ export function GitHubIntegrationCard(): React.JSX.Element {
               : 'Not authenticated'
       }
     >
-      {status !== 'checking' && !connected ? (
-        <IntegrationCardDetails>
-          {status === 'unavailable' ? (
+      <ProviderAccountScopeDetails>
+        {status !== 'checking' && !connected ? (
+          status === 'unavailable' ? (
             <>
               <p className="text-xs text-muted-foreground">
                 {translate(
@@ -96,7 +128,7 @@ export function GitHubIntegrationCard(): React.JSX.Element {
                   'The GitHub CLI is installed but not authenticated. Run this command in a terminal:'
                 )}
               </p>
-              <div className="flex items-center gap-2 rounded-md bg-muted/50 px-2.5 py-1.5 font-mono text-xs">
+              <div className={commandRowClass}>
                 <Terminal className="size-3.5 shrink-0 text-muted-foreground" />
                 {translate(
                   'auto.components.settings.cli.source.control.integration.cards.8d90249d22',
@@ -125,9 +157,9 @@ export function GitHubIntegrationCard(): React.JSX.Element {
                 </Button>
               </div>
             </>
-          )}
-        </IntegrationCardDetails>
-      ) : null}
+          )
+        ) : null}
+      </ProviderAccountScopeDetails>
     </IntegrationCardShell>
   )
 }
@@ -136,6 +168,7 @@ export function GitLabIntegrationCard(): React.JSX.Element {
   const { statuses, unavailable, refresh } = usePreflightCardStatuses('glab')
   const status = unavailable ? 'unavailable' : statuses.glabStatus
   const connected = status === 'connected'
+  const commandRowClass = useIntegrationCommandRowClass()
 
   return (
     <IntegrationCardShell
@@ -171,9 +204,9 @@ export function GitLabIntegrationCard(): React.JSX.Element {
               : 'Not authenticated'
       }
     >
-      {status !== 'checking' && !connected ? (
-        <IntegrationCardDetails>
-          {status === 'unavailable' ? (
+      <ProviderAccountScopeDetails>
+        {status !== 'checking' && !connected ? (
+          status === 'unavailable' ? (
             <>
               <p className="text-xs text-muted-foreground">
                 {translate(
@@ -226,7 +259,7 @@ export function GitLabIntegrationCard(): React.JSX.Element {
                   'The GitLab CLI is installed but not authenticated. Run this command in a terminal:'
                 )}
               </p>
-              <div className="flex items-center gap-2 rounded-md bg-muted/50 px-2.5 py-1.5 font-mono text-xs">
+              <div className={commandRowClass}>
                 <Terminal className="size-3.5 shrink-0 text-muted-foreground" />
                 {translate(
                   'auto.components.settings.cli.source.control.integration.cards.707180d09c',
@@ -257,9 +290,9 @@ export function GitLabIntegrationCard(): React.JSX.Element {
                 </Button>
               </div>
             </>
-          )}
-        </IntegrationCardDetails>
-      ) : null}
+          )
+        ) : null}
+      </ProviderAccountScopeDetails>
     </IntegrationCardShell>
   )
 }

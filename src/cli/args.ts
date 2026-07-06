@@ -22,6 +22,7 @@ export const BOOLEAN_FLAGS = new Set([
   'attachments',
   'children',
   'comments',
+  'connect',
   'current',
   'dry-run',
   'enter',
@@ -33,11 +34,16 @@ export const BOOLEAN_FLAGS = new Set([
   'interrupt',
   'json',
   'messages',
+  'me',
   'mobile',
   'mobile-pairing',
   'no-pairing',
+  'parent-current',
+  'provision',
   'ready',
+  'recipe-json',
   'relations',
+  'reinstall',
   'restore-window',
   'return-preamble',
   'run-hooks',
@@ -49,6 +55,18 @@ export const BOOLEAN_FLAGS = new Set([
   'value-stdin',
   'wait'
 ])
+
+export const REPEATED_FLAG_SEPARATOR = '\u0000'
+const REPEATABLE_STRING_FLAGS = new Set(['label'])
+
+function setFlagValue(flags: Map<string, string | boolean>, name: string, value: string): void {
+  const existing = flags.get(name)
+  if (typeof existing === 'string' && REPEATABLE_STRING_FLAGS.has(name)) {
+    flags.set(name, `${existing}${REPEATED_FLAG_SEPARATOR}${value}`)
+    return
+  }
+  flags.set(name, value)
+}
 
 export function parseArgs(argv: string[]): ParsedArgs {
   const commandPath: string[] = []
@@ -67,7 +85,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
     // treats a `--`-leading next token as a new flag, so it can't express one.
     const equalsIndex = assignment.indexOf('=')
     if (equalsIndex !== -1) {
-      flags.set(assignment.slice(0, equalsIndex), assignment.slice(equalsIndex + 1))
+      setFlagValue(flags, assignment.slice(0, equalsIndex), assignment.slice(equalsIndex + 1))
       continue
     }
 
@@ -82,7 +100,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
       flags.set(flag, true)
       continue
     }
-    flags.set(flag, next)
+    setFlagValue(flags, flag, next)
     i += 1
   }
 
@@ -113,6 +131,7 @@ export function supportsBrowserPageFlag(commandPath: string[]): boolean {
   if (
     [
       'automations',
+      'project',
       'repo',
       'worktree',
       'terminal',
@@ -142,6 +161,7 @@ export function isCommandGroup(commandPath: string[]): boolean {
     (commandPath.length === 1 &&
       [
         'automations',
+        'project',
         'repo',
         'worktree',
         'terminal',
@@ -161,7 +181,8 @@ export function isCommandGroup(commandPath: string[]): boolean {
         'agent',
         'environment',
         'diagnostics',
-        'linear'
+        'linear',
+        'vm'
       ].includes(commandPath[0])) ||
     (commandPath.length === 2 && commandPath[0] === 'agent' && commandPath[1] === 'hooks') ||
     (commandPath.length === 2 &&
@@ -176,7 +197,8 @@ export function normalizeCommandPositionals(specs: CommandSpec[], parsed: Parsed
     if (positionalArgs.length === 0) {
       continue
     }
-    if (parsed.commandPath.length !== spec.path.length + positionalArgs.length) {
+    const positionalCount = parsed.commandPath.length - spec.path.length
+    if (positionalCount <= 0 || positionalCount > positionalArgs.length) {
       continue
     }
     if (!matches(parsed.commandPath.slice(0, spec.path.length), spec.path)) {
@@ -186,10 +208,12 @@ export function normalizeCommandPositionals(specs: CommandSpec[], parsed: Parsed
     const values = parsed.commandPath.slice(spec.path.length)
     // Why: validation runs inside main's error-reporting path, so normalization
     // records ambiguity instead of throwing before CLI errors can be formatted.
-    const positionalFlagConflicts = positionalArgs.filter((name) => flags.has(name))
-    positionalArgs.forEach((name, index) => {
+    const providedPositionals = values.map((_, index) => positionalArgs[index])
+    const positionalFlagConflicts = providedPositionals.filter((name) => flags.has(name))
+    values.forEach((value, index) => {
+      const name = positionalArgs[index]
       if (!flags.has(name)) {
-        flags.set(name, values[index])
+        flags.set(name, value)
       }
     })
     return { commandPath: spec.path, flags, positionalFlagConflicts }

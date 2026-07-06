@@ -1,6 +1,3 @@
-/* eslint-disable max-lines -- Why: work-items coverage stays in one file so
-the fan-out mock plumbing (issue + PR gh calls, allSettled handling) does
-not drift across split files. */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const {
@@ -32,12 +29,23 @@ const {
 vi.mock('./gh-utils', () => ({
   execFileAsync: execFileAsyncMock,
   ghExecFileAsync: ghExecFileAsyncMock,
-  githubRepoContext: (repoPath: string, connectionId?: string | null) => ({
+  githubRepoContext: (
+    repoPath: string,
+    connectionId?: string | null,
+    localGitOptions: { wslDistro?: string } = {}
+  ) => ({
     repoPath,
-    connectionId: connectionId ?? null
+    connectionId: connectionId ?? null,
+    ...(localGitOptions.wslDistro ? { wslDistro: localGitOptions.wslDistro } : {})
   }),
-  ghRepoExecOptions: (context: { repoPath: string; connectionId?: string | null }) =>
-    context.connectionId ? {} : { cwd: context.repoPath },
+  ghRepoExecOptions: (context: {
+    repoPath: string
+    connectionId?: string | null
+    wslDistro?: string
+  }) =>
+    context.connectionId
+      ? {}
+      : { cwd: context.repoPath, ...(context.wslDistro ? { wslDistro: context.wslDistro } : {}) },
   getOwnerRepo: getOwnerRepoMock,
   getIssueOwnerRepo: getIssueOwnerRepoMock,
   getOwnerRepoForRemote: getOwnerRepoForRemoteMock,
@@ -64,6 +72,7 @@ import {
   _resetMergeQueueCacheForTests,
   _resetOwnerRepoCache
 } from './client'
+import { GITHUB_WORK_ITEMS_QUERY_MAX_BYTES } from '../../shared/github-work-items-query-bounds'
 
 describe('listWorkItems', () => {
   beforeEach(() => {
@@ -227,7 +236,68 @@ describe('listWorkItems', () => {
     ])
   })
 
-  it('hydrates PR list rows with repository merge method settings', async () => {
+  it('routes local WSL work-item listing through repo resolution and gh execution options', async () => {
+    const localGitOptions = { wslDistro: 'Ubuntu' }
+    resolveIssueSourceMock.mockResolvedValue({
+      source: { owner: 'acme', repo: 'widgets' },
+      fellBack: false
+    })
+    getOwnerRepoMock.mockResolvedValue({ owner: 'acme', repo: 'widgets' })
+    getOwnerRepoForRemoteMock.mockResolvedValue(null)
+    ghExecFileAsyncMock.mockResolvedValue({ stdout: '[]' })
+
+    await listWorkItems(
+      '/repo-root',
+      5,
+      undefined,
+      undefined,
+      undefined,
+      null,
+      false,
+      localGitOptions
+    )
+
+    expect(resolveIssueSourceMock).toHaveBeenCalledWith(
+      '/repo-root',
+      undefined,
+      null,
+      localGitOptions
+    )
+    expect(getOwnerRepoMock).toHaveBeenCalledWith('/repo-root', null, localGitOptions)
+    expect(getOwnerRepoForRemoteMock).toHaveBeenCalledWith(
+      '/repo-root',
+      'upstream',
+      null,
+      localGitOptions
+    )
+    expect(ghExecFileAsyncMock.mock.calls.every((call) => call[1]?.wslDistro === 'Ubuntu')).toBe(
+      true
+    )
+  })
+
+  it('rejects oversized queries before resolving repo sources or executing gh', async () => {
+    const secret = 'main-github-work-items-secret'
+    const oversizedQuery = secret + 'x'.repeat(GITHUB_WORK_ITEMS_QUERY_MAX_BYTES)
+
+    await expect(listWorkItems('/repo-root', 10, oversizedQuery)).resolves.toEqual({
+      items: [],
+      sources: {
+        issues: null,
+        prs: null,
+        originCandidate: null,
+        upstreamCandidate: null
+      }
+    })
+
+    expect(resolveIssueSourceMock).not.toHaveBeenCalled()
+    expect(getIssueOwnerRepoMock).not.toHaveBeenCalled()
+    expect(getOwnerRepoMock).not.toHaveBeenCalled()
+    expect(ghExecFileAsyncMock).not.toHaveBeenCalled()
+    expect(acquireMock).not.toHaveBeenCalled()
+    expect(releaseMock).not.toHaveBeenCalled()
+  })
+
+  it('hydrates PR list rows with repository merge metadata', async () => {
     getIssueOwnerRepoMock.mockResolvedValueOnce({ owner: 'acme', repo: 'widgets' })
     getOwnerRepoMock.mockResolvedValueOnce({ owner: 'acme', repo: 'widgets' })
     ghExecFileAsyncMock
@@ -255,7 +325,8 @@ describe('listWorkItems', () => {
               viewerDefaultMergeMethod: 'REBASE',
               mergeCommitAllowed: false,
               rebaseMergeAllowed: true,
-              squashMergeAllowed: true
+              squashMergeAllowed: true,
+              autoMergeAllowed: false
             }
           }
         })
@@ -272,6 +343,7 @@ describe('listWorkItems', () => {
         rebase: true
       }
     })
+    expect(items[0]?.autoMergeAllowed).toBe(false)
     expect(ghExecFileAsyncMock).toHaveBeenNthCalledWith(
       2,
       expect.arrayContaining(['api', 'graphql', '-f', 'owner=acme', '-f', 'repo=widgets']),
@@ -463,6 +535,20 @@ describe('listWorkItems', () => {
     const apiPath = decodeURIComponent(ghExecFileAsyncMock.mock.calls[0][0][3] as string)
     expect(apiPath).toContain('is:issue is:closed')
     expect(apiPath).not.toContain('-is:merged')
+  })
+
+  it('returns zero for oversized count queries before resolving repo sources', async () => {
+    const secret = 'main-github-work-items-secret'
+    const oversizedQuery = secret + 'x'.repeat(GITHUB_WORK_ITEMS_QUERY_MAX_BYTES)
+
+    await expect(countWorkItems('/repo-root', oversizedQuery)).resolves.toBe(0)
+
+    expect(resolveIssueSourceMock).not.toHaveBeenCalled()
+    expect(getIssueOwnerRepoMock).not.toHaveBeenCalled()
+    expect(getOwnerRepoMock).not.toHaveBeenCalled()
+    expect(ghExecFileAsyncMock).not.toHaveBeenCalled()
+    expect(acquireMock).not.toHaveBeenCalled()
+    expect(releaseMock).not.toHaveBeenCalled()
   })
 
   it('passes review-requested as a --search qualifier (gh CLI has no dedicated flag)', async () => {

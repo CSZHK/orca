@@ -24,12 +24,16 @@ import { createBrowserSlice } from './slices/browser'
 import { createRateLimitSlice } from './slices/rate-limits'
 import { createSshSlice } from './slices/ssh'
 import { createAgentStatusSlice } from './slices/agent-status'
+import { createPaneForegroundAgentSlice } from './slices/pane-foreground-agent'
 import { createDiffCommentsSlice } from './slices/diffComments'
 import { createDetectedAgentsSlice } from './slices/detected-agents'
 import { createWorktreeNavHistorySlice } from './slices/worktree-nav-history'
 import { createDictationSlice } from './slices/dictation'
 import { createWorkspaceCleanupSlice } from './slices/workspace-cleanup'
+import { createRuntimeStatusSlice } from './slices/runtime-status'
 import { createPullRequestGenerationSlice } from './slices/pull-request-generation'
+import { createCommitMessageGenerationSlice } from './slices/commit-message-generation'
+import { createPinnedTabCloseConfirmSlice } from './slices/pinned-tab-close-confirm'
 import { e2eConfig } from '@/lib/e2e-config'
 import { registerHttpLinkStoreAccessor } from '@/lib/http-link-routing'
 
@@ -58,12 +62,16 @@ export const useAppStore = create<AppState>()((...a) => ({
   ...createRateLimitSlice(...a),
   ...createSshSlice(...a),
   ...createAgentStatusSlice(...a),
+  ...createPaneForegroundAgentSlice(...a),
   ...createDiffCommentsSlice(...a),
   ...createDetectedAgentsSlice(...a),
   ...createWorktreeNavHistorySlice(...a),
   ...createDictationSlice(...a),
   ...createWorkspaceCleanupSlice(...a),
-  ...createPullRequestGenerationSlice(...a)
+  ...createRuntimeStatusSlice(...a),
+  ...createPullRequestGenerationSlice(...a),
+  ...createCommitMessageGenerationSlice(...a),
+  ...createPinnedTabCloseConfirmSlice(...a)
 }))
 
 registerHttpLinkStoreAccessor(() => useAppStore.getState())

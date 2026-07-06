@@ -7,6 +7,9 @@ export type ChecksPanelGitStatusContextInput = {
   branch: string
   linkedGitHubPR?: number | null
   linkedGitLabMR?: number | null
+  linkedBitbucketPR?: number | null
+  linkedAzureDevOpsPR?: number | null
+  linkedGiteaPR?: number | null
   runtimeEnvironmentId: string | null
   repoConnectionId: string | null
   pushTarget: GitPushTarget | null | undefined
@@ -16,12 +19,29 @@ export type ChecksPanelGitStatusSnapshot = {
   contextKey: string
   hasUncommittedChanges: boolean
   remoteStatus: GitUpstreamStatus | undefined
+  gitIdentity?: {
+    head?: string
+    branch?: string | null
+  }
 }
 
 export type ChecksPanelGitStatusInputs = {
   hasUncommittedChanges: boolean | undefined
   remoteStatus: GitUpstreamStatus | undefined
 }
+
+export type ChecksPanelRefreshGitIdentitySnapshot =
+  | {
+      kind: 'missing'
+    }
+  | {
+      kind: 'same'
+    }
+  | {
+      kind: 'changed'
+      head?: string
+      branch: string | null
+    }
 
 export function buildChecksPanelGitStatusContextKey(
   input: ChecksPanelGitStatusContextInput
@@ -35,6 +55,9 @@ export function buildChecksPanelGitStatusContextKey(
     // make pre-change PR refreshes stale even when repo/branch are unchanged.
     linkedGitHubPR: input.linkedGitHubPR ?? null,
     linkedGitLabMR: input.linkedGitLabMR ?? null,
+    linkedBitbucketPR: input.linkedBitbucketPR ?? null,
+    linkedAzureDevOpsPR: input.linkedAzureDevOpsPR ?? null,
+    linkedGiteaPR: input.linkedGiteaPR ?? null,
     runtimeEnvironmentId: input.runtimeEnvironmentId ?? '',
     repoConnectionId: input.repoConnectionId ?? '',
     pushTarget: input.pushTarget
@@ -111,4 +134,45 @@ export function readChecksPanelPublishActionGitStatus(input: {
     hasUncommittedChanges: (input.fallbackEntries?.length ?? 0) > 0,
     remoteStatus: input.fallbackRemoteStatus
   }
+}
+
+function canonicalBranchIdentity(branch: string | null | undefined): string {
+  return (branch ?? '').replace(/^refs\/heads\//, '').trim()
+}
+
+export function readChecksPanelRefreshGitIdentitySnapshot(input: {
+  snapshot: ChecksPanelGitStatusSnapshot | null
+  contextKey: string
+  currentBranch: string
+}): ChecksPanelRefreshGitIdentitySnapshot {
+  if (
+    !input.snapshot ||
+    input.snapshot.contextKey !== input.contextKey ||
+    !input.snapshot.gitIdentity ||
+    input.snapshot.gitIdentity.branch === undefined
+  ) {
+    return { kind: 'missing' }
+  }
+
+  if (
+    canonicalBranchIdentity(input.snapshot.gitIdentity.branch) ===
+    canonicalBranchIdentity(input.currentBranch)
+  ) {
+    return { kind: 'same' }
+  }
+
+  return {
+    kind: 'changed',
+    head: input.snapshot.gitIdentity.head,
+    branch: input.snapshot.gitIdentity.branch
+  }
+}
+
+export function hasChecksPanelGitStatusBranchChanged(input: {
+  observedBranch: string | null | undefined
+  currentBranch: string
+}): boolean {
+  return (
+    canonicalBranchIdentity(input.observedBranch) !== canonicalBranchIdentity(input.currentBranch)
+  )
 }

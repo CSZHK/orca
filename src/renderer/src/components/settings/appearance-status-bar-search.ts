@@ -162,11 +162,46 @@ export const getStatusBarToggles = createLocalizedCatalog(
       )
     },
     {
+      id: 'minimax',
+      title: translate('auto.components.settings.appearance.search.0f08f6b483', 'MiniMax Usage'),
+      description: translate(
+        'auto.components.settings.appearance.search.e46178eb1b',
+        'Show MiniMax subscription usage in the status bar.'
+      ),
+      keywords: [
+        ...translateSearchKeyword(
+          'auto.components.settings.appearance.search.896eb53fd4',
+          'status bar'
+        ),
+        ...translateSearchKeyword(
+          'auto.components.settings.appearance.search.d16378a88f',
+          'minimax'
+        ),
+        ...translateSearchKeyword('auto.components.settings.appearance.search.00a028f25f', 'usage'),
+        ...translateSearchKeyword(
+          'auto.components.settings.appearance.search.de586def95',
+          'subscription'
+        ),
+        ...translateSearchKeyword(
+          'auto.components.settings.appearance.search.d9e7cef86f',
+          'cookie'
+        ),
+        ...translateSearchKeyword(
+          'auto.components.settings.appearance.search.25e51b62ee',
+          'rate limit'
+        )
+      ],
+      toggleDescription: translate(
+        'settings.appearance.statusBar.minimaxToggleDescription',
+        'Show MiniMax subscription usage for the active workspace.'
+      )
+    },
+    {
       id: 'ssh',
-      title: translate('auto.components.settings.appearance.search.57fb424c56', 'SSH Status'),
+      title: translate('auto.components.settings.appearance.search.57fb424c56', 'Remote Hosts'),
       description: translate(
         'auto.components.settings.appearance.search.f17d66d0d2',
-        'Show the active SSH connection status in the status bar.'
+        'Show remote host connection status in the status bar.'
       ),
       keywords: [
         ...translateSearchKeyword(
@@ -186,7 +221,7 @@ export const getStatusBarToggles = createLocalizedCatalog(
       ],
       toggleDescription: translate(
         'settings.appearance.statusBar.sshToggleDescription',
-        'Show the active SSH connection. Only visible once an SSH target is configured.'
+        'Show configured SSH and remote Orca hosts when any are available.'
       )
     },
     {

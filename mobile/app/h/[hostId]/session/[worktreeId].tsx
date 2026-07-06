@@ -1,12 +1,12 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
-import { Animated, AppState, type AppStateStatus } from 'react-native'
+import { Animated, AppState, Linking, type AppStateStatus } from 'react-native'
 import * as Clipboard from 'expo-clipboard'
 import {
   BackHandler,
   FlatList,
+  Image,
   View,
   Text,
-  StyleSheet,
   ScrollView,
   TextInput,
   Pressable,
@@ -14,6 +14,7 @@ import {
   Platform,
   ActivityIndicator,
   type KeyboardEvent,
+  type LayoutChangeEvent,
   type ListRenderItem
 } from 'react-native'
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context'
@@ -34,8 +35,8 @@ import {
   GitBranch,
   Globe,
   Keyboard as KeyboardIcon,
+  ListChecks,
   MessageSquare,
-  Mic,
   Monitor,
   Plus,
   RefreshCw,
@@ -47,12 +48,29 @@ import {
 import type { RpcClient } from '../../../../src/transport/rpc-client'
 import { loadHosts } from '../../../../src/transport/host-store'
 import {
+  loadTerminalAutocompleteEnabled,
+  loadTerminalLinkOpenMode,
+  loadTerminalTextScale,
+  HOST_DOCK_MIN_WIDTH,
+  saveTerminalTextScale,
+  type MobileTerminalLinkOpenMode
+} from '../../../../src/storage/preferences'
+import {
   useHostClient,
   useForceReconnect,
   useReconnectAttempt,
   useLastConnectedAt
 } from '../../../../src/transport/client-context'
 import { classifyConnection } from '../../../../src/transport/connection-health'
+import { useResponsiveLayout } from '../../../../src/layout/responsive-layout'
+import {
+  type ActivePanel,
+  canDockSessionPanel,
+  resolvePanelAction,
+  panelRouteDescriptor
+} from '../../../../src/session/session-panel-host'
+import { useMobilePrBranchContext } from '../../../../src/session/use-mobile-pr-branch-context'
+import { SessionDockColumn } from '../../../../src/session/SessionDockColumn'
 import type { ConnectionState, RpcFailure, RpcSuccess } from '../../../../src/transport/types'
 import { useMobileDictation } from '../../../../src/hooks/use-mobile-dictation'
 import {
@@ -62,28 +80,45 @@ import {
   triggerError,
   triggerEdgeBump
 } from '../../../../src/platform/haptics'
-import {
-  TerminalWebView,
-  type TerminalKeyboardAvoidanceMetrics,
-  type MobileTerminalTheme,
-  type TerminalModes,
-  type TerminalWebViewHandle
+import type {
+  TerminalKeyboardAvoidanceMetrics,
+  TerminalModes,
+  TerminalWebViewHandle
 } from '../../../../src/terminal/TerminalWebView'
+import { isTerminalOscLinkRanges } from '../../../../src/terminal/terminal-osc-link-ranges'
 import { useTerminalViewportRefit } from '../../../../src/terminal/terminal-viewport-refit'
 import {
   getDefaultTerminalAccessoryBuiltInIds,
   getVisibleTerminalAccessoryKeys,
   loadTerminalAccessoryLayout
 } from '../../../../src/terminal/terminal-accessory-layout'
+import { createTerminalLiveAccessoryInput } from '../../../../src/terminal/terminal-live-accessory-input'
+import { getTerminalLiveAccessoryRawSendTarget } from '../../../../src/terminal/terminal-live-accessory-raw-send-target'
 import {
   clearTerminalLiveInputFocusTimer,
-  getTerminalLiveSpecialKeyBytes,
+  focusTerminalLiveInputTarget,
   isTerminalLiveInputWithinByteLimit,
   scheduleTerminalLiveInputFocus
 } from '../../../../src/terminal/terminal-live-input'
+import type { TerminalLiveInputSender } from '../../../../src/terminal/terminal-live-input-sender'
+import { isTerminalSendRpcAccepted } from '../../../../src/terminal/terminal-send-rpc-response'
+import { useTerminalLiveInputCommit } from '../../../../src/terminal/use-terminal-live-input-commit'
+import {
+  getTerminalCommandKeyboardType,
+  getTerminalLiveInputKeyboardType
+} from '../../../../src/terminal/terminal-keyboard-type'
+import { normalizeTerminalTextInput } from '../../../../src/terminal/terminal-text-input-normalization'
+import {
+  appendBufferedDictation,
+  routeDictationTranscript
+} from '../../../../src/terminal/terminal-live-dictation-routing'
 import { countTerminalGestureInputSequences } from '../../../../src/terminal/terminal-gesture-input'
-import { MobileBrowserPane, type MobileBrowserTab } from '../../../../src/browser/MobileBrowserPane'
-import { isBlankBrowserUrl, normalizeBrowserUrl } from '../../../../src/browser/browser-url'
+import {
+  recoverActiveTerminalAfterForeground,
+  shouldRecoverTerminalOnAppStateChange
+} from '../../../../src/terminal/terminal-foreground-recovery'
+import { MobileBrowserPane } from '../../../../src/browser/MobileBrowserPane'
+import { normalizeBrowserUrl } from '../../../../src/browser/browser-url'
 import { StatusDot } from '../../../../src/components/StatusDot'
 import { ActionSheetModal } from '../../../../src/components/ActionSheetModal'
 import { MobileAgentIcon } from '../../../../src/components/MobileAgentIcon'
@@ -97,10 +132,7 @@ import {
   saveCustomKeys,
   type CustomKey
 } from '../../../../src/components/CustomKeyModal'
-import {
-  buildMobileDiffLines,
-  type MobileDiffLine
-} from '../../../../src/session/mobile-diff-lines'
+import { buildMobileDiffLines } from '../../../../src/session/mobile-diff-lines'
 import {
   addMobileDiffComment,
   formatDiffComments,
@@ -112,144 +144,95 @@ import {
   buildPlainMobileDiffSyntaxLines,
   highlightMobileCode,
   highlightMobileDiffLines,
-  resolveMobileSyntaxLanguage,
-  type MobileHighlightedDiffLine,
-  type MobileSyntaxSegment
+  resolveMobileSyntaxLanguage
 } from '../../../../src/session/mobile-file-syntax'
 import {
   getTerminalRecordsFromSessionTabs,
   mergeTerminalListWithKnownRecords,
   mergeTerminalRecordsByCurrentOrder,
   mobileSessionTabsEqual,
-  terminalRecordsEqual,
-  type TerminalRecord
+  terminalRecordsEqual
 } from '../../../../src/session/mobile-terminal-records'
+import {
+  getMobileSessionTabTitle,
+  resolveMobileTerminalTabAgentId
+} from '../../../../src/session/mobile-terminal-tab-agent'
 import {
   buildMobileNewTabAgentOptions,
   type MobileNewTabAgentOption,
   type MobileNewTabAgentSettings
 } from '../../../../src/session/mobile-new-tab-agent-options'
+import { useMobileImageAttachment } from '../../../../src/session/use-mobile-image-attachment'
+import { useMobileTerminalPaste } from '../../../../src/session/use-mobile-terminal-paste'
+import { useTerminalLiveInputModePreference } from '../../../../src/session/use-terminal-live-input-mode-preference'
+import { MobileTerminalLiveInputStatus } from '../../../../src/session/MobileTerminalLiveInputStatus'
+import { MobileTerminalInputActions } from '../../../../src/session/MobileTerminalInputActions'
+import { classifyMobileArtifact } from '../../../../src/session/mobile-artifact-kind'
+import { openMobileTerminalFileTap } from '../../../../src/session/mobile-terminal-file-tap-open'
+import { useLiveWorktreeName } from '../../../../src/session/use-live-worktree-name'
+import {
+  acceptSessionSnapshot,
+  applyClosedTabTombstones,
+  type AppliedSnapshotMarker
+} from '../../../../src/session/session-tab-snapshot-gate'
+import {
+  buildMarkdownDiskFallbackDoc,
+  shouldReadMarkdownFromDiskAfterReadTabFailure
+} from '../../../../src/session/mobile-markdown-disk-fallback'
+import { MobileHtmlPreview } from '../../../../src/components/MobileHtmlPreview'
+import { MobileDictationSetupSheet } from '../../../../src/components/MobileDictationSetupSheet'
+import {
+  fetchDictationSetup,
+  isDictationSetupRequiredError
+} from '../../../../src/dictation/mobile-dictation-setup'
+import { TerminalPaneView } from '../../../../src/session/TerminalPaneView'
+import {
+  getRepoIdFromMobileWorktreeId,
+  isFileExistsErrorMessage,
+  isGestureMouseTrackingMode,
+  MOBILE_SESSION_STATUS_LABELS,
+  TERMINAL_GESTURE_INPUT_BUCKET_CAPACITY,
+  TERMINAL_GESTURE_INPUT_FLUSH_DELAY_MS,
+  TERMINAL_GESTURE_INPUT_MAX_PENDING_SEQUENCES,
+  TERMINAL_GESTURE_INPUT_MAX_QUEUE_AGE_MS,
+  TERMINAL_GESTURE_INPUT_REFILL_PER_SECOND
+} from '../../../../src/session/mobile-session-route-helpers'
 import { resolveMarkdownFloatingActionsBottom } from '../../../../src/session/markdown-floating-actions-layout'
+import { resolveTabStripScrollOffset } from '../../../../src/session/tab-strip-scroll'
+import { activateOpenedSourceControlDiffTab } from '../../../../src/session/opened-mobile-session-tab'
 import {
   createMobileSessionCreateWarningState,
   dismissMobileSessionCreateWarningState,
   reconcileMobileSessionCreateWarningState
 } from '../../../../src/session/mobile-session-create-warning-state'
-import { colors, spacing, radii, typography } from '../../../../src/theme/mobile-theme'
+import { colors, spacing } from '../../../../src/theme/mobile-theme'
+import { styles } from './mobile-session-styles'
 import type { DiffComment } from '../../../../../src/shared/types'
-import type { AgentStatusEntry } from '../../../../../src/shared/agent-status-types'
+import type {
+  DiffCommentActions,
+  DiffNotesDelivery,
+  DiffSyntaxState,
+  DirtyMarkdownDraft,
+  FileDocState,
+  FileSyntaxState,
+  MarkdownDocState,
+  MobileDisplayMode,
+  MobileNewTabAgentLoadState,
+  MobileSessionTab,
+  MobileSessionTabType,
+  RenderableDiffLine,
+  RuntimeRepoSummary,
+  RuntimeStatusResult,
+  SessionTabsResult,
+  Terminal,
+  TerminalCreateResult,
+  TerminalGestureInputBucket,
+  TerminalGestureInputQueue
+} from './mobile-session-route-types'
 
-type Terminal = TerminalRecord
+type TerminalLiveAccessoryInput = ReturnType<typeof createTerminalLiveAccessoryInput>
 
-type MobileSessionTabType = 'terminal' | 'markdown' | 'file' | 'browser'
-
-type MobileSessionTab =
-  | {
-      type: 'terminal'
-      id: string
-      title: string
-      parentTabId?: string
-      leafId?: string
-      status?: 'pending-handle' | 'ready'
-      terminal: string | null
-      agentStatus?: AgentStatusEntry | null
-      terminalTheme?: MobileTerminalTheme
-      isActive: boolean
-    }
-  | {
-      type: 'markdown'
-      id: string
-      title: string
-      filePath: string
-      relativePath: string
-      isDirty: boolean
-      isActive: boolean
-      documentVersion: string
-    }
-  | {
-      type: 'file'
-      id: string
-      title: string
-      filePath: string
-      relativePath: string
-      language?: string
-      mode?: 'edit' | 'diff'
-      diffSource?: 'staged' | 'unstaged' | 'branch' | 'commit'
-      isDirty: boolean
-      isActive: boolean
-    }
-  | MobileBrowserTab
-
-type SessionTabsResult = {
-  worktree: string
-  publicationEpoch?: string
-  snapshotVersion: number
-  tabs: MobileSessionTab[]
-  activeTabId: string | null
-  activeTabType: MobileSessionTabType | null
-}
-
-type RuntimeStatusResult = {
-  capabilities?: string[]
-}
-
-type MarkdownDocState =
-  | { status: 'loading' }
-  | {
-      status: 'ready'
-      content: string
-      localContent: string
-      baseVersion: string
-      isDirty: boolean
-      editable: boolean
-      stale?: boolean
-      saving?: boolean
-      saveError?: string
-      readOnlyReason?: string
-    }
-  | { status: 'error'; message: string }
-
-type FileDocState =
-  | { status: 'loading' }
-  | { status: 'ready'; kind: 'file'; content: string; truncated: boolean; byteLength: number }
-  | { status: 'ready'; kind: 'diff'; lines: MobileDiffLine[]; truncated: boolean }
-  | { status: 'error'; message: string }
-
-type RenderableDiffLine = MobileHighlightedDiffLine<MobileDiffLine>
-
-type DiffCommentActions = {
-  comments: DiffComment[]
-  busy: boolean
-  onAdd: (filePath: string, lineNumber: number, body: string) => Promise<boolean>
-  onDelete: (commentId: string) => Promise<void>
-  onCopyAll: () => Promise<void>
-  onSendAll: () => void
-}
-
-type DiffNotesDelivery = {
-  prompt: string
-  comments: DiffComment[]
-}
-
-type ReadyFileDocState = Extract<FileDocState, { status: 'ready' }>
-
-type FileSyntaxState = {
-  doc: ReadyFileDocState
-  language: string
-  segments: MobileSyntaxSegment[]
-}
-
-type DiffSyntaxState = {
-  doc: ReadyFileDocState
-  language: string
-  lines: RenderableDiffLine[]
-}
-
-type DirtyMarkdownDraft = {
-  tabId: string
-  title: string
-  content: string
-}
+const TERMINAL_KEYBOARD_DISMISS_ACTION_SHEET_FALLBACK_MS = 450
 
 function getActiveTabIdForHandle(
   tabs: MobileSessionTab[],
@@ -263,151 +246,6 @@ function getActiveTabIdForHandle(
       (tab): tab is Extract<MobileSessionTab, { type: 'terminal' }> =>
         tab.type === 'terminal' && tab.terminal === terminalHandle
     )?.id ?? terminalHandle
-  )
-}
-
-function getMobileSessionTabTitle(tab: MobileSessionTab): string {
-  if (tab.type === 'browser') {
-    const title = tab.title.trim()
-    if (title && !isBlankBrowserUrl(title)) {
-      return title
-    }
-    if (isBlankBrowserUrl(tab.url)) {
-      return 'New Browser'
-    }
-    return 'Browser'
-  }
-  if (tab.type === 'markdown') {
-    return tab.title || 'Markdown'
-  }
-  if (tab.type === 'file') {
-    return tab.title || 'File'
-  }
-  return tab.title || 'Terminal'
-}
-
-function isFileExistsErrorMessage(message: string): boolean {
-  const normalized = message.toLowerCase()
-  return normalized.includes('eexist') || normalized.includes('already exists')
-}
-
-type TerminalCreateResult = {
-  tab: Extract<MobileSessionTab, { type: 'terminal' }>
-}
-
-type MobileNewTabAgentLoadState = 'idle' | 'loading' | 'loaded' | 'error'
-
-type RuntimeRepoSummary = {
-  id: string
-  connectionId?: string | null
-}
-
-function getRepoIdFromMobileWorktreeId(id: string): string {
-  // Why: mobile cannot import desktop shared modules in its standalone tsc run,
-  // but the runtime worktree id wire format is still `${repoId}::${path}`.
-  const separatorIdx = id.indexOf('::')
-  return separatorIdx === -1 ? id : id.slice(0, separatorIdx)
-}
-
-type MobileDisplayMode = 'auto' | 'phone' | 'desktop'
-
-const STATUS_LABELS: Record<ConnectionState, string> = {
-  connecting: 'Connecting',
-  handshaking: 'Securing',
-  connected: 'Connected',
-  disconnected: 'Disconnected',
-  reconnecting: 'Reconnecting',
-  'auth-failed': 'Auth failed'
-}
-
-const TERMINAL_GESTURE_INPUT_BUCKET_CAPACITY = 64
-const TERMINAL_GESTURE_INPUT_REFILL_PER_SECOND = 120
-const TERMINAL_GESTURE_INPUT_FLUSH_DELAY_MS = 16
-const TERMINAL_GESTURE_INPUT_MAX_PENDING_SEQUENCES = 32
-const TERMINAL_GESTURE_INPUT_MAX_QUEUE_AGE_MS = 250
-
-type TerminalGestureInputBucket = {
-  tokens: number
-  lastRefillMs: number
-}
-
-type TerminalGestureInputQueue = {
-  bytes: string
-  sequenceCount: number
-  timer: ReturnType<typeof setTimeout> | null
-  lastUpdatedMs: number
-}
-
-function isWheelMouseTrackingMode(mode: TerminalModes['mouseTrackingMode'] | undefined): boolean {
-  return mode === 'vt200' || mode === 'drag' || mode === 'any'
-}
-
-function isGestureMouseTrackingMode(mode: TerminalModes['mouseTrackingMode'] | undefined): boolean {
-  return mode === 'x10' || isWheelMouseTrackingMode(mode)
-}
-
-function TerminalPaneView({
-  handle,
-  active,
-  keyboardLift,
-  terminalTheme,
-  onRef,
-  onWebReady,
-  onSelectionMode,
-  onSelectionCopy,
-  onSelectionEvicted,
-  onModesChanged,
-  onKeyboardAvoidanceMetrics,
-  onHaptic,
-  onTerminalInput,
-  onTerminalTap
-}: {
-  handle: string
-  active: boolean
-  keyboardLift: number
-  terminalTheme?: MobileTerminalTheme
-  onRef: (handle: string, ref: TerminalWebViewHandle | null) => void
-  onWebReady: (handle: string) => void
-  onSelectionMode: (handle: string, active: boolean) => void
-  onSelectionCopy: (handle: string, text: string) => void
-  onSelectionEvicted: (handle: string) => void
-  onModesChanged: (handle: string, modes: TerminalModes) => void
-  onKeyboardAvoidanceMetrics: (handle: string, metrics: TerminalKeyboardAvoidanceMetrics) => void
-  onHaptic: (kind: 'selection' | 'success' | 'error' | 'edge-bump') => void
-  onTerminalInput: (handle: string, bytes: string) => void
-  onTerminalTap: (handle: string) => void
-}) {
-  const setRef = useCallback(
-    (ref: TerminalWebViewHandle | null) => {
-      onRef(handle, ref)
-    },
-    [handle, onRef]
-  )
-
-  return (
-    <View
-      pointerEvents={active ? 'auto' : 'none'}
-      style={[
-        styles.terminalPane,
-        keyboardLift > 0 && { transform: [{ translateY: -keyboardLift }] },
-        !active && styles.terminalPaneHidden
-      ]}
-    >
-      <TerminalWebView
-        ref={setRef}
-        style={styles.terminalWebView}
-        terminalTheme={terminalTheme}
-        onWebReady={() => onWebReady(handle)}
-        onSelectionMode={(a) => onSelectionMode(handle, a)}
-        onSelectionCopy={(t) => onSelectionCopy(handle, t)}
-        onSelectionEvicted={() => onSelectionEvicted(handle)}
-        onModesChanged={(m) => onModesChanged(handle, m)}
-        onKeyboardAvoidanceMetrics={(m) => onKeyboardAvoidanceMetrics(handle, m)}
-        onHaptic={onHaptic}
-        onTerminalInput={(bytes) => onTerminalInput(handle, bytes)}
-        onTerminalTap={() => onTerminalTap(handle)}
-      />
-    </View>
   )
 }
 
@@ -430,6 +268,10 @@ function MarkdownReader({
   onDiscard: () => void
   keyboardLift: number
 }) {
+  // The editor lives in a WebView; native Keyboard events under-report its
+  // covered area, so prefer the inset measured inside the WebView when larger.
+  const [webviewKeyboardInset, setWebviewKeyboardInset] = useState(0)
+  const effectiveKeyboardLift = Math.max(keyboardLift, webviewKeyboardInset)
   if (!doc || doc.status === 'loading') {
     return (
       <View style={styles.markdownState}>
@@ -468,6 +310,7 @@ function MarkdownReader({
         content={doc.localContent}
         editable={doc.editable && !doc.saving}
         onChange={onChange}
+        onKeyboardInsetChange={setWebviewKeyboardInset}
       />
       {showFloatingActions ? (
         <View
@@ -478,7 +321,7 @@ function MarkdownReader({
             // Save/Discard controls lifted instead of resizing that surface.
             {
               bottom: resolveMarkdownFloatingActionsBottom({
-                keyboardLift,
+                keyboardLift: effectiveKeyboardLift,
                 restingBottom: spacing.lg,
                 liftedClearance: spacing.md
               })
@@ -791,7 +634,8 @@ function FileReader({
     // Why: highlighting can create many nested Text nodes; defer it one tick so
     // large files show immediately as plain text before colors are applied.
     const timer = setTimeout(() => {
-      if (doc.kind === 'file') {
+      // file + html share the syntax-segment source view (html's "Source" toggle).
+      if (doc.kind === 'file' || doc.kind === 'html') {
         setFileSyntax({
           doc,
           language: syntaxLanguage,
@@ -799,11 +643,14 @@ function FileReader({
         })
         return
       }
-      setDiffSyntax({
-        doc,
-        language: syntaxLanguage,
-        lines: highlightMobileDiffLines(doc.lines, syntaxLanguage)
-      })
+      if (doc.kind === 'diff') {
+        setDiffSyntax({
+          doc,
+          language: syntaxLanguage,
+          lines: highlightMobileDiffLines(doc.lines, syntaxLanguage)
+        })
+      }
+      // image: no syntax highlighting.
     }, 0)
 
     return () => clearTimeout(timer)
@@ -891,7 +738,28 @@ function FileReader({
     )
   }
 
-  return (
+  if (doc.kind === 'image') {
+    return (
+      <View style={styles.imagePreviewContainer}>
+        <ScrollView
+          style={styles.imagePreviewScroll}
+          contentContainerStyle={styles.imagePreviewContent}
+          maximumZoomScale={4}
+          minimumZoomScale={1}
+          centerContent
+        >
+          <Image
+            source={{ uri: doc.dataUri }}
+            style={styles.imagePreview}
+            resizeMode="contain"
+            accessibilityLabel={`${title} image`}
+          />
+        </ScrollView>
+      </View>
+    )
+  }
+
+  const renderSourceText = (content: string) => (
     <View style={styles.markdownEditor}>
       <ScrollView
         style={styles.filePreviewScroll}
@@ -902,20 +770,45 @@ function FileReader({
             segments={
               fileSyntax?.doc === doc && fileSyntax.language === syntaxLanguage
                 ? fileSyntax.segments
-                : [{ text: doc.content, kind: 'plain' }]
+                : [{ text: content, kind: 'plain' }]
             }
           />
         </Text>
       </ScrollView>
     </View>
   )
+
+  if (doc.kind === 'html') {
+    return (
+      <View style={styles.markdownEditor}>
+        <MobileHtmlPreview html={doc.content} renderSource={() => renderSourceText(doc.content)} />
+      </View>
+    )
+  }
+
+  return renderSourceText(doc.content)
+}
+
+function updateTerminalCwdFromStreamEvent(
+  handle: string,
+  data: Record<string, unknown>,
+  terminalCwd: Map<string, string>
+): void {
+  if (!('cwd' in data)) {
+    return
+  }
+  if (typeof data.cwd === 'string' && data.cwd.trim().length > 0) {
+    terminalCwd.set(handle, data.cwd)
+    return
+  }
+  terminalCwd.delete(handle)
 }
 
 export default function SessionScreen() {
   const {
     hostId,
     worktreeId,
-    name: worktreeName,
+    name: routeWorktreeName,
     created,
     warning: createdWarning
   } = useLocalSearchParams<{
@@ -925,6 +818,7 @@ export default function SessionScreen() {
     created?: string
     warning?: string
   }>()
+  const isFolderWorkspaceRoute = worktreeId.startsWith('folder:')
   const router = useRouter()
   const insets = useSafeAreaInsets()
   // Why: shared client per host owned by RpcClientProvider. See
@@ -933,20 +827,93 @@ export default function SessionScreen() {
   const reconnectAttempts = useReconnectAttempt(hostId)
   const lastConnectedAt = useLastConnectedAt(hostId)
   const forceReconnectHost = useForceReconnect()
+  const worktreeName = useLiveWorktreeName({
+    client,
+    connState,
+    routeName: routeWorktreeName,
+    worktreeId
+  })
+  // Master-detail host state (U5/KTD2): on wide layouts a tapped panel docks beside the
+  // session content; on narrow it stays null and the icons push full-screen routes.
+  const { isWideLayout } = useResponsiveLayout()
+  const [activePanel, setActivePanel] = useState<ActivePanel>(null)
+  const [sessionContentRowWidth, setSessionContentRowWidth] = useState(0)
+  const canDockPanel = canDockSessionPanel({
+    isWideLayout,
+    availableWidth: sessionContentRowWidth,
+    dockWidth: HOST_DOCK_MIN_WIDTH
+  })
+  // Why: docking needs enough measured row width. If rotation/split-screen makes
+  // the session row too narrow while a panel is docked, clear activePanel so the
+  // icon state and live mounted panel do not survive into overlay/push mode.
+  useEffect(() => {
+    if (!canDockPanel && activePanel !== null) {
+      setActivePanel(null)
+    }
+  }, [canDockPanel, activePanel])
+  // Session-level PR context feeds the docked PR panel and gates the GitHub-only
+  // PR entry so GitLab/other providers do not open a GitHub RPC surface.
+  const {
+    branch: prBranch,
+    headSha: prHeadSha,
+    status: prStatus,
+    isGithubRepo: prIsGithubRepo,
+    repoLoaded: prRepoContextLoaded,
+    loaded: prContextLoaded
+  } = useMobilePrBranchContext({
+    client,
+    connState,
+    worktreeId
+  })
+  useEffect(() => {
+    if (prRepoContextLoaded && !prIsGithubRepo && activePanel === 'pr') {
+      setActivePanel(null)
+    }
+  }, [activePanel, prRepoContextLoaded, prIsGithubRepo])
   const initialCreateWarning = typeof createdWarning === 'string' ? createdWarning.trim() : ''
   const [terminals, setTerminals] = useState<Terminal[]>([])
   const terminalsRef = useRef<Terminal[]>([])
   const [sessionTabs, setSessionTabs] = useState<MobileSessionTab[]>([])
   const sessionTabsRef = useRef<MobileSessionTab[]>([])
+  // Why: subscription, 2s polling, and post-mutation refetch race to apply tab
+  // snapshots. Track the last applied (publicationEpoch, snapshotVersion) so a
+  // late-arriving older snapshot from the same publisher can't overwrite (and
+  // resurrect closed tabs in) a newer one. See session-tab-snapshot-gate.
+  const appliedSnapshotMarkerRef = useRef<AppliedSnapshotMarker>({ epoch: null, version: -1 })
+  // Why: after an optimistic local close, suppress the tab until the publisher
+  // confirms its absence, so an in-flight snapshot generated before the close
+  // propagated (and thus newer by version) can't flash the tab back. Maps tab id
+  // to an expiry timestamp so a failed host-side close can't hide a tab forever.
+  const closedTabTombstonesRef = useRef<Map<string, number>>(new Map())
   const [terminalsLoaded, setTerminalsLoaded] = useState(false)
   const [input, setInput] = useState('')
+  // Why: baseline terminal zoom, reloaded on focus so a Settings → Terminal change
+  // applies in place (the terminal panes stay mounted).
+  const [terminalTextScale, setTerminalTextScale] = useState(1)
+  // Why: local opt-in for keyboard autocomplete/autocorrect on the terminal
+  // command bar; reloaded on focus so a Settings → Terminal toggle takes effect on return.
+  const [autocompleteEnabled, setAutocompleteEnabled] = useState(false)
+  const [terminalLinkOpenMode, setTerminalLinkOpenMode] =
+    useState<MobileTerminalLinkOpenMode>('orca-browser')
   const [liveInputCapture, setLiveInputCapture] = useState('')
-  const [liveInputTerminalHandles, setLiveInputTerminalHandles] = useState<Set<string>>(
-    () => new Set()
-  )
+  const {
+    clearTerminalLiveInputDefault,
+    defaultTerminalHandlesToLiveInput,
+    liveInputTerminalHandles,
+    liveInputTerminalHandlesRef,
+    pruneTerminalHandlesFromLiveInput,
+    toggleTerminalLiveInput
+  } = useTerminalLiveInputModePreference({ hostId, worktreeId })
   const [activeHandle, setActiveHandle] = useState<string | null>(null)
   const [activeSessionTabId, setActiveSessionTabId] = useState<string | null>(null)
   const activeSessionTabIdRef = useRef<string | null>(null)
+  // Auto-scroll the tab strip so the active tab (synced from desktop on
+  // worktree entry) is revealed without a manual scroll.
+  const tabStripRef = useRef<ScrollView>(null)
+  const tabStripOffsetRef = useRef(0)
+  const tabStripViewportWidthRef = useRef(0)
+  const tabStripContentWidthRef = useRef(0)
+  const tabLayoutsRef = useRef<Map<string, { x: number; width: number }>>(new Map())
   const [markdownDocs, setMarkdownDocs] = useState<Map<string, MarkdownDocState>>(new Map())
   const markdownDocsRef = useRef<Map<string, MarkdownDocState>>(new Map())
   const [fileDocs, setFileDocs] = useState<Map<string, FileDocState>>(new Map())
@@ -956,6 +923,10 @@ export default function SessionScreen() {
   const [pendingDiffNotesDelivery, setPendingDiffNotesDelivery] =
     useState<DiffNotesDelivery | null>(null)
   const [creating, setCreating] = useState(false)
+  // Why: React state isn't a synchronous lock — a fast double-tap can fire two
+  // creates before `creating` re-renders. This ref blocks the second one in the
+  // same tick (server idempotency only dedupes identical clientMutationIds).
+  const creatingTerminalRef = useRef(false)
   const [creatingBrowser, setCreatingBrowser] = useState(false)
   const [creatingMarkdown, setCreatingMarkdown] = useState(false)
   const [createError, setCreateError] = useState('')
@@ -1010,6 +981,10 @@ export default function SessionScreen() {
   >(new Map())
   const [selectModeActive, setSelectModeActive] = useState(false)
   const [canPaste, setCanPaste] = useState(false)
+  const [showDictationSetup, setShowDictationSetup] = useState(false)
+  // 'hold' makes the mic press-and-hold; 'toggle' makes it tap-to-start/stop.
+  // Mirrors Settings ▸ Voice ▸ Dictation Mode so the button matches the setting.
+  const [dictationMode, setDictationMode] = useState<'toggle' | 'hold'>('toggle')
   const [toastMessage, setToastMessage] = useState<string | null>(null)
   const toastOpacityRef = useRef(new Animated.Value(0))
   const toastHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -1020,6 +995,7 @@ export default function SessionScreen() {
   const terminalGestureInputBucketsRef = useRef<Map<string, TerminalGestureInputBucket>>(new Map())
   const terminalGestureInputQueuesRef = useRef<Map<string, TerminalGestureInputQueue>>(new Map())
   const terminalGestureInputInFlightRef = useRef<Set<string>>(new Set())
+  const terminalCwdRef = useRef<Map<string, string>>(new Map())
   const initialModesSeenRef = useRef<Set<string>>(new Set())
   const deviceTokenRef = useRef<string | null>(null)
   const clientRef = useRef<RpcClient | null>(null)
@@ -1031,6 +1007,15 @@ export default function SessionScreen() {
   const terminalRefs = useRef<Map<string, TerminalWebViewHandle>>(new Map())
   const liveInputRef = useRef<TextInput>(null)
   const liveInputFocusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const sendLiveTerminalInputRef = useRef<TerminalLiveInputSender>(async () => false)
+  const sessionTabActionSheetKeyboardHideSubRef = useRef<ReturnType<
+    typeof Keyboard.addListener
+  > | null>(null)
+  const sessionTabActionSheetRequestSeqRef = useRef(0)
+  const dictationRouteContextRef = useRef<{
+    readonly handle: string | null
+    readonly liveInputEnabled: boolean
+  } | null>(null)
   const terminalUnsubsRef = useRef<Map<string, () => void>>(new Map())
   const subscribingHandlesRef = useRef<Set<string>>(new Set())
   const initializedHandlesRef = useRef<Set<string>>(new Set())
@@ -1043,6 +1028,21 @@ export default function SessionScreen() {
   const activeSessionTabTypeRef = useRef<MobileSessionTabType | null>(null)
   const pendingActiveSessionTabIdRef = useRef<string | null>(null)
   const pendingActiveTerminalHandleRef = useRef<string | null>(null)
+  // Why: a browser tab opened from a terminal-tapped HTML must be focused as an
+  // Orca session tab (bridge auto-activate only flags the live webContents, not
+  // the app-level active tab). We remember the page id and, once its session tab
+  // syncs, activate it through the normal switchSessionTab path (which also makes
+  // switching back to the terminal work). A ref breaks the callback dep cycle.
+  const pendingBrowserFocusPageIdRef = useRef<string | null>(null)
+  const switchSessionTabRef = useRef<((tab: MobileSessionTab) => void) | null>(null)
+  const pendingTerminalActivationAttemptRef = useRef<string | null>(null)
+  // Why: handleTerminalOpenUrl is memoized on terminalLinkOpenMode, but
+  // handleCreateBrowser is a per-render closure that captures the live `client`.
+  // A terminal URL tap must run the CURRENT closure (the memoized one can hold a
+  // render where client was still null/connecting, silently no-opping the
+  // in-app-browser open). Route through a ref kept current every render.
+  const handleCreateBrowserRef = useRef<((rawUrl?: string) => Promise<boolean>) | null>(null)
+
   const initialEmptySessionAutoCreateRef = useRef<string | null>(null)
   const markdownSaveSeqRef = useRef<Map<string, number>>(new Map())
   const markdownSaveInFlightRef = useRef<Set<string>>(new Set())
@@ -1062,8 +1062,31 @@ export default function SessionScreen() {
   // can use the exact container height instead of relying on window.innerHeight,
   // which can overstate the visible area due to layout timing.
   const terminalFrameHeightRef = useRef<number>(0)
+  // Why: the terminal frame's width changes when EITHER sidebar is resized (the
+  // left worktree sidebar shrinks the detail pane; the right dock takes a slice of
+  // the row) without any window-dim change. Tracking the measured width lets the
+  // refit hook re-fit the PTY on those resizes — see terminal-viewport-refit.ts.
+  const [terminalFrameWidth, setTerminalFrameWidth] = useState(0)
 
   const activeSessionTab = sessionTabs.find((tab) => tab.id === activeSessionTabId) ?? null
+  const {
+    clearPendingLiveInputCommit,
+    flushPendingLiveInputBeforeExternalSend,
+    handleLiveInputAccessoryBytes,
+    handleLiveInputChange,
+    handleLiveInputKeyPress,
+    handleLiveInputSubmit
+  } = useTerminalLiveInputCommit({
+    activeHandle,
+    activeHandleRef,
+    activeSessionTabType: activeSessionTab?.type,
+    activeSessionTabTypeRef,
+    liveInputRef,
+    liveInputTerminalHandles,
+    liveInputTerminalHandlesRef,
+    sendLiveTerminalInputRef,
+    setLiveInputCapture
+  })
   const canSend =
     connState === 'connected' &&
     activeHandle != null &&
@@ -1072,6 +1095,10 @@ export default function SessionScreen() {
     activeSessionTab?.type !== 'browser'
   const liveInputEnabled = activeHandle ? liveInputTerminalHandles.has(activeHandle) : false
   const [browserScreencastSupported, setBrowserScreencastSupported] = useState<boolean | null>(null)
+  // Why: stable callbacks (handleFileTap) read the live value via this ref, since
+  // the capability probe resolves after the callbacks are created.
+  const browserScreencastSupportedRef = useRef(browserScreencastSupported)
+  browserScreencastSupportedRef.current = browserScreencastSupported
   // Why: terminal gesture/input callbacks are intentionally stable and
   // imperative; keep their refs current before commit instead of one effect later.
   clientRef.current = client
@@ -1149,19 +1176,115 @@ export default function SessionScreen() {
     client,
     enabled: canSend,
     onTranscript: (text) => {
-      setInput((current) => {
-        if (!current.trim()) {
-          return text
+      // Live mode inserts the transcript straight into its originating PTY as
+      // text (no Return — the user sends it themselves), matching live keystroke
+      // semantics; buffered mode keeps appending to the command field.
+      const routeContext = dictationRouteContextRef.current
+      dictationRouteContextRef.current = null
+      const route = routeDictationTranscript(
+        text,
+        routeContext?.liveInputEnabled ?? liveInputEnabled
+      )
+      if (route.kind === 'live-insert') {
+        const insertHandle = routeContext?.handle ?? activeHandleRef.current
+        if (!insertHandle) {
+          return
         }
-        return `${current.trimEnd()} ${text}`
-      })
+        void (async () => {
+          const flushedPendingInput = await flushPendingLiveInputBeforeExternalSend(insertHandle)
+          if (!flushedPendingInput) {
+            return
+          }
+          const sent = await sendLiveTerminalInput(insertHandle, route.text)
+          if (sent) {
+            showToast('Dictation inserted')
+          }
+        })()
+        return
+      }
+      setInput((current) => appendBufferedDictation(current, route.text))
       showToast('Dictation inserted')
     },
     onError: (err) => {
+      dictationRouteContextRef.current = null
+      // Dictation isn't set up on the desktop yet → open the setup sheet so the
+      // user can download a model + enable it from here, instead of a dead-end toast.
+      if (isDictationSetupRequiredError(err.message)) {
+        setShowDictationSetup(true)
+        return
+      }
       triggerError()
       showToast(err.message)
     }
   })
+
+  const startDictation = useCallback(() => {
+    const routeContext = activeHandle
+      ? { handle: activeHandle, liveInputEnabled: liveInputTerminalHandles.has(activeHandle) }
+      : null
+    dictationRouteContextRef.current = routeContext
+    void dictation.start().catch((err) => {
+      if (dictationRouteContextRef.current === routeContext) {
+        dictationRouteContextRef.current = null
+      }
+      triggerError()
+      showToast(err instanceof Error ? err.message : String(err))
+    })
+  }, [activeHandle, dictation, liveInputTerminalHandles, triggerError, showToast])
+
+  const cancelDictation = useCallback(() => {
+    dictationRouteContextRef.current = null
+    void dictation.cancel()
+  }, [dictation])
+
+  // Toggle mode: one tap starts, the next stops; long-press cancels mid-record.
+  const handleDictationToggle = useCallback(() => {
+    if (dictation.isProcessing) {
+      cancelDictation()
+    } else if (dictation.isStarting) {
+      return
+    } else if (dictation.isRecording) {
+      void dictation.stop()
+    } else {
+      startDictation()
+    }
+  }, [cancelDictation, dictation, startDictation])
+
+  // Hold mode: press starts, release stops — like a walkie-talkie.
+  const handleDictationPressIn = useCallback(() => {
+    if (!dictation.isStarting && !dictation.isRecording && !dictation.isProcessing) {
+      startDictation()
+    }
+  }, [dictation, startDictation])
+
+  const handleDictationPressOut = useCallback(() => {
+    if (dictation.isRecording) {
+      void dictation.stop()
+    } else if (dictation.isStarting) {
+      // Released before recording began: cancel so we don't leave a live mic.
+      cancelDictation()
+    }
+  }, [cancelDictation, dictation])
+
+  const refreshDictationMode = useCallback(async () => {
+    if (!client) {
+      return
+    }
+    try {
+      const setup = await fetchDictationSetup(client)
+      setDictationMode(setup.dictationMode)
+    } catch {
+      // Non-fatal: fall back to the default toggle behavior.
+    }
+  }, [client])
+
+  // Re-read on focus so a Dictation Mode change made in Settings ▸ Voice is
+  // reflected when the user returns to the session.
+  useFocusEffect(
+    useCallback(() => {
+      void refreshDictationMode()
+    }, [refreshDictationMode])
+  )
 
   useEffect(() => {
     diffCommentsRef.current = diffComments
@@ -1192,6 +1315,7 @@ export default function SessionScreen() {
     webReadyHandlesRef.current.clear()
     subscribeSeqRef.current.clear()
     layoutSeqRef.current.clear()
+    terminalCwdRef.current.clear()
     setTerminalKeyboardMetrics(new Map())
     for (const term of terminalRefs.current.values()) {
       term.clear()
@@ -1291,6 +1415,7 @@ export default function SessionScreen() {
             if (initializedHandlesRef.current.has(handle)) {
               return
             }
+            updateTerminalCwdFromStreamEvent(handle, data, terminalCwdRef.current)
             const cols = (data.cols as number) || 80
             const rows = (data.rows as number) || 24
             const scrollbackCols = cols
@@ -1299,6 +1424,7 @@ export default function SessionScreen() {
               typeof data.serialized === 'string' && data.serialized.length > 0
                 ? data.serialized
                 : ''
+            const oscLinks = isTerminalOscLinkRanges(data.oscLinks) ? data.oscLinks : undefined
             const ref = getTerminalRef(handle)
             // Why: previously we set `initializedHandlesRef` even when the
             // WebView wasn't mounted yet (ref=null). The init message went
@@ -1313,7 +1439,7 @@ export default function SessionScreen() {
               })
               return
             }
-            ref.init(cols, rows, initialData)
+            ref.init(cols, rows, initialData, false, oscLinks)
             initializedHandlesRef.current.add(handle)
             if (data.displayMode) {
               setTerminalModes((prev) =>
@@ -1385,7 +1511,10 @@ export default function SessionScreen() {
                 }
               })()
             }
+          } else if (data.type === 'metadata') {
+            updateTerminalCwdFromStreamEvent(handle, data, terminalCwdRef.current)
           } else if (data.type === 'data') {
+            updateTerminalCwdFromStreamEvent(handle, data, terminalCwdRef.current)
             // Why: log when data arrives but the WebView ref is missing
             // — this is the most likely cause of "blank but input works":
             // server stream is alive, sends flow, but writes are dropped
@@ -1408,14 +1537,19 @@ export default function SessionScreen() {
             }
             dataRef.write(data.chunk as string)
           } else if (data.type === 'resized') {
+            updateTerminalCwdFromStreamEvent(handle, data, terminalCwdRef.current)
             // Why: inline resize event — the server changed the PTY dimensions
-            // (mode toggle or desktop restore). Reinitialize xterm at the new
-            // dims with fresh scrollback. No resubscribe needed.
+            // (mode toggle, desktop restore, or a width reflow). When the server
+            // includes a fresh full-buffer snapshot (width reflow), reinitialize
+            // xterm at the new dims so the hard-wrapped scrollback rewraps;
+            // preserve the reader's scroll position across the replay. Otherwise
+            // resize xterm geometry and let the TUI's own redraw repaint.
             const cols = (data.cols as number) || 80
             const rows = (data.rows as number) || 24
             const serialized = typeof data.serialized === 'string' ? data.serialized : null
+            const oscLinks = isTerminalOscLinkRanges(data.oscLinks) ? data.oscLinks : undefined
             if (serialized != null) {
-              getTerminalRef(handle)?.init(cols, rows, serialized)
+              getTerminalRef(handle)?.init(cols, rows, serialized, true, oscLinks)
             } else {
               getTerminalRef(handle)?.resize(cols, rows)
             }
@@ -1515,11 +1649,16 @@ export default function SessionScreen() {
           }
 
           const liveHandles = new Set(result.terminals.map((terminal) => terminal.handle))
+          // Why: terminal.list is the lifetime signal; session-tab snapshots can lag
+          // mobile-created tabs and must not erase a user's buffered-mode opt-out.
+          pruneTerminalHandlesFromLiveInput(liveHandles)
+          defaultTerminalHandlesToLiveInput([...liveHandles])
           for (const handle of Array.from(terminalUnsubsRef.current.keys())) {
             if (!liveHandles.has(handle)) {
               unsubscribeTerminal(handle)
               terminalRefs.current.delete(handle)
               initializedHandlesRef.current.delete(handle)
+              clearTerminalLiveInputDefault(handle)
               setTerminalKeyboardMetrics((prev) => {
                 if (!prev.has(handle)) {
                   return prev
@@ -1564,12 +1703,29 @@ export default function SessionScreen() {
         fetchTerminalsInFlightRef.current = false
       }
     },
-    [client, worktreeId, subscribeToTerminal, unsubscribeTerminal]
+    [
+      client,
+      worktreeId,
+      clearTerminalLiveInputDefault,
+      defaultTerminalHandlesToLiveInput,
+      pruneTerminalHandlesFromLiveInput,
+      subscribeToTerminal,
+      unsubscribeTerminal
+    ]
   )
 
   const applySessionTabs = useCallback(
     (result: SessionTabsResult) => {
-      let nextTabs = result.tabs
+      // Reject out-of-order snapshots, then suppress just-closed tabs until the
+      // publisher confirms their absence. See session-tab-snapshot-gate.
+      if (!acceptSessionSnapshot(result, appliedSnapshotMarkerRef.current)) {
+        return
+      }
+      let nextTabs = applyClosedTabTombstones(
+        result.tabs,
+        closedTabTombstonesRef.current,
+        Date.now()
+      )
       const presentTabIds = new Set(nextTabs.map((tab) => tab.id))
       const orphanedDraftTabs: MobileSessionTab[] = []
       const currentMarkdownDocs = markdownDocsRef.current
@@ -1596,6 +1752,8 @@ export default function SessionScreen() {
       // render loop where the subscription effect tears down and replays itself.
       setSessionTabs((prev) => (mobileSessionTabsEqual(prev, nextTabs) ? prev : nextTabs))
       const terminalTabs = getTerminalRecordsFromSessionTabs(nextTabs)
+      const terminalTabHandles = terminalTabs.map((terminal) => terminal.handle)
+      defaultTerminalHandlesToLiveInput(terminalTabHandles)
       const mergedTerminalsForActive = mergeTerminalRecordsByCurrentOrder(
         terminalTabs,
         terminalsRef.current
@@ -1690,7 +1848,7 @@ export default function SessionScreen() {
         setActiveHandle(null)
       }
     },
-    [subscribeToTerminal, unsubscribeTerminal]
+    [defaultTerminalHandlesToLiveInput, subscribeToTerminal, unsubscribeTerminal]
   )
 
   const readMarkdownTab = useCallback(
@@ -1704,27 +1862,56 @@ export default function SessionScreen() {
           worktree: `id:${worktreeId}`,
           tabId: tab.id
         })
-        if (!response.ok) {
+        if (response.ok) {
+          const result = (response as RpcSuccess).result as {
+            content: string
+            version: string
+            isDirty: boolean
+            editable?: boolean
+            readOnlyReason?: string
+          }
+          setMarkdownDocs((prev) =>
+            new Map(prev).set(tab.id, {
+              status: 'ready',
+              content: result.content,
+              localContent: result.content,
+              baseVersion: result.version,
+              isDirty: false,
+              editable: result.editable === true,
+              stale: result.isDirty,
+              readOnlyReason: result.readOnlyReason
+            })
+          )
+          return
+        }
+        if (!shouldReadMarkdownFromDiskAfterReadTabFailure(response as RpcFailure)) {
+          throw new Error((response as RpcFailure).error.message)
+        }
+        // Why: a headless host (no desktop renderer) can't serve the live editor
+        // document and fails markdown.readTab with renderer_unavailable. Fall back
+        // to the on-disk file so markdown still renders read-only, matching how
+        // other file types load via files.read.
+        const fallback = await client.sendRequest('files.read', {
+          worktree: `id:${worktreeId}`,
+          relativePath: tab.relativePath
+        })
+        if (!fallback.ok) {
           throw new Error('Unable to read markdown')
         }
-        const result = (response as RpcSuccess).result as {
+        const fileResult = (fallback as RpcSuccess).result as {
           content: string
-          version: string
-          isDirty: boolean
-          editable?: boolean
-          readOnlyReason?: string
+          truncated: boolean
+          byteLength: number
         }
         setMarkdownDocs((prev) =>
-          new Map(prev).set(tab.id, {
-            status: 'ready',
-            content: result.content,
-            localContent: result.content,
-            baseVersion: result.version,
-            isDirty: false,
-            editable: result.editable === true,
-            stale: result.isDirty,
-            readOnlyReason: result.readOnlyReason
-          })
+          new Map(prev).set(
+            tab.id,
+            buildMarkdownDiskFallbackDoc({
+              content: fileResult.content,
+              truncated: fileResult.truncated,
+              tabIsDirty: tab.isDirty
+            })
+          )
         )
       } catch {
         setMarkdownDocs((prev) =>
@@ -1775,6 +1962,32 @@ export default function SessionScreen() {
           )
           return
         }
+        const artifactKind = classifyMobileArtifact(tab.relativePath)
+        if (artifactKind === 'image') {
+          const preview = await client.sendRequest('files.readPreview', {
+            worktree: `id:${worktreeId}`,
+            relativePath: tab.relativePath
+          })
+          if (!preview.ok) {
+            throw new Error((preview as RpcFailure).error.message)
+          }
+          const result = (preview as RpcSuccess).result as {
+            content: string
+            isImage?: boolean
+            mimeType?: string
+          }
+          if (!result.isImage || !result.mimeType || result.content.length === 0) {
+            throw new Error('binary_file')
+          }
+          setFileDocs((prev) =>
+            new Map(prev).set(tab.id, {
+              status: 'ready',
+              kind: 'image',
+              dataUri: `data:${result.mimeType};base64,${result.content}`
+            })
+          )
+          return
+        }
         const response = await client.sendRequest('files.read', {
           worktree: `id:${worktreeId}`,
           relativePath: tab.relativePath
@@ -1786,6 +1999,16 @@ export default function SessionScreen() {
           content: string
           truncated: boolean
           byteLength: number
+        }
+        if (artifactKind === 'html') {
+          setFileDocs((prev) =>
+            new Map(prev).set(tab.id, {
+              status: 'ready',
+              kind: 'html',
+              content: result.content
+            })
+          )
+          return
         }
         setFileDocs((prev) =>
           new Map(prev).set(tab.id, {
@@ -2152,6 +2375,18 @@ export default function SessionScreen() {
       }
       const result = (response as RpcSuccess).result as SessionTabsResult
       applySessionTabs(result)
+      // Focus a just-opened browser tab once it appears in the snapshot, via the
+      // normal activate path so it sticks and the user can still switch away.
+      const pendingPageId = pendingBrowserFocusPageIdRef.current
+      if (pendingPageId) {
+        const browserTab = result.tabs.find(
+          (tab) => tab.type === 'browser' && tab.browserPageId === pendingPageId
+        )
+        if (browserTab) {
+          pendingBrowserFocusPageIdRef.current = null
+          switchSessionTabRef.current?.(browserTab)
+        }
+      }
     } catch {
       // Keep the last tab snapshot visible during reconnect/backoff.
     } finally {
@@ -2260,6 +2495,35 @@ export default function SessionScreen() {
     }
   }, [])
 
+  useEffect(() => {
+    let previousAppState: AppStateStatus | null = AppState.currentState
+    const sub = AppState.addEventListener('change', (nextAppState: AppStateStatus) => {
+      const shouldRecover = shouldRecoverTerminalOnAppStateChange(
+        previousAppState,
+        nextAppState,
+        Platform.OS
+      )
+      previousAppState = nextAppState
+      if (!shouldRecover) {
+        return
+      }
+      // Why: iOS can resume a live WKWebView with a blank xterm backing store
+      // without firing web-ready/reconnect; replay scrollback to repaint it.
+      recoverActiveTerminalAfterForeground({
+        activeHandleRef,
+        terminalRefs,
+        initializedHandlesRef,
+        connStateRef,
+        unsubscribeTerminal,
+        subscribeToTerminal,
+        schedule: scheduleDelayedAction
+      })
+    })
+    return () => {
+      sub.remove()
+    }
+  }, [scheduleDelayedAction, subscribeToTerminal, unsubscribeTerminal])
+
   // Why: viewport refits for layout changes outside the subscribe path
   // (tab strip toggling, fold/unfold, rotation) live in a dedicated hook —
   // see terminal-viewport-refit.ts for the full rationale.
@@ -2273,6 +2537,8 @@ export default function SessionScreen() {
     deviceTokenRef,
     initializedHandlesRef,
     tabStripVisible: terminals.length > 1,
+    textScale: terminalTextScale,
+    terminalFrameWidth,
     unsubscribeTerminal,
     subscribeToTerminal
   })
@@ -2293,6 +2559,34 @@ export default function SessionScreen() {
       hideSub.remove()
     }
   }, [])
+
+  const scrollActiveTabIntoView = useCallback((tabId: string | null, animated: boolean) => {
+    if (!tabId) {
+      return
+    }
+    const layout = tabLayoutsRef.current.get(tabId)
+    if (!layout) {
+      return
+    }
+    const nextOffset = resolveTabStripScrollOffset({
+      tabX: layout.x,
+      tabWidth: layout.width,
+      viewportWidth: tabStripViewportWidthRef.current,
+      contentWidth: tabStripContentWidthRef.current,
+      currentOffset: tabStripOffsetRef.current
+    })
+    if (nextOffset !== tabStripOffsetRef.current) {
+      tabStripOffsetRef.current = nextOffset
+      tabStripRef.current?.scrollTo({ x: nextOffset, animated })
+    }
+  }, [])
+
+  // Reveal the active tab whenever it changes (e.g. desktop's open tab synced on
+  // worktree entry). Defer one frame so freshly mounted tab layouts are recorded.
+  useEffect(() => {
+    const id = requestAnimationFrame(() => scrollActiveTabIntoView(activeSessionTabId, true))
+    return () => cancelAnimationFrame(id)
+  }, [activeSessionTabId, scrollActiveTabIntoView])
 
   useEffect(() => {
     if (hostId && worktreeId) {
@@ -2318,12 +2612,22 @@ export default function SessionScreen() {
   }, [router])
 
   useEffect(() => {
+    // Why: Expo can reuse this screen across worktrees. Reset pending
+    // keyboard listeners, snapshot floors, and tombstones so prior route state
+    // cannot open stale UI or reject the next worktree's first snapshot.
+    sessionTabActionSheetRequestSeqRef.current += 1
+    sessionTabActionSheetKeyboardHideSubRef.current?.remove()
+    sessionTabActionSheetKeyboardHideSubRef.current = null
     clearTerminalCache()
     activeHandleRef.current = null
     activeSessionTabTypeRef.current = null
     pendingActiveSessionTabIdRef.current = null
     pendingActiveTerminalHandleRef.current = null
+    pendingBrowserFocusPageIdRef.current = null
+    pendingTerminalActivationAttemptRef.current = null
     initialEmptySessionAutoCreateRef.current = null
+    appliedSnapshotMarkerRef.current = { epoch: null, version: -1 }
+    closedTabTombstonesRef.current.clear()
     for (const queued of terminalGestureInputQueuesRef.current.values()) {
       if (queued.timer) {
         clearTimeout(queued.timer)
@@ -2336,15 +2640,23 @@ export default function SessionScreen() {
     terminalsRef.current = []
     setSessionTabs([])
     setActiveSessionTabId(null)
-    setLiveInputCapture('')
-    setLiveInputTerminalHandles(new Set())
+    clearPendingLiveInputCommit()
     setMarkdownDocs(new Map())
     setFileDocs(new Map())
     clearDelayedActionTimers()
     return () => {
+      sessionTabActionSheetRequestSeqRef.current += 1
+      sessionTabActionSheetKeyboardHideSubRef.current?.remove()
+      clearPendingLiveInputCommit()
       clearDelayedActionTimers()
     }
-  }, [clearDelayedActionTimers, clearTerminalCache, worktreeId])
+  }, [
+    clearDelayedActionTimers,
+    clearPendingLiveInputCommit,
+    clearTerminalCache,
+    hostId,
+    worktreeId
+  ])
 
   useEffect(() => {
     if (connState !== 'connected') {
@@ -2373,9 +2685,12 @@ export default function SessionScreen() {
     }
     void (async () => {
       if (client && created !== '1') {
-        await client
+        // Why: mobile needs host-owned tabs hydrated for this route, but should
+        // not pull other paired clients, especially desktop, into this worktree.
+        void client
           .sendRequest('worktree.activate', {
-            worktree: `id:${worktreeId}`
+            worktree: `id:${worktreeId}`,
+            notifyClients: false
           })
           .catch(() => null)
       }
@@ -2400,7 +2715,8 @@ export default function SessionScreen() {
           void (async () => {
             await client
               .sendRequest('worktree.activate', {
-                worktree: `id:${worktreeId}`
+                worktree: `id:${worktreeId}`,
+                notifyClients: false
               })
               .catch(() => null)
             if (disposed) {
@@ -2469,6 +2785,52 @@ export default function SessionScreen() {
     }, [connState, fetchSessionTabs, fetchTerminals])
   )
 
+  // Why: pick up the Settings → Terminal text size when returning here — the
+  // terminal panes stay mounted, so they update in place.
+  useFocusEffect(
+    useCallback(() => {
+      let active = true
+      void loadTerminalTextScale().then((scale) => {
+        if (active) {
+          setTerminalTextScale(scale)
+        }
+      })
+      return () => {
+        active = false
+      }
+    }, [])
+  )
+
+  // Why: pick up the Settings → Terminal autocomplete toggle when returning here.
+  useFocusEffect(
+    useCallback(() => {
+      let active = true
+      void loadTerminalAutocompleteEnabled().then((enabled) => {
+        if (active) {
+          setAutocompleteEnabled(enabled)
+        }
+      })
+      return () => {
+        active = false
+      }
+    }, [])
+  )
+
+  // Why: link routing is a phone-local choice; reload after Settings → Browser.
+  useFocusEffect(
+    useCallback(() => {
+      let active = true
+      void loadTerminalLinkOpenMode().then((mode) => {
+        if (active) {
+          setTerminalLinkOpenMode(mode)
+        }
+      })
+      return () => {
+        active = false
+      }
+    }, [])
+  )
+
   // Why: unsubscribe the old terminal so the server restores its desktop dims
   // (clearing the phone-fit banner), then subscribe the new terminal with the
   // measured viewport so the server phone-fits it. Also call terminal.focus
@@ -2483,6 +2845,7 @@ export default function SessionScreen() {
       pendingActiveSessionTabIdRef.current = matchingTab?.id ?? null
       pendingActiveTerminalHandleRef.current = handle
       activeSessionTabTypeRef.current = 'terminal'
+      defaultTerminalHandlesToLiveInput([handle])
       setActiveSessionTabId(matchingTab?.id ?? null)
       const prev = activeHandleRef.current
       activeHandleRef.current = handle
@@ -2503,13 +2866,21 @@ export default function SessionScreen() {
           void client
             .sendRequest('session.tabs.activate', {
               worktree: `id:${worktreeId}`,
-              tabId: matchingTab.id
+              tabId: matchingTab.id,
+              notifyClients: false
             })
             .catch(() => {})
         }
       }
     },
-    [client, sessionTabs, subscribeToTerminal, unsubscribeTerminal, worktreeId]
+    [
+      client,
+      defaultTerminalHandlesToLiveInput,
+      sessionTabs,
+      subscribeToTerminal,
+      unsubscribeTerminal,
+      worktreeId
+    ]
   )
 
   const switchSessionTab = useCallback(
@@ -2535,7 +2906,8 @@ export default function SessionScreen() {
           void client
             .sendRequest('session.tabs.activate', {
               worktree: `id:${worktreeId}`,
-              tabId: tab.id
+              tabId: tab.id,
+              notifyClients: false
             })
             .catch(() => {})
         }
@@ -2558,7 +2930,8 @@ export default function SessionScreen() {
         void client
           .sendRequest('session.tabs.activate', {
             worktree: `id:${worktreeId}`,
-            tabId: tab.id
+            tabId: tab.id,
+            notifyClients: false
           })
           .catch(() => {})
       }
@@ -2579,6 +2952,9 @@ export default function SessionScreen() {
     },
     [client, markdownDocs, readFileTab, readMarkdownTab, switchTab, unsubscribeTerminal, worktreeId]
   )
+  // Keep the ref pointing at the latest switchSessionTab so fetchSessionTabs can
+  // activate a freshly-synced browser tab without a callback dependency cycle.
+  switchSessionTabRef.current = switchSessionTab
 
   // Why: just store the ref. Subscription is deferred to handleTerminalWebReady
   // which fires after the WebView has loaded xterm.js and is ready to process
@@ -2663,7 +3039,7 @@ export default function SessionScreen() {
     }
     sendingRef.current = true
 
-    const text = input
+    const text = normalizeTerminalTextInput(input)
     setInput('')
 
     try {
@@ -2685,66 +3061,152 @@ export default function SessionScreen() {
     }
   }
 
-  async function handleAccessoryKey(bytes: string) {
+  async function handleAccessoryKey(input: TerminalLiveAccessoryInput) {
     if (!client || !activeHandle || !canSend) {
       return
     }
-
-    try {
-      await client.sendRequest('terminal.send', {
-        terminal: activeHandle,
-        text: bytes,
+    const targetHandle = activeHandle
+    const accessoryCommit = await handleLiveInputAccessoryBytes(input)
+    if (accessoryCommit.kind !== 'allow-raw') {
+      return
+    }
+    const currentClient = clientRef.current
+    // Why: async IME flushing can outlive the original terminal selection.
+    const rawSendTarget = getTerminalLiveAccessoryRawSendTarget({
+      targetHandle,
+      activeHandle: activeHandleRef.current,
+      activeSessionTabType: activeSessionTabTypeRef.current
+    })
+    if (!currentClient || !rawSendTarget || connStateRef.current !== 'connected') {
+      return
+    }
+    await currentClient
+      .sendRequest('terminal.send', {
+        terminal: rawSendTarget,
+        text: input.bytes,
         enter: false,
         ...(deviceTokenRef.current
           ? { client: { id: deviceTokenRef.current, type: 'mobile' as const } }
           : {})
       })
-    } catch {
-      // Transient failure
-    }
+      .then(
+        () => undefined,
+        () => undefined
+      )
   }
 
   const sendLiveTerminalInput = useCallback(
-    (handle: string, bytes: string) => {
-      if (bytes.length === 0) {
-        return
+    async (handle: string, bytes: string): Promise<boolean> => {
+      const text = normalizeTerminalTextInput(bytes)
+      if (text.length === 0) {
+        return false
       }
-      if (!isTerminalLiveInputWithinByteLimit(bytes)) {
+      if (!isTerminalLiveInputWithinByteLimit(text)) {
         triggerError()
         showToast('Input too large (max 256 KiB)', 1500)
-        return
+        return false
       }
       const rpc = clientRef.current
+      // Why: callers suppress follow-up controls/toasts when this live send is stale.
       if (
         !rpc ||
         connStateRef.current !== 'connected' ||
         handle !== activeHandleRef.current ||
         activeSessionTabTypeRef.current !== 'terminal'
       ) {
-        return
+        return false
       }
-      void rpc
+      return rpc
         .sendRequest('terminal.send', {
           terminal: handle,
-          text: bytes,
+          text,
           enter: false,
           ...(deviceTokenRef.current
             ? { client: { id: deviceTokenRef.current, type: 'mobile' as const } }
             : {})
         })
-        .catch(() => {
-          // Transient failure
-        })
+        .then(isTerminalSendRpcAccepted, () => false)
     },
     [showToast]
   )
+  sendLiveTerminalInputRef.current = sendLiveTerminalInput
 
   const focusLiveInput = useCallback(() => {
     if (!canSend || !liveInputEnabled) {
       return
     }
-    liveInputRef.current?.focus()
-  }, [canSend, liveInputEnabled])
+    focusTerminalLiveInputTarget(liveInputRef.current, {
+      keyboardHeight,
+      refocus: () =>
+        scheduleTerminalLiveInputFocus(liveInputFocusTimerRef, () => liveInputRef.current?.focus())
+    })
+  }, [canSend, keyboardHeight, liveInputEnabled])
+
+  const clearSessionTabActionSheetKeyboardListener = useCallback(() => {
+    sessionTabActionSheetKeyboardHideSubRef.current?.remove()
+    sessionTabActionSheetKeyboardHideSubRef.current = null
+  }, [])
+
+  const openSessionTabActionSheet = useCallback((tab: MobileSessionTab) => {
+    if (tab.type === 'terminal') {
+      if (typeof tab.terminal !== 'string') {
+        return
+      }
+      setActionTarget({
+        handle: tab.terminal,
+        title: tab.title,
+        isActive: tab.terminal === activeHandleRef.current
+      })
+    } else if (tab.type === 'markdown') {
+      setMarkdownActionTarget(tab)
+    } else if (tab.type === 'file') {
+      setFileActionTarget(tab)
+    } else {
+      setBrowserActionTarget(tab)
+    }
+  }, [])
+
+  const openSessionTabActionSheetAfterKeyboardDismiss = useCallback(
+    (tab: MobileSessionTab) => {
+      // Why: live input can have a queued refocus; action sheets should open after
+      // the terminal keyboard is gone, not race it under the drawer.
+      sessionTabActionSheetRequestSeqRef.current += 1
+      const requestSeq = sessionTabActionSheetRequestSeqRef.current
+      clearSessionTabActionSheetKeyboardListener()
+      let didOpen = false
+      const openAfterDismiss = () => {
+        if (didOpen || requestSeq !== sessionTabActionSheetRequestSeqRef.current) {
+          return
+        }
+        didOpen = true
+        clearSessionTabActionSheetKeyboardListener()
+        openSessionTabActionSheet(tab)
+      }
+
+      clearTerminalLiveInputFocusTimer(liveInputFocusTimerRef)
+
+      if (keyboardHeight <= 0) {
+        liveInputRef.current?.blur()
+        Keyboard.dismiss()
+        openAfterDismiss()
+        return
+      }
+
+      sessionTabActionSheetKeyboardHideSubRef.current = Keyboard.addListener(
+        'keyboardDidHide',
+        openAfterDismiss
+      )
+      liveInputRef.current?.blur()
+      Keyboard.dismiss()
+      scheduleDelayedAction(openAfterDismiss, TERMINAL_KEYBOARD_DISMISS_ACTION_SHEET_FALLBACK_MS)
+    },
+    [
+      clearSessionTabActionSheetKeyboardListener,
+      keyboardHeight,
+      openSessionTabActionSheet,
+      scheduleDelayedAction
+    ]
+  )
 
   const handleTerminalTap = useCallback(
     (handle: string) => {
@@ -2756,83 +3218,116 @@ export default function SessionScreen() {
     [focusLiveInput]
   )
 
+  // Tap on a file path in terminal output → resolve it on the host and open it
+  // as a file tab (mirrors desktop Cmd/Ctrl-click). Silent on a miss; the
+  // WebView only emits this when the tap landed on a detected path.
+  const handleFileTapActivationSeqRef = useRef(0)
+  const handleFileTap = useCallback(
+    (handle: string, pathText: string, line: number | null, column: number | null) => {
+      if (handle !== activeHandleRef.current || !client) {
+        return
+      }
+      const activationSeq = ++handleFileTapActivationSeqRef.current
+      openMobileTerminalFileTap<MobileSessionTab>({
+        client,
+        hostId,
+        worktreeId,
+        worktreeName: routeWorktreeName,
+        terminalHandle: handle,
+        pathText,
+        cwd: terminalCwdRef.current.get(handle) ?? null,
+        line,
+        column,
+        pushPreviewRoute: (href) => router.push(href),
+        openBrowser: (url) => void handleCreateBrowserRef.current?.(url),
+        triggerOpenFeedback: triggerSelection,
+        fetchSessionTabs,
+        getSessionTabs: () => sessionTabsRef.current,
+        getActiveSessionTabId: () => activeSessionTabIdRef.current,
+        getActivationState: (activated) => ({
+          activated,
+          activationSeq,
+          latestActivationSeq: handleFileTapActivationSeqRef.current,
+          sourceTerminalHandle: handle,
+          activeTerminalHandle: activeHandleRef.current,
+          activeTabType: activeSessionTabTypeRef.current
+        }),
+        switchSessionTab: (tab) => switchSessionTabRef.current?.(tab),
+        scheduleDelayedAction
+      })
+    },
+    [client, fetchSessionTabs, hostId, routeWorktreeName, router, scheduleDelayedAction, worktreeId]
+  )
+
+  const handleOpenedFileDiffActivationSeqRef = useRef(0)
+  // Active tab captured at tap time (before the openDiff RPC). Capturing it when
+  // the diff finishes opening would misread a tab the user switched to mid-RPC
+  // as the tap-time tab, letting the retry steal focus back to the diff.
+  const fileOpenStartActiveTabIdRef = useRef<string | null>(null)
+  const handleFileOpenStart = useCallback(() => {
+    fileOpenStartActiveTabIdRef.current = activeSessionTabIdRef.current
+  }, [])
+  const handleOpenedFileDiff = useCallback(
+    (relativePath: string) => {
+      const activationSeq = ++handleOpenedFileDiffActivationSeqRef.current
+      const activeTabIdAtTap = fileOpenStartActiveTabIdRef.current
+
+      let activated = false
+      const activateOpenedTab = async (): Promise<void> => {
+        // Route matching through the shared helper so the deterministic repro
+        // test exercises the same logic production runs.
+        const settled = await activateOpenedSourceControlDiffTab<MobileSessionTab>({
+          relativePath,
+          activeTabIdAtTap,
+          fetchSessionTabs,
+          getTabs: () => sessionTabsRef.current,
+          getActiveTabId: () => activeSessionTabIdRef.current,
+          getActivationState: () => ({
+            activated,
+            activationSeq,
+            latestActivationSeq: handleOpenedFileDiffActivationSeqRef.current
+          }),
+          switchSessionTab: (tab) => switchSessionTabRef.current?.(tab)
+        })
+        if (settled) {
+          activated = true
+        }
+      }
+
+      scheduleDelayedAction(() => void activateOpenedTab(), 300)
+      scheduleDelayedAction(() => void activateOpenedTab(), 900)
+      scheduleDelayedAction(() => void activateOpenedTab(), 1800)
+    },
+    [fetchSessionTabs, scheduleDelayedAction]
+  )
+
+  const handleTerminalOpenUrl = useCallback(
+    (handle: string, url: string) => {
+      if (handle !== activeHandleRef.current) {
+        return
+      }
+      if (terminalLinkOpenMode === 'phone-browser') {
+        void Linking.openURL(url).catch(() => {})
+        return
+      }
+      void handleCreateBrowserRef.current?.(url)
+    },
+    [terminalLinkOpenMode]
+  )
+
   const toggleLiveInput = useCallback(() => {
     if (!activeHandle) {
       return
     }
-    const nextEnabled = !liveInputTerminalHandles.has(activeHandle)
-    setLiveInputTerminalHandles((prev) => {
-      const next = new Set(prev)
-      if (nextEnabled) {
-        next.add(activeHandle)
-      } else {
-        next.delete(activeHandle)
-      }
-      return next
-    })
-    setLiveInputCapture('')
+    const nextEnabled = toggleTerminalLiveInput(activeHandle)
+    clearPendingLiveInputCommit()
     if (nextEnabled) {
       scheduleTerminalLiveInputFocus(liveInputFocusTimerRef, () => liveInputRef.current?.focus())
     } else {
       clearTerminalLiveInputFocusTimer(liveInputFocusTimerRef)
       liveInputRef.current?.blur()
     }
-  }, [activeHandle, liveInputTerminalHandles])
-
-  const handleLiveInputChange = useCallback(
-    (text: string) => {
-      if (!activeHandle) {
-        setLiveInputCapture('')
-        liveInputRef.current?.setNativeProps({ text: '' })
-        return
-      }
-      if (!liveInputTerminalHandles.has(activeHandle)) {
-        setLiveInputCapture('')
-        liveInputRef.current?.setNativeProps({ text: '' })
-        return
-      }
-      if (text.length > 0) {
-        sendLiveTerminalInput(activeHandle, text)
-      }
-      setLiveInputCapture('')
-      // Why: the field is only a keyboard capture surface. Clearing the
-      // native value prevents subsequent phone-keyboard events from replaying
-      // already-sent characters when React state remains the empty string.
-      liveInputRef.current?.setNativeProps({ text: '' })
-    },
-    [activeHandle, liveInputTerminalHandles, sendLiveTerminalInput]
-  )
-
-  const handleLiveInputKeyPress = useCallback(
-    (event: { nativeEvent: { key: string } }) => {
-      if (!activeHandle) {
-        return
-      }
-      if (!liveInputTerminalHandles.has(activeHandle)) {
-        return
-      }
-      const bytes = getTerminalLiveSpecialKeyBytes(event.nativeEvent.key)
-      if (!bytes) {
-        return
-      }
-      sendLiveTerminalInput(activeHandle, bytes)
-      setLiveInputCapture('')
-      liveInputRef.current?.setNativeProps({ text: '' })
-    },
-    [activeHandle, liveInputTerminalHandles, sendLiveTerminalInput]
-  )
-
-  const handleLiveInputSubmit = useCallback(() => {
-    if (!activeHandle) {
-      return
-    }
-    if (!liveInputTerminalHandles.has(activeHandle)) {
-      return
-    }
-    sendLiveTerminalInput(activeHandle, '\r')
-    setLiveInputCapture('')
-    liveInputRef.current?.setNativeProps({ text: '' })
-  }, [activeHandle, liveInputTerminalHandles, sendLiveTerminalInput])
+  }, [activeHandle, clearPendingLiveInputCommit, toggleTerminalLiveInput])
 
   const allowTerminalGestureInput = useCallback(
     (handle: string, sequenceCount: number): boolean => {
@@ -3032,11 +3527,11 @@ export default function SessionScreen() {
     }
   }, [])
   const startAccessoryRepeat = useCallback(
-    (bytes: string) => {
+    (input: TerminalLiveAccessoryInput) => {
       stopAccessoryRepeat()
       repeatTimeoutRef.current = setTimeout(() => {
         repeatIntervalRef.current = setInterval(() => {
-          void handleAccessoryKeyRef.current(bytes)
+          void handleAccessoryKeyRef.current(input)
         }, 45)
       }, 400)
     },
@@ -3055,9 +3550,19 @@ export default function SessionScreen() {
       clearToastHideTimer()
       clearDelayedActionTimers()
       clearTerminalLiveInputFocusTimer(liveInputFocusTimerRef)
+      clearPendingLiveInputCommit()
+      sessionTabActionSheetRequestSeqRef.current += 1
+      clearSessionTabActionSheetKeyboardListener()
       stopAccessoryRepeat()
     },
-    [clearDelayedActionTimers, clearTerminalCache, clearToastHideTimer, stopAccessoryRepeat]
+    [
+      clearPendingLiveInputCommit,
+      clearDelayedActionTimers,
+      clearSessionTabActionSheetKeyboardListener,
+      clearTerminalCache,
+      clearToastHideTimer,
+      stopAccessoryRepeat
+    ]
   )
 
   const handleSelectionMode = useCallback((handle: string, active: boolean) => {
@@ -3152,67 +3657,85 @@ export default function SessionScreen() {
     }
   }, [])
 
-  const handlePaste = useCallback(async () => {
-    if (!client || !activeHandle || !canSend) {
-      return
+  const getActiveWorktreeConnectionId = useCallback(async (): Promise<string | null> => {
+    if (!client) {
+      return null
     }
-    try {
-      const text = await Clipboard.getStringAsync()
-      if (text.length === 0) {
-        return
-      }
-      const modes = ptyModesRef.current.get(activeHandle) || {
-        bracketedPasteMode: false,
-        altScreen: false,
-        mouseTrackingMode: 'none',
-        sgrMouseMode: false,
-        sgrMousePixelsMode: false
-      }
-      const wrap = modes.bracketedPasteMode && !modes.altScreen
-      // Why: strip embedded bracketed-paste markers from clipboard text so a
-      // malicious copy containing `\x1b[201~` can't terminate paste mode early
-      // and have the trailing bytes interpreted as shell commands. Matches
-      // xterm.js / iTerm2 behavior.
-      // eslint-disable-next-line no-control-regex -- intentional bracketed-paste marker stripping
-      const sanitized = wrap ? text.replace(/\x1b\[20[01]~/g, '') : text
-      const payload = wrap ? `\x1b[200~${sanitized}\x1b[201~` : sanitized
-      const wrappedBytes = new TextEncoder().encode(payload).byteLength
-      if (wrappedBytes > 256 * 1024) {
-        triggerError()
-        // eslint-disable-next-line no-console
-        console.warn('[mobile-clip] paste oversized', { wrappedBytes })
-        showToast('Paste too large (max 256 KiB)', 1500)
-        return
-      }
-      await client.sendRequest('terminal.send', {
-        terminal: activeHandle,
-        text: payload,
-        enter: false,
-        ...(deviceTokenRef.current
-          ? { client: { id: deviceTokenRef.current, type: 'mobile' as const } }
-          : {})
-      })
-      triggerSelection()
-      void Clipboard.hasStringAsync().then(setCanPaste)
-    } catch (e) {
-      triggerError()
-      const err = e as { name?: string; message?: string }
-      const isDisconnected = connState !== 'connected'
-      // eslint-disable-next-line no-console
-      console.warn('[mobile-clip] paste failed', { name: err.name, message: err.message })
-      if (isDisconnected) {
-        showToast('Paste failed (disconnected)', 1500)
-      }
+    const repoId = getRepoIdFromMobileWorktreeId(worktreeId)
+    const repoResponse = await client.sendRequest('repo.list')
+    if (!repoResponse.ok) {
+      throw new Error((repoResponse as RpcFailure).error.message)
     }
-  }, [client, activeHandle, canSend, connState, showToast])
+    const repos =
+      ((repoResponse as RpcSuccess).result as { repos?: RuntimeRepoSummary[] }).repos ?? []
+    return repos.find((repo) => repo.id === repoId)?.connectionId?.trim() || null
+  }, [client, worktreeId])
+
+  const refreshCanPaste = useCallback(() => {
+    void Promise.all([
+      Clipboard.hasStringAsync().catch(() => false),
+      Clipboard.hasImageAsync().catch(() => false)
+    ]).then(([hasString, hasImage]) => {
+      setCanPaste(hasString || hasImage)
+    })
+  }, [])
+
+  const handlePaste = useMobileTerminalPaste({
+    client,
+    activeHandle,
+    activeHandleRef,
+    activeSessionTabTypeRef,
+    canSend,
+    connState,
+    connStateRef,
+    clientRef,
+    deviceTokenRef,
+    flushPendingLiveInputBeforeExternalSend,
+    getActiveWorktreeConnectionId,
+    onError: triggerError,
+    onSuccess: triggerSelection,
+    ptyModesRef,
+    refreshCanPaste,
+    showToast
+  })
+
+  const flushPendingLiveInputBeforeAttachmentSend = useCallback(
+    async (targetHandle: string): Promise<boolean> => {
+      const flushedPendingInput = await flushPendingLiveInputBeforeExternalSend(targetHandle)
+      // Why: image picking/upload and IME flushing can outlive the original tab.
+      return (
+        flushedPendingInput &&
+        connStateRef.current === 'connected' &&
+        targetHandle === activeHandleRef.current &&
+        activeSessionTabTypeRef.current === 'terminal'
+      )
+    },
+    [flushPendingLiveInputBeforeExternalSend]
+  )
+
+  const { attachImage, isAttaching } = useMobileImageAttachment({
+    client,
+    activeHandle,
+    canSend,
+    connState,
+    deviceTokenRef,
+    beforeTerminalSend: flushPendingLiveInputBeforeAttachmentSend,
+    getActiveWorktreeConnectionId,
+    showToast,
+    onSuccess: triggerSelection,
+    onError: triggerError
+  })
 
   // Why: refresh canPaste on mount, AppState active, after paste.
   useEffect(() => {
     let mounted = true
     const refresh = () => {
-      void Clipboard.hasStringAsync().then((has) => {
+      void Promise.all([
+        Clipboard.hasStringAsync().catch(() => false),
+        Clipboard.hasImageAsync().catch(() => false)
+      ]).then(([hasString, hasImage]) => {
         if (mounted) {
-          setCanPaste(has)
+          setCanPaste(hasString || hasImage)
         }
       })
     }
@@ -3302,17 +3825,27 @@ export default function SessionScreen() {
     agent?: MobileNewTabAgentOption['agent'],
     options?: { initialPrompt?: string; onPromptSent?: () => void }
   ) {
-    if (!client || creating) {
+    if (!client || creatingTerminalRef.current) {
       return
     }
+    creatingTerminalRef.current = true
 
     setCreating(true)
     setCreateError('')
+
+    // Why: idempotency key so a transport-level retry (reconnect replay) of this
+    // create resolves to the same terminal instead of spawning a duplicate. Kept
+    // compact (no worktree id) to stay under the schema's length cap; the ref
+    // guard above blocks concurrent taps synchronously.
+    const clientMutationId = `mobile-create:${Date.now().toString(36)}-${Math.random()
+      .toString(36)
+      .slice(2, 10)}`
 
     try {
       const response = await client.sendRequest('session.tabs.createTerminal', {
         worktree: `id:${worktreeId}`,
         afterTabId: activeSessionTabId ?? undefined,
+        clientMutationId,
         ...(agent ? { agent } : {})
       })
       if (response.ok) {
@@ -3337,6 +3870,7 @@ export default function SessionScreen() {
         })
         if (typeof created.terminal === 'string') {
           const createdHandle = created.terminal
+          defaultTerminalHandlesToLiveInput([createdHandle])
           activeHandleRef.current = createdHandle
           setActiveHandle(createdHandle)
           setTerminals((prev) => {
@@ -3401,6 +3935,7 @@ export default function SessionScreen() {
     } catch {
       setCreateError('Failed to create terminal')
     } finally {
+      creatingTerminalRef.current = false
       setCreating(false)
     }
   }
@@ -3455,7 +3990,9 @@ export default function SessionScreen() {
     if (!client || creatingBrowser) {
       return false
     }
-    if (browserScreencastSupported !== true) {
+    // Why: read via ref so a tap that fires before the capability probe resolves
+    // (or from a stale callback) still sees the live support value.
+    if (browserScreencastSupportedRef.current !== true) {
       showToast('Desktop update required for mobile browser streaming', 1600)
       return false
     }
@@ -3474,14 +4011,25 @@ export default function SessionScreen() {
         'browser.tabCreate',
         {
           worktree: `id:${worktreeId}`,
-          url
+          url,
+          // The user opened this tab (tapped HTML / address bar) → focus it.
+          activate: true
         },
         { timeoutMs: 30_000 }
       )
       if (!response.ok) {
         throw new Error((response as RpcFailure).error.message)
       }
-      scheduleDelayedAction(() => void fetchSessionTabs(), 300)
+      // Focus the new browser tab once it syncs (fetchSessionTabs activates it
+      // via the normal path). Refresh a few times since the desktop registers
+      // the tab asynchronously.
+      const created = (response as RpcSuccess).result as { browserPageId?: string }
+      if (created.browserPageId) {
+        pendingBrowserFocusPageIdRef.current = created.browserPageId
+      }
+      void fetchSessionTabs()
+      scheduleDelayedAction(() => void fetchSessionTabs(), 400)
+      scheduleDelayedAction(() => void fetchSessionTabs(), 1200)
       return true
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to create browser'
@@ -3492,6 +4040,9 @@ export default function SessionScreen() {
       setCreatingBrowser(false)
     }
   }
+  // Keep the ref pointing at the latest handleCreateBrowser so a terminal URL
+  // tap (handleTerminalOpenUrl) always runs the current closure.
+  handleCreateBrowserRef.current = handleCreateBrowser
 
   async function handleBrowserNavigationCommand(
     tab: Extract<MobileSessionTab, { type: 'browser' }>,
@@ -3563,6 +4114,7 @@ export default function SessionScreen() {
         unsubscribeTerminal(target.handle)
         terminalRefs.current.delete(target.handle)
         initializedHandlesRef.current.delete(target.handle)
+        clearTerminalLiveInputDefault(target.handle)
         const next = terminals.filter((terminal) => terminal.handle !== target.handle)
         setTerminals(next)
         terminalsRef.current = next
@@ -3575,7 +4127,6 @@ export default function SessionScreen() {
             subscribeToTerminal(replacement.handle)
           }
         }
-        scheduleDelayedAction(() => void fetchTerminals(), 300)
       }
     } catch {
       // Close failed — keep the local tab list unchanged.
@@ -3593,18 +4144,23 @@ export default function SessionScreen() {
       })
       if (response.ok) {
         if (tab.type === 'terminal' && typeof tab.terminal === 'string') {
-          unsubscribeTerminal(tab.terminal)
-          terminalRefs.current.delete(tab.terminal)
-          initializedHandlesRef.current.delete(tab.terminal)
+          const terminalHandle = tab.terminal
+          unsubscribeTerminal(terminalHandle)
+          terminalRefs.current.delete(terminalHandle)
+          initializedHandlesRef.current.delete(terminalHandle)
+          clearTerminalLiveInputDefault(terminalHandle)
         }
         setSessionTabs((prev) => prev.filter((candidate) => candidate.id !== tab.id))
+        // Why: tombstone the closed tab and rely on the subscription/poll
+        // snapshot (gated by snapshotVersion) instead of a blind 300ms refetch
+        // that re-applied whatever the host had — often the not-yet-closed list.
+        closedTabTombstonesRef.current.set(tab.id, Date.now() + 10_000)
         if (activeSessionTabId === tab.id) {
           activeSessionTabTypeRef.current = null
           setActiveSessionTabId(null)
           activeHandleRef.current = null
           setActiveHandle(null)
         }
-        scheduleDelayedAction(() => void fetchSessionTabs(), 300)
       }
     } catch {
       // Close failed — keep the authoritative session snapshot visible.
@@ -3627,6 +4183,54 @@ export default function SessionScreen() {
     activeSessionTab?.type === 'terminal' && typeof activeSessionTab.terminal !== 'string'
       ? activeSessionTab
       : null
+
+  useEffect(() => {
+    if (!client || connState !== 'connected' || !activePendingTerminalTab) {
+      if (connState !== 'connected' || !activePendingTerminalTab) {
+        pendingTerminalActivationAttemptRef.current = null
+      }
+      return
+    }
+    const activationKey = `${worktreeId}:${activePendingTerminalTab.id}:${activePendingTerminalTab.leafId ?? ''}`
+    if (pendingTerminalActivationAttemptRef.current === activationKey) {
+      return
+    }
+    // Why: a hydrated headless/server-owned tab can already be active but still
+    // pending; activation is the RPC that materializes or focuses its PTY handle.
+    pendingTerminalActivationAttemptRef.current = activationKey
+    void client
+      .sendRequest('session.tabs.activate', {
+        worktree: `id:${worktreeId}`,
+        tabId: activePendingTerminalTab.id,
+        leafId: activePendingTerminalTab.leafId,
+        notifyClients: false
+      })
+      .then((response) => {
+        if (!response.ok) {
+          if (pendingTerminalActivationAttemptRef.current === activationKey) {
+            pendingTerminalActivationAttemptRef.current = null
+          }
+          return
+        }
+        applySessionTabs((response as RpcSuccess).result as SessionTabsResult)
+        scheduleDelayedAction(() => void fetchSessionTabs(), 300)
+        scheduleDelayedAction(() => void fetchSessionTabs(), 1200)
+      })
+      .catch(() => {
+        if (pendingTerminalActivationAttemptRef.current === activationKey) {
+          pendingTerminalActivationAttemptRef.current = null
+        }
+      })
+  }, [
+    activePendingTerminalTab,
+    applySessionTabs,
+    client,
+    connState,
+    fetchSessionTabs,
+    scheduleDelayedAction,
+    worktreeId
+  ])
+
   const showLoadingState = connState === 'connected' && !terminalsLoaded && visibleTabs.length === 0
   const showEmptyState =
     connState === 'connected' && terminalsLoaded && visibleTabs.length === 0 && !activeHandle
@@ -3669,7 +4273,7 @@ export default function SessionScreen() {
           : `${visibleTabs.length} tabs`
       : showConnectionRetry
         ? `${connectionVerdict.label} — tap to retry`
-        : STATUS_LABELS[connState]
+        : MOBILE_SESSION_STATUS_LABELS[connState]
 
   // Why: keep safe-area padding in layout at all times, then visually translate
   // the controls over the terminal when the keyboard appears. iOS keyboard
@@ -3794,6 +4398,31 @@ export default function SessionScreen() {
                 ]
               : []
 
+  // Routes a header panel-icon tap through the pure dock-vs-push decision (U1):
+  // measured dock-capable rows toggle/swap, constrained rows push full-screen.
+  const handleSessionContentRowLayout = useCallback((event: LayoutChangeEvent) => {
+    const width = Math.round(event.nativeEvent.layout.width)
+    setSessionContentRowWidth((prev) => (prev === width ? prev : width))
+  }, [])
+
+  const handlePanelTap = (tapped: Exclude<ActivePanel, null>) => {
+    const action = resolvePanelAction({ canDock: canDockPanel, tapped, current: activePanel })
+    if (action.kind === 'dock') {
+      setActivePanel(action.next)
+      return
+    }
+    router.push({
+      pathname: panelRouteDescriptor(action.panel).pathname,
+      params: {
+        hostId,
+        worktreeId,
+        name: worktreeName || '',
+        // Source control's post-diff-open dismissal keys off origin: 'session' (U2).
+        ...(action.panel === 'sourceControl' ? { origin: 'session' } : {})
+      }
+    })
+  }
+
   return (
     <View ref={setMobileSessionRootRef} style={styles.container}>
       <View style={styles.kavInner}>
@@ -3830,64 +4459,88 @@ export default function SessionScreen() {
               </Pressable>
             </View>
             <Pressable
-              style={({ pressed }) => [styles.filesButton, pressed && styles.filesButtonPressed]}
-              onPress={() =>
-                router.push({
-                  pathname: '/h/[hostId]/source-control/[worktreeId]',
-                  params: { hostId, worktreeId, name: worktreeName || '', origin: 'session' }
-                })
-              }
-              hitSlop={8}
-              accessibilityLabel="Open source control"
-            >
-              <GitBranch size={18} color={colors.textSecondary} strokeWidth={2.1} />
-            </Pressable>
-            <Pressable
-              style={({ pressed }) => [styles.filesButton, pressed && styles.filesButtonPressed]}
-              onPress={() =>
-                router.push({
-                  pathname: '/h/[hostId]/files/[worktreeId]',
-                  params: { hostId, worktreeId, name: worktreeName || '' }
-                })
-              }
+              style={({ pressed }) => [
+                styles.filesButton,
+                pressed && styles.filesButtonPressed,
+                activePanel === 'files' && styles.filesButtonActive
+              ]}
+              onPress={() => handlePanelTap('files')}
               hitSlop={8}
               accessibilityLabel="Open file explorer"
             >
               <Folder size={18} color={colors.textSecondary} strokeWidth={2.1} />
             </Pressable>
+            {!isFolderWorkspaceRoute && (
+              <Pressable
+                style={({ pressed }) => [
+                  styles.filesButton,
+                  pressed && styles.filesButtonPressed,
+                  activePanel === 'sourceControl' && styles.filesButtonActive
+                ]}
+                onPress={() => handlePanelTap('sourceControl')}
+                hitSlop={8}
+                accessibilityLabel="Open source control"
+              >
+                <GitBranch size={18} color={colors.textSecondary} strokeWidth={2.1} />
+              </Pressable>
+            )}
+            {prRepoContextLoaded && prIsGithubRepo ? (
+              <Pressable
+                style={({ pressed }) => [
+                  styles.filesButton,
+                  pressed && styles.filesButtonPressed,
+                  activePanel === 'pr' && styles.filesButtonActive
+                ]}
+                onPress={() => handlePanelTap('pr')}
+                hitSlop={8}
+                accessibilityLabel="Open pull request"
+              >
+                <ListChecks size={18} color={colors.textSecondary} strokeWidth={2.1} />
+              </Pressable>
+            ) : null}
           </View>
 
           {visibleTabs.length > 0 && (
             <View style={styles.tabBar}>
+              {/* Why: tab taps must register on the first press while the live
+                  keyboard is open instead of being eaten by keyboard dismissal
+                  (#5106); leaving a non-live tab still closes the keyboard
+                  because the live input unmounts. */}
               <ScrollView
+                ref={tabStripRef}
                 horizontal
                 showsHorizontalScrollIndicator={false}
                 style={styles.tabScroll}
                 contentContainerStyle={styles.tabContent}
+                keyboardShouldPersistTaps="handled"
+                scrollEventThrottle={16}
+                onScroll={(e) => {
+                  tabStripOffsetRef.current = e.nativeEvent.contentOffset.x
+                }}
+                onLayout={(e) => {
+                  tabStripViewportWidthRef.current = e.nativeEvent.layout.width
+                  scrollActiveTabIntoView(activeSessionTabIdRef.current, false)
+                }}
+                onContentSizeChange={(width) => {
+                  tabStripContentWidthRef.current = width
+                  scrollActiveTabIntoView(activeSessionTabIdRef.current, false)
+                }}
               >
                 {visibleTabs.map((t) => (
                   <Pressable
                     key={t.id}
                     style={[styles.tab, t.id === activeSessionTabId && styles.tabActive]}
+                    onLayout={(e) => {
+                      const { x, width } = e.nativeEvent.layout
+                      tabLayoutsRef.current.set(t.id, { x, width })
+                      if (t.id === activeSessionTabIdRef.current) {
+                        scrollActiveTabIntoView(t.id, false)
+                      }
+                    }}
                     onPress={() => switchSessionTab(t)}
                     onLongPress={() => {
                       triggerMediumImpact()
-                      if (t.type === 'terminal') {
-                        if (typeof t.terminal !== 'string') {
-                          return
-                        }
-                        setActionTarget({
-                          handle: t.terminal,
-                          title: t.title,
-                          isActive: t.terminal === activeHandle
-                        })
-                      } else if (t.type === 'markdown') {
-                        setMarkdownActionTarget(t)
-                      } else if (t.type === 'file') {
-                        setFileActionTarget(t)
-                      } else {
-                        setBrowserActionTarget(t)
-                      }
+                      openSessionTabActionSheetAfterKeyboardDismiss(t)
                     }}
                     delayLongPress={400}
                   >
@@ -3901,6 +4554,11 @@ export default function SessionScreen() {
                       {t.type === 'file' && (
                         <File size={13} color={colors.textSecondary} strokeWidth={2.1} />
                       )}
+                      {t.type === 'terminal' &&
+                        (() => {
+                          const agentId = resolveMobileTerminalTabAgentId(t)
+                          return agentId ? <MobileAgentIcon agentId={agentId} size={13} /> : null
+                        })()}
                       <Text
                         style={[
                           styles.tabText,
@@ -3913,61 +4571,15 @@ export default function SessionScreen() {
                     </View>
                   </Pressable>
                 ))}
-                <Pressable
-                  style={({ pressed }) => [
-                    styles.newTerminalButton,
-                    pressed && styles.newTerminalButtonPressed,
-                    (creating ||
-                      creatingBrowser ||
-                      creatingMarkdown ||
-                      connState !== 'connected') &&
-                      styles.newTerminalButtonDisabled
-                  ]}
-                  disabled={
-                    creating || creatingBrowser || creatingMarkdown || connState !== 'connected'
-                  }
-                  onPress={() => {
-                    setCreateError('')
-                    setShowCreateTabDrawer(true)
-                  }}
-                  accessibilityLabel="New tab"
-                >
-                  <Plus size={16} color={colors.textSecondary} strokeWidth={2.2} />
-                </Pressable>
               </ScrollView>
-            </View>
-          )}
-        </SafeAreaView>
-
-        {createWarning ? (
-          <View style={styles.createWarningBanner}>
-            <AlertTriangle size={16} color={colors.statusAmber} strokeWidth={2.2} />
-            <Text style={styles.createWarningText}>{createWarning}</Text>
-            <Pressable
-              style={styles.createWarningDismiss}
-              onPress={() => setCreateWarningState(dismissMobileSessionCreateWarningState)}
-              accessibilityLabel="Dismiss workspace creation warning"
-              hitSlop={8}
-            >
-              <X size={16} color={colors.textMuted} strokeWidth={2.2} />
-            </Pressable>
-          </View>
-        ) : null}
-
-        {showLoadingState ? (
-          <View style={styles.emptyState}>
-            <ActivityIndicator size="small" color={colors.textSecondary} />
-          </View>
-        ) : showEmptyState ? (
-          <View style={styles.emptyState}>
-            <Text style={styles.emptyText}>No tabs in this session</Text>
-            {createError ? <Text style={styles.createError}>{createError}</Text> : null}
-            <View style={styles.emptyActions}>
+              {/* Why: pinned outside the scroll strip so the new-agent button
+                  stays reachable no matter how far the tabs scroll. */}
               <Pressable
-                style={[
-                  styles.createButton,
+                style={({ pressed }) => [
+                  styles.newTerminalButton,
+                  pressed && styles.newTerminalButtonPressed,
                   (creating || creatingBrowser || creatingMarkdown || connState !== 'connected') &&
-                    styles.createButtonDisabled
+                    styles.newTerminalButtonDisabled
                 ]}
                 disabled={
                   creating || creatingBrowser || creatingMarkdown || connState !== 'connected'
@@ -3976,384 +4588,513 @@ export default function SessionScreen() {
                   setCreateError('')
                   setShowCreateTabDrawer(true)
                 }}
+                accessibilityLabel="New tab"
               >
-                <Text style={styles.createButtonText}>
-                  {creating || creatingBrowser || creatingMarkdown ? 'Creating...' : 'Create Tab'}
-                </Text>
+                <Plus size={16} color={colors.textSecondary} strokeWidth={2.2} />
               </Pressable>
             </View>
-          </View>
-        ) : activeMarkdownTab ? (
-          <View style={styles.markdownFrame}>
-            <MarkdownReader
-              documentId={activeMarkdownTab.id}
-              doc={markdownDocs.get(activeMarkdownTab.id)}
-              onRefresh={() => void readMarkdownTab(activeMarkdownTab)}
-              onChange={(content) => updateMarkdownLocalContent(activeMarkdownTab.id, content)}
-              onSave={() => void saveMarkdownTab(activeMarkdownTab)}
-              onCopy={() => void copyMarkdownLocalContent(activeMarkdownTab.id)}
-              onDiscard={() => discardMarkdownLocalContent(activeMarkdownTab)}
-              keyboardLift={keyboardLift}
-            />
-            {toastMessage && (
-              <Animated.View pointerEvents="none" style={[styles.toast, toastAnimatedStyle]}>
-                <Text style={styles.toastText}>{toastMessage}</Text>
-              </Animated.View>
-            )}
-          </View>
-        ) : activeFileTab ? (
-          <View style={styles.markdownFrame}>
-            <FileReader
-              doc={fileDocs.get(activeFileTab.id)}
-              title={activeFileTab.title || 'File'}
-              relativePath={activeFileTab.relativePath}
-              language={activeFileTab.language}
-              diffCommentActions={
-                activeFileTab.diffSource === 'staged' || activeFileTab.diffSource === 'unstaged'
-                  ? {
-                      comments: diffComments,
-                      busy: diffCommentBusy,
-                      onAdd: addDiffCommentForFile,
-                      onDelete: deleteDiffCommentForFile,
-                      onCopyAll: copyDiffCommentsToClipboard,
-                      onSendAll: sendDiffCommentsToAgent
-                    }
-                  : undefined
-              }
-            />
-            {toastMessage && (
-              <Animated.View pointerEvents="none" style={[styles.toast, toastAnimatedStyle]}>
-                <Text style={styles.toastText}>{toastMessage}</Text>
-              </Animated.View>
-            )}
-          </View>
-        ) : activeBrowserTab ? (
-          <View style={styles.browserFrame}>
-            {/* Why: the pane owns imperative frame refs; browser tabs should
-            never render a stale frame while the old stream effect cleans up. */}
-            <MobileBrowserPane
-              key={activeBrowserTab.browserPageId ?? activeBrowserTab.id}
-              client={client}
-              worktreeId={worktreeId}
-              tab={activeBrowserTab}
-              screencastSupported={browserScreencastSupported}
-              keyboardLift={keyboardLift}
-              bottomInset={insets.bottom}
-              onToast={showToast}
-            />
-            {toastMessage && (
-              <Animated.View pointerEvents="none" style={[styles.toast, toastAnimatedStyle]}>
-                <Text style={styles.toastText}>{toastMessage}</Text>
-              </Animated.View>
-            )}
-          </View>
-        ) : activePendingTerminalTab ? (
-          <View style={styles.emptyState}>
-            <ActivityIndicator size="small" color={colors.textSecondary} />
-            <Text style={styles.emptyText}>
-              {activePendingTerminalTab.title || 'Loading terminal'}
-            </Text>
-          </View>
-        ) : (
-          <View
-            style={styles.terminalFrame}
-            onLayout={(e) => {
-              terminalFrameHeightRef.current = e.nativeEvent.layout.height
-            }}
-          >
-            {terminals.map((terminal) => (
-              <TerminalPaneView
-                key={terminal.handle}
-                handle={terminal.handle}
-                active={terminal.handle === activeHandle}
-                keyboardLift={terminal.handle === activeHandle ? activeTerminalKeyboardLift : 0}
-                terminalTheme={terminal.terminalTheme}
-                onRef={setTerminalWebViewRef}
-                onWebReady={handleTerminalWebReady}
-                onSelectionMode={handleSelectionMode}
-                onSelectionCopy={handleSelectionCopy}
-                onSelectionEvicted={handleSelectionEvicted}
-                onModesChanged={handleModesChanged}
-                onKeyboardAvoidanceMetrics={handleKeyboardAvoidanceMetrics}
-                onHaptic={handleHaptic}
-                onTerminalInput={handleTerminalInput}
-                onTerminalTap={handleTerminalTap}
-              />
-            ))}
-            {toastMessage && (
-              <Animated.View pointerEvents="none" style={[styles.toast, toastAnimatedStyle]}>
-                <Text style={styles.toastText}>{toastMessage}</Text>
-              </Animated.View>
-            )}
-          </View>
-        )}
+          )}
+        </SafeAreaView>
 
-        {/* Why: translate instead of resizing so keyboard open/close does not
-            trigger a server-side PTY viewport change. */}
-        {!activeMarkdownTab && !activeFileTab && !activeBrowserTab && (
-          <View
-            style={[
-              styles.commandDock,
-              { paddingBottom: insets.bottom, transform: [{ translateY: -keyboardLift }] }
-            ]}
-          >
-            {/* Accessory keys */}
-            <View style={styles.accessoryBar}>
-              <ScrollView
-                horizontal
-                showsHorizontalScrollIndicator={false}
-                contentContainerStyle={styles.accessoryContent}
-              >
+        {/* Content-row host (KTD2): the header/tab chrome stays a full-width sibling
+            above; on wide the post-chrome content shares this row with the docked panel.
+            There is no single terminal node, so the entire conditional block is the
+            flex-1 left child. On narrow the dock never renders and layout is unchanged. */}
+        <View style={styles.sessionContentRow} onLayout={handleSessionContentRowLayout}>
+          <View style={styles.sessionContentMain}>
+            {createWarning ? (
+              <View style={styles.createWarningBanner}>
+                <AlertTriangle size={16} color={colors.statusAmber} strokeWidth={2.2} />
+                <Text style={styles.createWarningText}>{createWarning}</Text>
                 <Pressable
-                  style={({ pressed }) => [
-                    styles.accessoryKey,
-                    pressed && styles.accessoryKeyPressed,
-                    !canSend && styles.accessoryKeyDisabled
-                  ]}
-                  disabled={!canSend}
-                  onPress={() => {
-                    if (activeHandle) {
-                      void toggleDisplayMode(activeHandle)
-                    }
-                  }}
-                  accessibilityLabel={
-                    isPhoneMode(activeHandle) ? 'Switch to desktop mode' : 'Switch to phone mode'
-                  }
+                  style={styles.createWarningDismiss}
+                  onPress={() => setCreateWarningState(dismissMobileSessionCreateWarningState)}
+                  accessibilityLabel="Dismiss workspace creation warning"
+                  hitSlop={8}
                 >
-                  {isPhoneMode(activeHandle) ? (
-                    <Monitor size={14} color={canSend ? colors.textSecondary : colors.textMuted} />
-                  ) : (
-                    <Smartphone
-                      size={14}
-                      color={canSend ? colors.textSecondary : colors.textMuted}
-                    />
-                  )}
+                  <X size={16} color={colors.textMuted} strokeWidth={2.2} />
                 </Pressable>
-                <Pressable
-                  style={({ pressed }) => [
-                    styles.accessoryKey,
-                    liveInputEnabled && styles.accessoryKeyActive,
-                    pressed && styles.accessoryKeyPressed,
-                    !canSend && styles.accessoryKeyDisabled
-                  ]}
-                  disabled={!canSend}
-                  onPress={toggleLiveInput}
-                  accessibilityLabel={
-                    liveInputEnabled
-                      ? 'Switch to buffered command input'
-                      : 'Switch to live terminal input'
-                  }
-                >
-                  <ChevronsRight
-                    size={14}
-                    color={
-                      liveInputEnabled
-                        ? colors.bgBase
-                        : canSend
-                          ? colors.textSecondary
-                          : colors.textMuted
+              </View>
+            ) : null}
+
+            {showLoadingState ? (
+              <View style={styles.emptyState}>
+                <ActivityIndicator size="small" color={colors.textSecondary} />
+              </View>
+            ) : showEmptyState ? (
+              <View style={styles.emptyState}>
+                <Text style={styles.emptyText}>No tabs in this session</Text>
+                {createError ? <Text style={styles.createError}>{createError}</Text> : null}
+                <View style={styles.emptyActions}>
+                  <Pressable
+                    style={[
+                      styles.createButton,
+                      (creating ||
+                        creatingBrowser ||
+                        creatingMarkdown ||
+                        connState !== 'connected') &&
+                        styles.createButtonDisabled
+                    ]}
+                    disabled={
+                      creating || creatingBrowser || creatingMarkdown || connState !== 'connected'
                     }
-                  />
-                </Pressable>
-                {canPaste && (
-                  <Pressable
-                    style={({ pressed }) => [
-                      styles.accessoryKey,
-                      pressed && styles.accessoryKeyPressed,
-                      !canSend && styles.accessoryKeyDisabled
-                    ]}
-                    disabled={!canSend}
-                    onPress={() => void handlePaste()}
-                    accessibilityLabel="Paste from clipboard"
-                  >
-                    <Text
-                      style={[styles.accessoryKeyText, !canSend && styles.accessoryKeyTextDisabled]}
-                    >
-                      Paste
-                    </Text>
-                  </Pressable>
-                )}
-                {visibleBuiltInAccessoryKeys.map((key) => (
-                  <Pressable
-                    key={key.id}
-                    style={({ pressed }) => [
-                      styles.accessoryKey,
-                      pressed && styles.accessoryKeyPressed,
-                      !canSend && styles.accessoryKeyDisabled
-                    ]}
-                    disabled={!canSend}
-                    onPressIn={() => {
-                      if (!key.repeatable) {
-                        return
-                      }
-                      void handleAccessoryKey(key.bytes)
-                      startAccessoryRepeat(key.bytes)
-                    }}
-                    onPressOut={() => {
-                      if (key.repeatable) {
-                        stopAccessoryRepeat()
-                      }
-                    }}
                     onPress={() => {
-                      if (key.repeatable) {
-                        return
-                      }
-                      void handleAccessoryKey(key.bytes)
+                      setCreateError('')
+                      setShowCreateTabDrawer(true)
                     }}
-                    accessibilityLabel={key.accessibilityLabel ?? `Send ${key.label}`}
                   >
-                    <Text
-                      style={[styles.accessoryKeyText, !canSend && styles.accessoryKeyTextDisabled]}
-                    >
-                      {key.label}
+                    <Text style={styles.createButtonText}>
+                      {creating || creatingBrowser || creatingMarkdown
+                        ? 'Creating...'
+                        : 'Create Tab'}
                     </Text>
                   </Pressable>
-                ))}
-                {customKeys.map((key) => (
-                  <Pressable
-                    key={key.id}
-                    style={({ pressed }) => [
-                      styles.accessoryKey,
-                      styles.customAccessoryKey,
-                      pressed && styles.accessoryKeyPressed,
-                      !canSend && styles.accessoryKeyDisabled
-                    ]}
-                    disabled={!canSend}
-                    onPress={() => void handleAccessoryKey(key.bytes)}
-                    onLongPress={() => {
-                      triggerMediumImpact()
-                      setDeleteKeyTarget(key)
-                    }}
-                    delayLongPress={400}
-                    accessibilityLabel={`Send ${key.label}`}
-                  >
-                    <Text
-                      style={[styles.accessoryKeyText, !canSend && styles.accessoryKeyTextDisabled]}
-                    >
-                      {key.label}
-                    </Text>
-                  </Pressable>
-                ))}
-                <Pressable
-                  style={({ pressed }) => [
-                    styles.accessoryKey,
-                    pressed && styles.accessoryKeyPressed
-                  ]}
-                  onPress={() => setShowCustomKeyModal(true)}
-                  accessibilityLabel="Add custom shortcut"
-                >
-                  <Plus size={14} color={colors.textSecondary} strokeWidth={2.2} />
-                </Pressable>
-              </ScrollView>
-            </View>
-
-            {/* Input bar */}
-            {liveInputEnabled ? (
-              <Pressable
-                style={[styles.inputBar, styles.liveInputBar]}
-                disabled={!canSend}
-                onPress={focusLiveInput}
-                accessibilityLabel="Focus live terminal input"
-              >
-                <KeyboardIcon size={16} color={colors.textSecondary} strokeWidth={2} />
-                <Text style={styles.liveInputHint} numberOfLines={1}>
-                  Keyboard input directly goes to terminal
-                </Text>
-                <TextInput
-                  ref={liveInputRef}
-                  style={styles.liveInputCapture}
-                  value={liveInputCapture}
-                  onChangeText={handleLiveInputChange}
-                  onKeyPress={handleLiveInputKeyPress}
-                  onSubmitEditing={handleLiveInputSubmit}
-                  placeholder=""
-                  autoCapitalize="none"
-                  autoCorrect={false}
-                  spellCheck={false}
-                  keyboardType={Platform.OS === 'ios' ? 'ascii-capable' : 'visible-password'}
-                  returnKeyType="default"
-                  blurOnSubmit={false}
-                  editable={canSend}
-                  importantForAutofill="no"
-                  textContentType="none"
+                </View>
+              </View>
+            ) : activeMarkdownTab ? (
+              <View style={styles.markdownFrame}>
+                <MarkdownReader
+                  documentId={activeMarkdownTab.id}
+                  doc={markdownDocs.get(activeMarkdownTab.id)}
+                  onRefresh={() => void readMarkdownTab(activeMarkdownTab)}
+                  onChange={(content) => updateMarkdownLocalContent(activeMarkdownTab.id, content)}
+                  onSave={() => void saveMarkdownTab(activeMarkdownTab)}
+                  onCopy={() => void copyMarkdownLocalContent(activeMarkdownTab.id)}
+                  onDiscard={() => discardMarkdownLocalContent(activeMarkdownTab)}
+                  keyboardLift={keyboardLift}
                 />
-              </Pressable>
-            ) : (
-              <View style={styles.inputBar}>
-                <TextInput
-                  style={styles.textInput}
-                  value={input}
-                  onChangeText={setInput}
-                  placeholder="Type a command…"
-                  placeholderTextColor={colors.textMuted}
-                  autoCapitalize="none"
-                  autoCorrect={false}
-                  returnKeyType="send"
-                  editable={canSend}
-                  onSubmitEditing={() => void handleSend()}
-                />
-                <Pressable
-                  style={[
-                    styles.dictationButton,
-                    (dictation.isStarting || dictation.isRecording) && styles.dictationButtonActive,
-                    !canSend && styles.sendButtonDisabled
-                  ]}
-                  disabled={!canSend}
-                  onPress={() => {
-                    if (dictation.isProcessing) {
-                      void dictation.cancel()
-                    } else if (dictation.isStarting) {
-                      return
-                    } else if (dictation.isRecording) {
-                      void dictation.stop()
-                    } else {
-                      void dictation.start().catch((err) => {
-                        triggerError()
-                        showToast(err instanceof Error ? err.message : String(err))
-                      })
-                    }
-                  }}
-                  onLongPress={() => {
-                    if (dictation.isRecording || dictation.isProcessing) {
-                      void dictation.cancel()
-                    }
-                  }}
-                  accessibilityLabel={
-                    dictation.isRecording
-                      ? 'Stop voice dictation'
-                      : dictation.isProcessing
-                        ? 'Cancel voice dictation'
-                        : dictation.isStarting
-                          ? 'Starting voice dictation'
-                          : 'Start voice dictation'
+                {toastMessage && (
+                  <Animated.View pointerEvents="none" style={[styles.toast, toastAnimatedStyle]}>
+                    <Text style={styles.toastText}>{toastMessage}</Text>
+                  </Animated.View>
+                )}
+              </View>
+            ) : activeFileTab ? (
+              <View style={styles.markdownFrame}>
+                <FileReader
+                  doc={fileDocs.get(activeFileTab.id)}
+                  title={activeFileTab.title || 'File'}
+                  relativePath={activeFileTab.relativePath}
+                  language={activeFileTab.language}
+                  diffCommentActions={
+                    activeFileTab.diffSource === 'staged' || activeFileTab.diffSource === 'unstaged'
+                      ? {
+                          comments: diffComments,
+                          busy: diffCommentBusy,
+                          onAdd: addDiffCommentForFile,
+                          onDelete: deleteDiffCommentForFile,
+                          onCopyAll: copyDiffCommentsToClipboard,
+                          onSendAll: sendDiffCommentsToAgent
+                        }
+                      : undefined
                   }
-                >
-                  {dictation.isProcessing ? (
-                    <ActivityIndicator size="small" color={colors.textSecondary} />
-                  ) : dictation.isStarting || dictation.isRecording ? (
-                    <Mic size={17} color={colors.textPrimary} strokeWidth={2.4} />
-                  ) : (
-                    <Mic size={17} color={colors.textSecondary} strokeWidth={2.4} />
-                  )}
-                </Pressable>
-                <Pressable
-                  style={[styles.sendButton, !canSend && styles.sendButtonDisabled]}
-                  disabled={!canSend}
-                  onPress={() => void handleSend()}
-                  accessibilityLabel="Send command"
-                >
-                  <ArrowUp size={18} color={colors.textSecondary} strokeWidth={2.5} />
-                </Pressable>
+                />
+                {toastMessage && (
+                  <Animated.View pointerEvents="none" style={[styles.toast, toastAnimatedStyle]}>
+                    <Text style={styles.toastText}>{toastMessage}</Text>
+                  </Animated.View>
+                )}
+              </View>
+            ) : activeBrowserTab ? (
+              <View style={styles.browserFrame}>
+                {/* Why: the pane owns imperative frame refs; browser tabs should
+            never render a stale frame while the old stream effect cleans up. */}
+                <MobileBrowserPane
+                  key={activeBrowserTab.browserPageId ?? activeBrowserTab.id}
+                  client={client}
+                  worktreeId={worktreeId}
+                  tab={activeBrowserTab}
+                  screencastSupported={browserScreencastSupported}
+                  keyboardLift={keyboardLift}
+                  bottomInset={insets.bottom}
+                  onToast={showToast}
+                />
+                {toastMessage && (
+                  <Animated.View pointerEvents="none" style={[styles.toast, toastAnimatedStyle]}>
+                    <Text style={styles.toastText}>{toastMessage}</Text>
+                  </Animated.View>
+                )}
+              </View>
+            ) : activePendingTerminalTab ? (
+              <View style={styles.emptyState}>
+                <ActivityIndicator size="small" color={colors.textSecondary} />
+                <Text style={styles.emptyText}>
+                  {activePendingTerminalTab.title || 'Loading terminal'}
+                </Text>
+              </View>
+            ) : (
+              <View
+                style={styles.terminalFrame}
+                onLayout={(e) => {
+                  terminalFrameHeightRef.current = e.nativeEvent.layout.height
+                  // Trigger a refit only when the width actually changes (sidebar
+                  // resize, fold, rotation) — avoids churn on height-only changes.
+                  const nextWidth = Math.round(e.nativeEvent.layout.width)
+                  setTerminalFrameWidth((prev) => (prev === nextWidth ? prev : nextWidth))
+                }}
+              >
+                {terminals.map((terminal) => (
+                  <TerminalPaneView
+                    key={terminal.handle}
+                    handle={terminal.handle}
+                    active={terminal.handle === activeHandle}
+                    keyboardLift={terminal.handle === activeHandle ? activeTerminalKeyboardLift : 0}
+                    terminalTheme={terminal.terminalTheme}
+                    textScale={terminalTextScale}
+                    onTextScaleChange={(scale) => {
+                      // Why: pinch-to-zoom in the WebView reports a new preset; persist
+                      // it so the size sticks across panes and app launches.
+                      setTerminalTextScale(scale)
+                      void saveTerminalTextScale(scale)
+                    }}
+                    onRef={setTerminalWebViewRef}
+                    onWebReady={handleTerminalWebReady}
+                    onSelectionMode={handleSelectionMode}
+                    onSelectionCopy={handleSelectionCopy}
+                    onSelectionEvicted={handleSelectionEvicted}
+                    onModesChanged={handleModesChanged}
+                    onKeyboardAvoidanceMetrics={handleKeyboardAvoidanceMetrics}
+                    onHaptic={handleHaptic}
+                    onTerminalInput={handleTerminalInput}
+                    onTerminalTap={handleTerminalTap}
+                    onFileTap={handleFileTap}
+                    onOpenUrl={handleTerminalOpenUrl}
+                  />
+                ))}
+                {toastMessage && (
+                  <Animated.View pointerEvents="none" style={[styles.toast, toastAnimatedStyle]}>
+                    <Text style={styles.toastText}>{toastMessage}</Text>
+                  </Animated.View>
+                )}
+              </View>
+            )}
+
+            {/* Why: translate instead of resizing so keyboard open/close does not
+            trigger a server-side PTY viewport change. */}
+            {!activeMarkdownTab && !activeFileTab && !activeBrowserTab && (
+              <View
+                style={[
+                  styles.commandDock,
+                  { paddingBottom: insets.bottom, transform: [{ translateY: -keyboardLift }] }
+                ]}
+              >
+                {/* Accessory keys */}
+                <View style={styles.accessoryBar}>
+                  {/* Why: with default tap handling the first tap on any accessory
+                  key dismisses the open keyboard and is swallowed, so live
+                  input lost its keyboard on every Esc/Tab press (#5106). */}
+                  <ScrollView
+                    horizontal
+                    showsHorizontalScrollIndicator={false}
+                    contentContainerStyle={styles.accessoryContent}
+                    keyboardShouldPersistTaps="always"
+                  >
+                    <Pressable
+                      style={({ pressed }) => [
+                        styles.accessoryKey,
+                        pressed && styles.accessoryKeyPressed,
+                        !canSend && styles.accessoryKeyDisabled
+                      ]}
+                      disabled={!canSend}
+                      onPress={() => {
+                        if (activeHandle) {
+                          void toggleDisplayMode(activeHandle)
+                        }
+                      }}
+                      accessibilityLabel={
+                        isPhoneMode(activeHandle)
+                          ? 'Switch to desktop mode'
+                          : 'Switch to phone mode'
+                      }
+                    >
+                      {isPhoneMode(activeHandle) ? (
+                        <Monitor
+                          size={14}
+                          color={canSend ? colors.textSecondary : colors.textMuted}
+                        />
+                      ) : (
+                        <Smartphone
+                          size={14}
+                          color={canSend ? colors.textSecondary : colors.textMuted}
+                        />
+                      )}
+                    </Pressable>
+                    <Pressable
+                      style={({ pressed }) => [
+                        styles.accessoryKey,
+                        liveInputEnabled && styles.accessoryKeyActive,
+                        pressed && styles.accessoryKeyPressed,
+                        !canSend && styles.accessoryKeyDisabled
+                      ]}
+                      disabled={!canSend}
+                      onPress={toggleLiveInput}
+                      accessibilityLabel={
+                        liveInputEnabled
+                          ? 'Switch to buffered command input'
+                          : 'Switch to live terminal input'
+                      }
+                    >
+                      <ChevronsRight
+                        size={14}
+                        color={
+                          liveInputEnabled
+                            ? colors.bgBase
+                            : canSend
+                              ? colors.textSecondary
+                              : colors.textMuted
+                        }
+                      />
+                    </Pressable>
+                    {canPaste && (
+                      <Pressable
+                        style={({ pressed }) => [
+                          styles.accessoryKey,
+                          pressed && styles.accessoryKeyPressed,
+                          !canSend && styles.accessoryKeyDisabled
+                        ]}
+                        disabled={!canSend}
+                        onPress={() => void handlePaste()}
+                        accessibilityLabel="Paste from clipboard"
+                      >
+                        <Text
+                          style={[
+                            styles.accessoryKeyText,
+                            !canSend && styles.accessoryKeyTextDisabled
+                          ]}
+                        >
+                          Paste
+                        </Text>
+                      </Pressable>
+                    )}
+                    {visibleBuiltInAccessoryKeys.map((key) => (
+                      <Pressable
+                        key={key.id}
+                        style={({ pressed }) => [
+                          styles.accessoryKey,
+                          pressed && styles.accessoryKeyPressed,
+                          !canSend && styles.accessoryKeyDisabled
+                        ]}
+                        disabled={!canSend}
+                        onPressIn={() => {
+                          if (!key.repeatable) {
+                            return
+                          }
+                          const input = createTerminalLiveAccessoryInput(key)
+                          void handleAccessoryKey(input)
+                          startAccessoryRepeat(input)
+                        }}
+                        onPressOut={() => {
+                          if (key.repeatable) {
+                            stopAccessoryRepeat()
+                          }
+                        }}
+                        onPress={() => {
+                          if (key.repeatable) {
+                            return
+                          }
+                          void handleAccessoryKey(createTerminalLiveAccessoryInput(key))
+                        }}
+                        accessibilityLabel={key.accessibilityLabel ?? `Send ${key.label}`}
+                      >
+                        <Text
+                          style={[
+                            styles.accessoryKeyText,
+                            !canSend && styles.accessoryKeyTextDisabled
+                          ]}
+                        >
+                          {key.label}
+                        </Text>
+                      </Pressable>
+                    ))}
+                    {customKeys.map((key) => (
+                      <Pressable
+                        key={key.id}
+                        style={({ pressed }) => [
+                          styles.accessoryKey,
+                          styles.customAccessoryKey,
+                          pressed && styles.accessoryKeyPressed,
+                          !canSend && styles.accessoryKeyDisabled
+                        ]}
+                        disabled={!canSend}
+                        onPress={() => void handleAccessoryKey({ bytes: key.bytes })}
+                        onLongPress={() => {
+                          triggerMediumImpact()
+                          setDeleteKeyTarget(key)
+                        }}
+                        delayLongPress={400}
+                        accessibilityLabel={`Send ${key.label}`}
+                      >
+                        <Text
+                          style={[
+                            styles.accessoryKeyText,
+                            !canSend && styles.accessoryKeyTextDisabled
+                          ]}
+                        >
+                          {key.label}
+                        </Text>
+                      </Pressable>
+                    ))}
+                    <Pressable
+                      style={({ pressed }) => [
+                        styles.accessoryKey,
+                        pressed && styles.accessoryKeyPressed
+                      ]}
+                      onPress={() => setShowCustomKeyModal(true)}
+                      accessibilityLabel="Add custom shortcut"
+                    >
+                      <Plus size={14} color={colors.textSecondary} strokeWidth={2.2} />
+                    </Pressable>
+                  </ScrollView>
+                </View>
+
+                {/* Input bar */}
+                {liveInputEnabled ? (
+                  <View style={[styles.inputBar, styles.liveInputBar]}>
+                    <Pressable
+                      style={({ pressed }) => [
+                        styles.liveInputFocusTarget,
+                        pressed && styles.liveInputFocusTargetPressed,
+                        !canSend && styles.liveInputFocusTargetDisabled
+                      ]}
+                      disabled={!canSend}
+                      onPress={focusLiveInput}
+                      accessibilityRole="button"
+                      accessibilityLabel="Show keyboard for live terminal input"
+                      accessibilityHint="Typed text is sent directly to the active terminal"
+                    >
+                      <KeyboardIcon size={16} color={colors.textSecondary} strokeWidth={2} />
+                      <MobileTerminalLiveInputStatus
+                        dictation={dictation}
+                        isAttaching={isAttaching}
+                      />
+                    </Pressable>
+                    <MobileTerminalInputActions
+                      canSend={canSend}
+                      isAttaching={isAttaching}
+                      dictation={dictation}
+                      dictationMode={dictationMode}
+                      buttonStyle={styles.dictationButton}
+                      activeButtonStyle={styles.dictationButtonActive}
+                      disabledButtonStyle={styles.sendButtonDisabled}
+                      onAttachImage={() => void attachImage('library')}
+                      onAttachFile={() => void attachImage('files')}
+                      onDictationToggle={handleDictationToggle}
+                      onDictationPressIn={handleDictationPressIn}
+                      onDictationPressOut={handleDictationPressOut}
+                      onDictationCancel={cancelDictation}
+                    />
+                    <TextInput
+                      ref={liveInputRef}
+                      style={styles.liveInputCapture}
+                      value={liveInputCapture}
+                      onChangeText={handleLiveInputChange}
+                      onKeyPress={handleLiveInputKeyPress}
+                      onSubmitEditing={handleLiveInputSubmit}
+                      placeholder=""
+                      showSoftInputOnFocus
+                      autoCapitalize="none"
+                      autoCorrect={false}
+                      spellCheck={false}
+                      smartInsertDelete={false}
+                      // Why: iOS textContentType wins over autoComplete and can
+                      // narrow the keyboard surface; keep IME switching available.
+                      autoComplete="off"
+                      keyboardType={getTerminalLiveInputKeyboardType(Platform.OS)}
+                      returnKeyType="default"
+                      blurOnSubmit={false}
+                      editable={canSend}
+                      importantForAutofill="no"
+                    />
+                  </View>
+                ) : (
+                  <View style={styles.inputBar}>
+                    <TextInput
+                      // Why: Android caches the IME inputType at mount, so toggling
+                      // autocomplete must remount there; iOS can update without a focus-costly remount.
+                      key={
+                        Platform.OS === 'android'
+                          ? autocompleteEnabled
+                            ? 'cmd-input-ac-on'
+                            : 'cmd-input-ac-off'
+                          : 'cmd-input'
+                      }
+                      style={styles.textInput}
+                      value={input}
+                      onChangeText={(text) =>
+                        setInput((previousText) => normalizeTerminalTextInput(text, previousText))
+                      }
+                      placeholder="Type a command…"
+                      placeholderTextColor={colors.textMuted}
+                      autoCapitalize="none"
+                      autoCorrect={autocompleteEnabled}
+                      spellCheck={autocompleteEnabled}
+                      smartInsertDelete={false}
+                      // Why: terminal commands are not autofill content, but the
+                      // keyboard must stay default so non-Latin IMEs remain selectable.
+                      autoComplete="off"
+                      keyboardType={getTerminalCommandKeyboardType(
+                        Platform.OS,
+                        autocompleteEnabled
+                      )}
+                      returnKeyType="send"
+                      editable={canSend}
+                      onSubmitEditing={() => void handleSend()}
+                    />
+                    <MobileTerminalInputActions
+                      canSend={canSend}
+                      isAttaching={isAttaching}
+                      dictation={dictation}
+                      dictationMode={dictationMode}
+                      buttonStyle={styles.dictationButton}
+                      activeButtonStyle={styles.dictationButtonActive}
+                      disabledButtonStyle={styles.sendButtonDisabled}
+                      onAttachImage={() => void attachImage('library')}
+                      onAttachFile={() => void attachImage('files')}
+                      onDictationToggle={handleDictationToggle}
+                      onDictationPressIn={handleDictationPressIn}
+                      onDictationPressOut={handleDictationPressOut}
+                      onDictationCancel={cancelDictation}
+                    />
+                    <Pressable
+                      style={[styles.sendButton, !canSend && styles.sendButtonDisabled]}
+                      disabled={!canSend}
+                      onPress={() => void handleSend()}
+                      accessibilityLabel="Send command"
+                    >
+                      <ArrowUp size={18} color={colors.textSecondary} strokeWidth={2.5} />
+                    </Pressable>
+                  </View>
+                )}
               </View>
             )}
           </View>
-        )}
+          {canDockPanel && activePanel !== null && (
+            <SessionDockColumn
+              activePanel={activePanel}
+              hostId={hostId}
+              worktreeId={worktreeId}
+              name={worktreeName || ''}
+              client={client}
+              connState={connState}
+              branch={prBranch}
+              headSha={prHeadSha}
+              gitStatus={prStatus}
+              isGithubRepo={prIsGithubRepo}
+              branchContextLoaded={prContextLoaded && prRepoContextLoaded}
+              availableWidth={sessionContentRowWidth}
+              onRequestClose={() => setActivePanel(null)}
+              onFileOpenStart={handleFileOpenStart}
+              onOpenedFileDiff={handleOpenedFileDiff}
+            />
+          )}
+        </View>
       </View>
 
       <ActionSheetModal
         visible={showCreateTabDrawer}
         title="New Tab"
         actions={[
+          ...createTabAgentActions,
           {
             label: 'Terminal',
             icon: SquareTerminal,
@@ -4381,8 +5122,7 @@ export default function SessionScreen() {
               setShowCreateTabDrawer(false)
               void handleCreateMarkdownNote()
             }
-          },
-          ...createTabAgentActions
+          }
         ]}
         onClose={() => setShowCreateTabDrawer(false)}
       />
@@ -4677,6 +5417,12 @@ export default function SessionScreen() {
         onKeysChanged={setCustomKeys}
         onManageShortcuts={handleManageShortcuts}
       />
+      <MobileDictationSetupSheet
+        visible={showDictationSetup}
+        client={client}
+        onClose={() => setShowDictationSetup(false)}
+        onReady={() => setShowDictationSetup(false)}
+      />
       <ActionSheetModal
         visible={deleteKeyTarget != null}
         title={deleteKeyTarget?.label ?? 'Shortcut'}
@@ -4698,632 +5444,3 @@ export default function SessionScreen() {
     </View>
   )
 }
-
-const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: colors.bgBase
-  },
-  kavInner: {
-    flex: 1
-  },
-  sessionChrome: {
-    backgroundColor: colors.bgPanel,
-    borderBottomWidth: 1,
-    borderBottomColor: colors.borderSubtle
-  },
-  sessionTopBar: {
-    minHeight: 44,
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: spacing.sm,
-    paddingVertical: spacing.xs
-  },
-  backButton: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginRight: spacing.xs
-  },
-  backButtonPressed: {
-    backgroundColor: colors.bgRaised
-  },
-  filesButton: {
-    width: 36,
-    height: 36,
-    borderRadius: radii.button,
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginLeft: spacing.xs
-  },
-  filesButtonPressed: {
-    backgroundColor: colors.bgRaised
-  },
-  sessionTitleBlock: {
-    flex: 1,
-    minWidth: 0
-  },
-  sessionTitle: {
-    color: colors.textPrimary,
-    fontSize: 14,
-    fontWeight: '600'
-  },
-  sessionMetaRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginTop: 2
-  },
-  sessionMetaText: {
-    flexShrink: 1,
-    color: colors.textSecondary,
-    fontSize: typography.metaSize
-  },
-  tabBar: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    borderTopWidth: 1,
-    borderTopColor: colors.borderSubtle
-  },
-  tabScroll: {
-    flex: 1,
-    maxHeight: 36
-  },
-  tabContent: {
-    paddingLeft: spacing.sm,
-    paddingRight: spacing.sm
-  },
-  tab: {
-    width: 128,
-    maxWidth: 128,
-    minHeight: 36,
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingHorizontal: spacing.sm,
-    paddingVertical: spacing.sm,
-    borderBottomWidth: 2,
-    borderBottomColor: 'transparent'
-  },
-  tabActive: {
-    borderBottomColor: colors.accentBlue
-  },
-  tabLabelRow: {
-    maxWidth: '100%',
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: spacing.xs
-  },
-  tabText: {
-    flexShrink: 1,
-    color: colors.textSecondary,
-    fontSize: 13
-  },
-  tabTextActive: {
-    color: colors.textPrimary
-  },
-  newTerminalButton: {
-    width: 40,
-    height: 36,
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderBottomWidth: 2,
-    borderBottomColor: 'transparent'
-  },
-  newTerminalButtonPressed: {
-    backgroundColor: colors.bgRaised
-  },
-  newTerminalButtonDisabled: {
-    opacity: 0.45
-  },
-  terminalFrame: {
-    flex: 1,
-    minHeight: 0,
-    position: 'relative',
-    overflow: 'hidden'
-  },
-  terminalPane: {
-    ...StyleSheet.absoluteFillObject
-  },
-  terminalPaneHidden: {
-    opacity: 0
-  },
-  terminalWebView: {
-    flex: 1
-  },
-  markdownFrame: {
-    flex: 1,
-    minHeight: 0,
-    backgroundColor: colors.bgBase
-  },
-  browserFrame: {
-    flex: 1,
-    minHeight: 0,
-    backgroundColor: colors.bgBase
-  },
-  markdownEditor: {
-    flex: 1,
-    position: 'relative'
-  },
-  markdownState: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-    padding: spacing.xl,
-    gap: spacing.md
-  },
-  markdownError: {
-    color: colors.statusRed,
-    fontSize: typography.bodySize
-  },
-  markdownTextInput: {
-    flex: 1,
-    minHeight: 0,
-    color: colors.textPrimary,
-    backgroundColor: colors.bgBase,
-    paddingHorizontal: spacing.lg,
-    paddingTop: spacing.lg,
-    paddingBottom: spacing.xl * 3,
-    fontSize: typography.bodySize,
-    lineHeight: 22,
-    fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace', default: 'monospace' })
-  },
-  filePreviewScroll: {
-    flex: 1,
-    minHeight: 0,
-    backgroundColor: colors.editorSurface
-  },
-  filePreviewContent: {
-    paddingHorizontal: spacing.lg,
-    paddingTop: spacing.lg,
-    paddingBottom: spacing.xl
-  },
-  filePreviewText: {
-    color: colors.textPrimary,
-    fontSize: typography.bodySize,
-    lineHeight: 22,
-    fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace', default: 'monospace' })
-  },
-  diffNotesToolbar: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    gap: spacing.sm,
-    paddingHorizontal: spacing.lg,
-    paddingVertical: spacing.sm,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: colors.borderSubtle,
-    backgroundColor: colors.bgPanel
-  },
-  diffNotesTitleRow: {
-    minWidth: 0,
-    flex: 1,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: spacing.xs
-  },
-  diffNotesTitle: {
-    color: colors.textSecondary,
-    fontSize: typography.metaSize,
-    fontWeight: '600'
-  },
-  diffNotesActions: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: spacing.xs
-  },
-  diffNotesActionButton: {
-    minHeight: 30,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: spacing.xs,
-    borderWidth: 1,
-    borderColor: colors.borderSubtle,
-    borderRadius: radii.button,
-    paddingHorizontal: spacing.sm,
-    backgroundColor: colors.bgRaised
-  },
-  diffNotesActionText: {
-    color: colors.textSecondary,
-    fontSize: typography.metaSize,
-    fontWeight: '600'
-  },
-  diffLineBlock: {
-    marginBottom: spacing.xs
-  },
-  diffLine: {
-    flexDirection: 'row',
-    alignItems: 'flex-start',
-    borderLeftWidth: 2,
-    borderLeftColor: colors.editorSurface,
-    paddingRight: spacing.sm
-  },
-  diffLineAdded: {
-    backgroundColor: colors.diffAddedBg,
-    borderLeftColor: colors.gitDecorationAdded
-  },
-  diffLineDeleted: {
-    backgroundColor: colors.diffDeletedBg,
-    borderLeftColor: colors.gitDecorationDeleted
-  },
-  diffGutter: {
-    width: 42,
-    paddingRight: spacing.sm,
-    textAlign: 'right',
-    color: colors.textMuted,
-    fontSize: typography.metaSize,
-    lineHeight: 22,
-    fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace', default: 'monospace' })
-  },
-  diffText: {
-    flex: 1,
-    color: colors.textPrimary,
-    fontSize: typography.bodySize,
-    lineHeight: 22,
-    fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace', default: 'monospace' })
-  },
-  diffPrefix: {
-    color: colors.textMuted
-  },
-  diffPrefixAdded: {
-    color: colors.gitDecorationAdded
-  },
-  diffPrefixDeleted: {
-    color: colors.gitDecorationDeleted
-  },
-  diffCommentAddButton: {
-    width: 26,
-    height: 22,
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderRadius: radii.button
-  },
-  diffCommentAddButtonPressed: {
-    backgroundColor: colors.bgPanel
-  },
-  diffCommentButtonDisabled: {
-    opacity: 0.45
-  },
-  diffCommentList: {
-    gap: spacing.xs,
-    marginLeft: 44,
-    marginRight: spacing.sm,
-    marginTop: spacing.xs
-  },
-  diffCommentCard: {
-    borderWidth: 1,
-    borderColor: colors.borderSubtle,
-    borderRadius: radii.button,
-    backgroundColor: colors.bgPanel,
-    paddingHorizontal: spacing.sm,
-    paddingVertical: spacing.xs
-  },
-  diffCommentHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: spacing.xs,
-    marginBottom: 2
-  },
-  diffCommentMeta: {
-    flex: 1,
-    color: colors.textMuted,
-    fontSize: typography.metaSize,
-    fontWeight: '600'
-  },
-  diffCommentDeleteButton: {
-    width: 22,
-    height: 22,
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderRadius: 11
-  },
-  diffCommentBody: {
-    color: colors.textPrimary,
-    fontSize: typography.metaSize,
-    lineHeight: 17
-  },
-  diffCommentComposer: {
-    gap: spacing.xs,
-    marginLeft: 44,
-    marginRight: spacing.sm,
-    marginTop: spacing.xs,
-    borderWidth: 1,
-    borderColor: colors.borderSubtle,
-    borderRadius: radii.button,
-    backgroundColor: colors.bgPanel,
-    padding: spacing.sm
-  },
-  diffCommentInput: {
-    minHeight: 70,
-    height: 70,
-    marginRight: 0,
-    paddingTop: spacing.sm,
-    paddingBottom: spacing.sm
-  },
-  diffCommentComposerActions: {
-    flexDirection: 'row',
-    justifyContent: 'flex-end',
-    gap: spacing.xs
-  },
-  diffCommentSecondaryAction: {
-    minHeight: 30,
-    justifyContent: 'center',
-    borderRadius: radii.button,
-    paddingHorizontal: spacing.md
-  },
-  diffCommentSecondaryText: {
-    color: colors.textSecondary,
-    fontSize: typography.metaSize,
-    fontWeight: '600'
-  },
-  diffCommentPrimaryAction: {
-    minHeight: 30,
-    justifyContent: 'center',
-    borderRadius: radii.button,
-    backgroundColor: colors.bgRaised,
-    paddingHorizontal: spacing.md
-  },
-  diffCommentPrimaryText: {
-    color: colors.textPrimary,
-    fontSize: typography.metaSize,
-    fontWeight: '700'
-  },
-  markdownRefreshButton: {
-    alignSelf: 'flex-start',
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: spacing.xs,
-    backgroundColor: colors.bgRaised,
-    borderWidth: 1,
-    borderColor: colors.borderSubtle,
-    borderRadius: radii.button,
-    paddingHorizontal: spacing.md,
-    paddingVertical: spacing.xs
-  },
-  markdownButtonDisabled: {
-    opacity: 0.45
-  },
-  markdownRefreshText: {
-    color: colors.textPrimary,
-    fontSize: 13,
-    fontWeight: '600'
-  },
-  markdownFloatingBar: {
-    position: 'absolute',
-    left: spacing.md,
-    right: spacing.md,
-    bottom: spacing.lg,
-    alignItems: 'flex-end',
-    gap: spacing.xs
-  },
-  markdownFloatingStatus: {
-    maxWidth: '100%',
-    alignSelf: 'flex-end',
-    overflow: 'hidden',
-    color: colors.textSecondary,
-    backgroundColor: colors.bgPanel,
-    borderWidth: 1,
-    borderColor: colors.borderSubtle,
-    borderRadius: radii.button,
-    paddingHorizontal: spacing.sm,
-    paddingVertical: spacing.xs,
-    fontSize: typography.metaSize
-  },
-  markdownFloatingActions: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    justifyContent: 'flex-end',
-    gap: spacing.xs
-  },
-  markdownFloatingButton: {
-    minHeight: 34,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: spacing.xs,
-    backgroundColor: colors.bgPanel,
-    borderWidth: 1,
-    borderColor: colors.borderSubtle,
-    borderRadius: radii.button,
-    paddingHorizontal: spacing.md,
-    paddingVertical: spacing.xs
-  },
-  markdownSaveButton: {
-    backgroundColor: colors.bgRaised
-  },
-  markdownFloatingButtonText: {
-    color: colors.textPrimary,
-    fontSize: 13,
-    fontWeight: '600'
-  },
-  toast: {
-    position: 'absolute',
-    bottom: spacing.lg,
-    alignSelf: 'center',
-    left: 0,
-    right: 0,
-    alignItems: 'center'
-  },
-  toastText: {
-    backgroundColor: colors.bgRaised,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: colors.borderSubtle,
-    color: colors.textPrimary,
-    fontSize: 13,
-    paddingHorizontal: spacing.lg,
-    paddingVertical: spacing.sm,
-    borderRadius: radii.button,
-    overflow: 'hidden'
-  },
-  createWarningBanner: {
-    flexDirection: 'row',
-    alignItems: 'flex-start',
-    gap: spacing.sm,
-    backgroundColor: colors.bgPanel,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: colors.borderSubtle,
-    paddingHorizontal: spacing.md,
-    paddingVertical: spacing.sm
-  },
-  createWarningText: {
-    flex: 1,
-    color: colors.textPrimary,
-    fontSize: 12,
-    lineHeight: 16
-  },
-  createWarningDismiss: {
-    width: 24,
-    height: 24,
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginTop: -4
-  },
-  emptyState: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-    padding: spacing.xl
-  },
-  emptyText: {
-    color: colors.textSecondary,
-    fontSize: typography.bodySize,
-    marginBottom: spacing.lg
-  },
-  createError: {
-    color: colors.statusRed,
-    fontSize: 13,
-    marginBottom: spacing.sm
-  },
-  emptyActions: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    justifyContent: 'center',
-    gap: spacing.sm
-  },
-  createButton: {
-    backgroundColor: colors.bgRaised,
-    borderWidth: 1,
-    borderColor: colors.borderSubtle,
-    paddingHorizontal: spacing.xl,
-    paddingVertical: spacing.sm + 2,
-    borderRadius: radii.button
-  },
-  createButtonDisabled: {
-    opacity: 0.5
-  },
-  createButtonText: {
-    color: colors.textPrimary,
-    fontSize: typography.bodySize,
-    fontWeight: '600'
-  },
-  commandDock: {
-    zIndex: 20
-  },
-  accessoryBar: {
-    borderTopWidth: 1,
-    borderTopColor: colors.borderSubtle,
-    backgroundColor: colors.bgPanel
-  },
-  accessoryContent: {
-    paddingHorizontal: spacing.sm,
-    paddingVertical: spacing.xs,
-    gap: spacing.xs
-  },
-  accessoryKey: {
-    backgroundColor: colors.bgRaised,
-    paddingHorizontal: spacing.sm + 2,
-    paddingVertical: spacing.xs,
-    borderRadius: radii.button,
-    minWidth: 36,
-    alignItems: 'center'
-  },
-  accessoryKeyPressed: {
-    backgroundColor: colors.borderSubtle
-  },
-  accessoryKeyActive: {
-    backgroundColor: colors.textPrimary
-  },
-  customAccessoryKey: {
-    borderWidth: 1,
-    borderColor: colors.borderSubtle
-  },
-  accessoryKeyDisabled: {
-    opacity: 0.35
-  },
-  accessoryKeyText: {
-    color: colors.textSecondary,
-    fontSize: 12,
-    fontFamily: typography.monoFamily
-  },
-  accessoryKeyTextActive: {
-    color: colors.bgBase,
-    fontWeight: '700'
-  },
-  accessoryKeyTextDisabled: {
-    color: colors.textMuted
-  },
-  inputBar: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    minHeight: 46,
-    paddingVertical: spacing.xs + 2,
-    paddingHorizontal: spacing.md,
-    borderTopWidth: 1,
-    borderTopColor: colors.borderSubtle,
-    backgroundColor: colors.bgPanel
-  },
-  textInput: {
-    flex: 1,
-    height: 34,
-    backgroundColor: colors.bgRaised,
-    color: colors.textPrimary,
-    borderRadius: radii.input,
-    paddingHorizontal: spacing.md,
-    paddingVertical: 0,
-    fontSize: 14,
-    fontFamily: typography.monoFamily,
-    marginRight: spacing.sm
-  },
-  liveInputBar: {
-    gap: spacing.sm
-  },
-
-  liveInputHint: {
-    flex: 1,
-    color: colors.textSecondary,
-    fontSize: typography.metaSize,
-    fontFamily: typography.monoFamily
-  },
-  liveInputCapture: {
-    position: 'absolute',
-    opacity: 0,
-    width: 1,
-    height: 1,
-    color: colors.textPrimary
-  },
-  sendButton: {
-    backgroundColor: colors.bgRaised,
-    width: 34,
-    height: 34,
-    borderRadius: 17,
-    alignItems: 'center',
-    justifyContent: 'center'
-  },
-  dictationButton: {
-    backgroundColor: colors.bgRaised,
-    width: 34,
-    height: 34,
-    borderRadius: 17,
-    borderWidth: 1,
-    borderColor: 'transparent',
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginRight: spacing.sm
-  },
-  dictationButtonActive: {
-    backgroundColor: colors.bgPanel,
-    borderColor: colors.textSecondary
-  },
-  sendButtonDisabled: {
-    opacity: 0.35
-  }
-})

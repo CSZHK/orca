@@ -1,8 +1,9 @@
-import { createReadStream } from 'fs'
-import { readFile } from 'fs/promises'
-import { createInterface } from 'readline'
+import { createReadStream } from 'node:fs'
+import { readFile } from 'node:fs/promises'
+import { createInterface } from 'node:readline'
 import type { AiVaultSession } from '../../shared/ai-vault-types'
-import type { CodexUsageSnapshot, FileWithMtime, SessionAccumulator } from './session-scanner-types'
+import type { ExecutionHostId } from '../../shared/execution-host'
+import type { FileWithMtime, SessionAccumulator } from './session-scanner-types'
 import {
   addPreviewContent,
   createAccumulator,
@@ -16,35 +17,59 @@ import {
   asRecord,
   claudeUsageTotal,
   extractContentText,
-  extractGitBranch,
   extractMessageText,
-  extractModel,
   extractString,
-  normalizeCodexUsage,
   normalizeTitleText,
   parseJsonObject,
-  subtractCodexUsage,
   tokenTotal
 } from './session-scanner-values'
+
+type ParserSessionOptions = {
+  executionHostId?: ExecutionHostId
+  executionHostPlatform?: NodeJS.Platform | null
+}
 
 export async function parseClaudeSessionFile(
   file: FileWithMtime,
   platform: NodeJS.Platform = process.platform
 ): Promise<AiVaultSession | null> {
-  const accumulator = createAccumulator({
-    agent: 'claude',
-    file,
-    sessionId: sessionIdFromFileName(file.path)
-  })
-  let metaTitle: string | null = null
-  let generatedTitle: string | null = null
-
   const lines = createInterface({
     input: createReadStream(file.path, { encoding: 'utf-8' }),
     crlfDelay: Infinity
   })
+  return parseClaudeSessionLines({ file, lines, platform })
+}
 
-  for await (const line of lines) {
+export async function parseClaudeSessionContent(
+  file: FileWithMtime,
+  content: string,
+  platform: NodeJS.Platform = process.platform,
+  options: ParserSessionOptions = {}
+): Promise<AiVaultSession | null> {
+  return parseClaudeSessionLines({
+    file,
+    lines: content.split(/\r?\n/),
+    platform,
+    options
+  })
+}
+
+async function parseClaudeSessionLines(args: {
+  file: FileWithMtime
+  lines: AsyncIterable<string> | Iterable<string>
+  platform: NodeJS.Platform
+  options?: ParserSessionOptions
+}): Promise<AiVaultSession | null> {
+  const accumulator = createAccumulator({
+    agent: 'claude',
+    file: args.file,
+    sessionId: sessionIdFromFileName(args.file.path)
+  })
+  let metaTitle: string | null = null
+  let generatedTitle: string | null = null
+  let firstUserTitle: string | null = null
+
+  for await (const line of args.lines) {
     const record = parseJsonObject(line)
     if (!record) {
       continue
@@ -62,7 +87,11 @@ export async function parseClaudeSessionFile(
     }
 
     if (record.type === 'ai-title') {
-      generatedTitle ??= normalizeTitleText(extractString(record.aiTitle) ?? '')
+      const title = normalizeTitleText(extractString(record.aiTitle) ?? '')
+      if (title) {
+        // Claude can revise generated names; AI Vault should mirror the current one.
+        generatedTitle = title
+      }
       continue
     }
 
@@ -75,10 +104,13 @@ export async function parseClaudeSessionFile(
       accumulator.messageCount++
       const title = extractMessageText(record.message)
       addPreviewContent(accumulator, 'user', asRecord(record.message)?.content, record.timestamp)
-      if (title && record.isMeta !== true && !accumulator.title) {
-        accumulator.title = title
-      } else if (title && !metaTitle) {
-        metaTitle = title
+      if (title) {
+        // Meta prompts (injected context) only seed the last-resort title.
+        if (record.isMeta === true) {
+          metaTitle ??= title
+        } else {
+          firstUserTitle ??= title
+        }
       }
       continue
     }
@@ -95,122 +127,10 @@ export async function parseClaudeSessionFile(
     }
   }
 
-  accumulator.fallbackTitle = generatedTitle ?? metaTitle
-  return finalizeSession(accumulator, platform)
-}
-
-export async function parseCodexSessionFile(
-  file: FileWithMtime,
-  platform: NodeJS.Platform = process.platform,
-  codexHome: string | null = null
-): Promise<AiVaultSession | null> {
-  const accumulator = createAccumulator({
-    agent: 'codex',
-    file,
-    sessionId: sessionIdFromFileName(file.path)
-  })
-  let previousTotals: CodexUsageSnapshot | null = null
-
-  const lines = createInterface({
-    input: createReadStream(file.path, { encoding: 'utf-8' }),
-    crlfDelay: Infinity
-  })
-
-  for await (const line of lines) {
-    const record = parseJsonObject(line)
-    if (!record) {
-      continue
-    }
-
-    updateTimeline(accumulator, extractString(record.timestamp))
-
-    const payload = asRecord(record.payload)
-    if (record.type === 'session_meta' && payload) {
-      const sessionId = extractString(payload.id)
-      if (sessionId) {
-        accumulator.sessionId = sessionId
-      }
-      const cwd = extractString(payload.cwd)
-      if (cwd) {
-        accumulator.cwd = cwd
-      }
-      accumulator.branch = extractGitBranch(payload.git) ?? accumulator.branch
-      continue
-    }
-
-    if (record.type === 'turn_context' && payload) {
-      const cwd = extractString(payload.cwd)
-      if (cwd) {
-        accumulator.cwd = cwd
-      }
-      const model = extractModel(payload)
-      if (model) {
-        accumulator.model = model
-      }
-      continue
-    }
-
-    if (!payload) {
-      continue
-    }
-
-    if (record.type === 'response_item' && payload.type === 'message') {
-      accumulator.messageCount++
-      if (payload.role === 'user' && !accumulator.title) {
-        accumulator.title = extractContentText(payload.content)
-      }
-      addPreviewContent(
-        accumulator,
-        payload.role === 'assistant' ? 'assistant' : payload.role === 'user' ? 'user' : 'unknown',
-        payload.content,
-        record.timestamp
-      )
-      continue
-    }
-
-    if (record.type !== 'event_msg') {
-      continue
-    }
-
-    if (payload.type === 'user_message') {
-      accumulator.messageCount++
-      if (!accumulator.title) {
-        accumulator.title = extractContentText(payload.message)
-      }
-      addPreviewContent(accumulator, 'user', payload.message, record.timestamp)
-      continue
-    }
-
-    if (payload.type === 'agent_message') {
-      accumulator.messageCount++
-      addPreviewContent(accumulator, 'assistant', payload.message, record.timestamp)
-      continue
-    }
-
-    if (payload.type !== 'token_count') {
-      continue
-    }
-
-    const info = asRecord(payload.info)
-    if (!info) {
-      continue
-    }
-    const totalUsage = normalizeCodexUsage(info.total_token_usage)
-    const lastUsage = normalizeCodexUsage(info.last_token_usage)
-    const delta = totalUsage ? subtractCodexUsage(totalUsage, previousTotals) : lastUsage
-    if (totalUsage) {
-      previousTotals = totalUsage
-    }
-    if (delta) {
-      accumulator.totalTokens += delta.totalTokens
-    }
-    const model = extractModel(payload)
-    if (model) {
-      accumulator.model = model
-    }
-  }
-
-  return finalizeSession(accumulator, platform, { codexHome })
+  // Why: a user-set custom-title (accumulator.title) wins, but Claude's generated
+  // session name (ai-title) should outrank the raw first prompt when present.
+  accumulator.fallbackTitle = generatedTitle ?? firstUserTitle ?? metaTitle
+  return finalizeSession(accumulator, args.platform, args.options)
 }
 
 export async function parseGeminiSessionFile(
@@ -221,7 +141,33 @@ export async function parseGeminiSessionFile(
     return parseGeminiJsonlSessionFile(file, platform)
   }
 
-  const record = asRecord(JSON.parse(await readFile(file.path, 'utf-8')) as unknown)
+  return parseGeminiJsonSessionContent(file, await readFile(file.path, 'utf-8'), platform)
+}
+
+export async function parseGeminiSessionContent(
+  file: FileWithMtime,
+  content: string,
+  platform: NodeJS.Platform = process.platform,
+  options: ParserSessionOptions = {}
+): Promise<AiVaultSession | null> {
+  if (file.path.endsWith('.jsonl')) {
+    return parseGeminiJsonlSessionLines({
+      file,
+      lines: content.split(/\r?\n/),
+      platform,
+      options
+    })
+  }
+  return parseGeminiJsonSessionContent(file, content, platform, options)
+}
+
+function parseGeminiJsonSessionContent(
+  file: FileWithMtime,
+  content: string,
+  platform: NodeJS.Platform,
+  options: ParserSessionOptions = {}
+): AiVaultSession | null {
+  const record = asRecord(JSON.parse(content) as unknown)
   if (!record) {
     return null
   }
@@ -235,24 +181,33 @@ export async function parseGeminiSessionFile(
   for (const message of arrayValue(record.messages)) {
     consumeGeminiMessage(accumulator, asRecord(message))
   }
-  return finalizeSession(accumulator, platform)
+  return finalizeSession(accumulator, platform, options)
 }
 
 export async function parseGeminiJsonlSessionFile(
   file: FileWithMtime,
   platform: NodeJS.Platform
 ): Promise<AiVaultSession | null> {
-  const accumulator = createAccumulator({
-    agent: 'gemini',
-    file,
-    sessionId: sessionIdFromFileName(file.path)
-  })
   const lines = createInterface({
     input: createReadStream(file.path, { encoding: 'utf-8' }),
     crlfDelay: Infinity
   })
+  return parseGeminiJsonlSessionLines({ file, lines, platform })
+}
 
-  for await (const line of lines) {
+async function parseGeminiJsonlSessionLines(args: {
+  file: FileWithMtime
+  lines: AsyncIterable<string> | Iterable<string>
+  platform: NodeJS.Platform
+  options?: ParserSessionOptions
+}): Promise<AiVaultSession | null> {
+  const accumulator = createAccumulator({
+    agent: 'gemini',
+    file: args.file,
+    sessionId: sessionIdFromFileName(args.file.path)
+  })
+
+  for await (const line of args.lines) {
     const record = parseJsonObject(line)
     if (!record) {
       continue
@@ -271,7 +226,7 @@ export async function parseGeminiJsonlSessionFile(
     consumeGeminiMessage(accumulator, record)
   }
 
-  return finalizeSession(accumulator, platform)
+  return finalizeSession(accumulator, args.platform, args.options)
 }
 
 export function consumeGeminiMessage(

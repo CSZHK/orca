@@ -1,4 +1,3 @@
-/* eslint-disable max-lines -- Why: this onboarding step owns the full notification setup surface, including macOS guidance, sound choices, and upload controls. */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { BellRing, FileAudio, Settings, Upload } from 'lucide-react'
 import { toast } from 'sonner'
@@ -16,12 +15,6 @@ import { sendNotificationSettingsTestNotification } from '@/components/settings/
 import { getNotificationSoundOptions } from '@/components/notification-sound-options'
 import { useMountedRef } from '@/hooks/useMountedRef'
 import { translate } from '@/i18n/i18n'
-
-export type NotificationDraft = {
-  agentTaskComplete: boolean
-  terminalBell: boolean
-  notifyWhenFocused: boolean
-}
 
 type NotificationStepProps = {
   settings: GlobalSettings | null

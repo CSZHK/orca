@@ -1,5 +1,3 @@
-/* eslint-disable max-lines -- Why: cookie import tests share import-time Electron mocks plus
-   browser-specific cookie fixtures; splitting would duplicate brittle setup. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const { sessionFromPartitionMock, dialogShowOpenDialogMock } = vi.hoisted(() => ({
@@ -18,6 +16,7 @@ import {
   importCookiesFromFile,
   importCookiesFromBrowser,
   detectInstalledBrowsers,
+  summarizeCookieImportError,
   type ChromiumCookieColumnInfo,
   type DetectedBrowser
 } from './browser-cookie-import'
@@ -26,6 +25,19 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 
 const LARGE_SAFARI_COOKIE_COUNT = 150_000
+
+describe('summarizeCookieImportError', () => {
+  it('folds a bounded error preview without full-string whitespace replacement', () => {
+    const replaceSpy = vi.spyOn(String.prototype, 'replace')
+    const message = `Import failed\n\t${'secret-cookie-value '.repeat(20_000)}`
+
+    const summary = summarizeCookieImportError(new Error(message))
+
+    expect(summary.length).toBeLessThanOrEqual(180)
+    expect(summary).toContain('Import failed secret-cookie-value')
+    expect(replaceSpy).not.toHaveBeenCalled()
+  })
+})
 
 function buildSafariBinaryCookies(cookieCount: number): Buffer {
   const cookies: Buffer[] = []
@@ -333,7 +345,16 @@ describe('detectInstalledBrowsers', () => {
 
   it('each detected browser has a valid family', () => {
     const browsers = detectInstalledBrowsers()
-    const validFamilies = ['chrome', 'edge', 'arc', 'chromium', 'firefox', 'safari', 'comet']
+    const validFamilies = [
+      'chrome',
+      'edge',
+      'arc',
+      'chromium',
+      'firefox',
+      'safari',
+      'comet',
+      'helium'
+    ]
     for (const browser of browsers) {
       expect(validFamilies).toContain(browser.family)
     }

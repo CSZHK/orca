@@ -1,7 +1,3 @@
-/* eslint-disable max-lines --
- * Why: agent title detection is intentionally table-driven in one place so the
- * supported title variants stay readable and regressions are easy to compare.
- */
 import { describe, expect, it, test, vi } from 'vitest'
 import {
   detectAgentStatusFromTitle,
@@ -232,6 +228,13 @@ describe('detectAgentStatusFromTitle', () => {
     expect(detectAgentStatusFromTitle('Hermes working')).toBe('working')
   })
 
+  it('classifies synthesized Devin titles', () => {
+    expect(detectAgentStatusFromTitle('⠋ Devin')).toBe('working')
+    expect(detectAgentStatusFromTitle('Devin ready')).toBe('idle')
+    expect(detectAgentStatusFromTitle('Devin - action required')).toBe('permission')
+    expect(detectAgentStatusFromTitle('Devin working')).toBe('working')
+  })
+
   it('does not treat Factory Droid native needs-input titles as completion', () => {
     expect(detectAgentStatusFromTitle('Factory Droid needs input')).toBeNull()
     expect(detectAgentStatusFromTitle('Factory Droid needs your input')).toBeNull()
@@ -390,6 +393,22 @@ describe('normalizeTerminalTitle', () => {
   it('collapses Pi spinner and idle titles to stable labels', () => {
     expect(normalizeTerminalTitle('⠋ π - my-project')).toBe('⠋ Pi')
     expect(normalizeTerminalTitle('π - my-project')).toBe('Pi')
+    expect(normalizeTerminalTitle('⠋ π: my-project')).toBe('⠋ Pi')
+    expect(normalizeTerminalTitle('π: my-project')).toBe('Pi')
+    expect(normalizeTerminalTitle('π -')).toBe('Pi')
+    expect(normalizeTerminalTitle('π:')).toBe('Pi')
+    expect(normalizeTerminalTitle('π ')).toBe('Pi')
+  })
+
+  it('does not collapse Pi-compatible titles whose cwd mentions Gemini', () => {
+    expect(normalizeTerminalTitle('⠋ π - gemini')).toBe('⠋ Pi')
+    expect(normalizeTerminalTitle('π - gemini')).toBe('Pi')
+    expect(normalizeTerminalTitle('⠋ π: gemini')).toBe('⠋ Pi')
+    expect(normalizeTerminalTitle('π: gemini')).toBe('Pi')
+    expect(normalizeTerminalTitle('⠋ π gemini')).toBe('⠋ Pi')
+    expect(normalizeTerminalTitle('π gemini')).toBe('Pi')
+    expect(normalizeTerminalTitle('⠋ π - gemini-project')).toBe('⠋ Pi')
+    expect(normalizeTerminalTitle('π - gemini-project')).toBe('Pi')
   })
 })
 
@@ -402,6 +421,17 @@ describe('isGeminiTerminalTitle', () => {
 
   it('does not match other terminal titles', () => {
     expect(isGeminiTerminalTitle('⠂ Claude Code')).toBe(false)
+    expect(isGeminiTerminalTitle('⠋ π - gemini')).toBe(false)
+    expect(isGeminiTerminalTitle('π - gemini')).toBe(false)
+    expect(isGeminiTerminalTitle('⠋ π: gemini')).toBe(false)
+    expect(isGeminiTerminalTitle('π: gemini')).toBe(false)
+    expect(isGeminiTerminalTitle('⠋ π gemini')).toBe(false)
+    expect(isGeminiTerminalTitle('π gemini')).toBe(false)
+    expect(isGeminiTerminalTitle('π -')).toBe(false)
+    expect(isGeminiTerminalTitle('π:')).toBe(false)
+    expect(isGeminiTerminalTitle('π ')).toBe(false)
+    expect(isGeminiTerminalTitle('⠋ π - gemini-project')).toBe(false)
+    expect(isGeminiTerminalTitle('/tmp/gemini/working')).toBe(false)
     expect(isGeminiTerminalTitle('bash')).toBe(false)
   })
 })
@@ -409,6 +439,12 @@ describe('isGeminiTerminalTitle', () => {
 describe('getAgentLabel', () => {
   it('labels Pi working titles as Pi instead of Claude Code', () => {
     expect(getAgentLabel('⠋ π - my-project')).toBe('Pi')
+  })
+
+  it('treats Claude Code prefixed task titles as Claude even when they mention another CLI', () => {
+    expect(getAgentLabel('✳ Gemini CLI')).toBe('Claude Code')
+    expect(getAgentLabel('. Compare Opencode Vs Orca')).toBe('Claude Code')
+    expect(getAgentLabel('* Review Codex behavior')).toBe('Claude Code')
   })
 
   it('labels supported agent families consistently', () => {
@@ -424,6 +460,8 @@ describe('getAgentLabel', () => {
     expect(getAgentLabel('Droid ready')).toBe('Droid')
     expect(getAgentLabel('⠋ Hermes')).toBe('Hermes')
     expect(getAgentLabel('Hermes ready')).toBe('Hermes')
+    expect(getAgentLabel('⠋ Devin')).toBe('Devin')
+    expect(getAgentLabel('Devin ready')).toBe('Devin')
   })
 
   it('does not label the Claude agents management title', () => {
@@ -450,6 +488,7 @@ describe('getAgentLabel', () => {
     expect(getAgentLabel('~/projects/codex-scratch')).toBeNull()
     expect(getAgentLabel('~/cursor-rules')).toBeNull()
     expect(getAgentLabel('grok-fixtures')).toBeNull()
+    expect(getAgentLabel('devin-fixtures')).toBeNull()
     expect(getAgentLabel('aider-config')).toBeNull()
   })
 
@@ -459,6 +498,7 @@ describe('getAgentLabel', () => {
     expect(getAgentLabel('openclaude.cmd')).toBe('OpenClaude')
     expect(getAgentLabel('⠋ Codex')).toBe('Codex')
     expect(getAgentLabel('Aider idle')).toBe('Aider')
+    expect(getAgentLabel('Devin working')).toBe('Devin')
   })
 })
 
@@ -806,6 +846,10 @@ describe('formatAgentTypeLabel', () => {
     expect(formatAgentTypeLabel('command-code')).toBe('Command Code')
   })
 
+  it("maps 'ante' to 'Ante'", () => {
+    expect(formatAgentTypeLabel('ante')).toBe('Ante')
+  })
+
   it('passes through arbitrary custom agent names as-is', () => {
     expect(formatAgentTypeLabel('weirdo')).toBe('weirdo')
   })
@@ -829,6 +873,7 @@ describe('agentTypeToIconAgent', () => {
     expect(agentTypeToIconAgent('openclaude')).toBe('openclaude')
     expect(agentTypeToIconAgent('antigravity')).toBe('antigravity')
     expect(agentTypeToIconAgent('command-code')).toBe('command-code')
+    expect(agentTypeToIconAgent('ante')).toBe('ante')
   })
 
   it('returns null for arbitrary non-iconable strings', () => {

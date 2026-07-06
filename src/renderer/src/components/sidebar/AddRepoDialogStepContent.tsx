@@ -1,5 +1,5 @@
-import type { Dispatch, SetStateAction } from 'react'
-import { CloneStep } from './AddRepoSteps'
+import type { Dispatch, ReactNode, SetStateAction } from 'react'
+import { CloneStep } from './AddRepoCloneStep'
 import { RemoteStep } from './AddRepoRemoteStep'
 import { CreateStep } from './AddRepoCreateStep'
 import { AddRepoLocalStartStep } from './AddRepoStartSteps'
@@ -29,6 +29,9 @@ type AddRepoDialogStepContentProps = {
   isCloning: boolean
   sshTargets: (SshTarget & { state?: SshConnectionState })[]
   selectedTargetId: string | null
+  selectedSshTargetId?: string | null
+  selectedHostLabel?: string | null
+  lockSshTargetSelection?: boolean
   remotePath: string
   remoteError: string | null
   isAddingRemote: boolean
@@ -38,9 +41,13 @@ type AddRepoDialogStepContentProps = {
   nestedGroupName: string
   createName: string
   createParent: string
-  createKind: 'git' | 'folder'
   createError: string | null
   isCreating: boolean
+  hostSelector?: ReactNode
+  showRemoteAction?: boolean
+  canCreateProject?: boolean
+  manualCreateParentEntry?: boolean
+  browseHostKind?: 'local' | 'ssh' | 'runtime'
   createDefaultParent: string
   createGitAvailability: GitAvailability
   createRuntimeParentStatus: 'idle' | 'checking' | 'failed'
@@ -48,7 +55,7 @@ type AddRepoDialogStepContentProps = {
   onBrowse: () => void
   onOpenCloneStep: () => void
   onOpenCreateStep: () => void
-  onOpenRemoteStep: () => void
+  onOpenRemoteStep: (targetId?: string | null) => void
   onStopNestedScan: () => void
   onServerPathChange: (path: string) => void
   onAddServerPath: (kind: 'git' | 'folder') => void
@@ -65,9 +72,9 @@ type AddRepoDialogStepContentProps = {
   onNestedGroupNameChange: (name: string) => void
   onNestedSelectedPathsChange: Dispatch<SetStateAction<Set<string>>>
   onImportNestedRepos: (mode: 'group' | 'separate') => void
+  onOpenNestedRootFolder: () => void
   onCreateNameChange: (name: string) => void
   onCreateParentChange: (parent: string) => void
-  onCreateKindChange: (kind: 'git' | 'folder') => void
   onPickCreateParent: () => void
   onCreate: () => void
 }
@@ -91,6 +98,9 @@ export function AddRepoDialogStepContent({
   isCloning,
   sshTargets,
   selectedTargetId,
+  selectedSshTargetId,
+  selectedHostLabel,
+  lockSshTargetSelection = false,
   remotePath,
   remoteError,
   isAddingRemote,
@@ -100,9 +110,13 @@ export function AddRepoDialogStepContent({
   nestedGroupName,
   createName,
   createParent,
-  createKind,
   createError,
   isCreating,
+  hostSelector,
+  showRemoteAction = true,
+  canCreateProject = true,
+  manualCreateParentEntry = isRuntimeEnvironmentActive,
+  browseHostKind = 'local',
   createDefaultParent,
   createGitAvailability,
   createRuntimeParentStatus,
@@ -127,27 +141,12 @@ export function AddRepoDialogStepContent({
   onNestedGroupNameChange,
   onNestedSelectedPathsChange,
   onImportNestedRepos,
+  onOpenNestedRootFolder,
   onCreateNameChange,
   onCreateParentChange,
-  onCreateKindChange,
   onPickCreateParent,
   onCreate
 }: AddRepoDialogStepContentProps): React.JSX.Element | null {
-  if (step === 'add' && isRuntimeEnvironmentActive) {
-    return (
-      <AddRepoServerPathStartStep
-        serverPath={serverPath}
-        runtimeEnvironmentId={activeRuntimeEnvironmentId}
-        isAddingServerPath={isAddingServerPath}
-        addProjectBusyLabel={addProjectBusyLabel}
-        onServerPathChange={onServerPathChange}
-        onAddServerPath={onAddServerPath}
-        onOpenCloneStep={onOpenCloneStep}
-        onOpenCreateStep={onOpenCreateStep}
-      />
-    )
-  }
-
   if (step === 'add') {
     return (
       <AddRepoLocalStartStep
@@ -157,6 +156,10 @@ export function AddRepoDialogStepContent({
         addProjectBusyLabel={addProjectBusyLabel}
         nestedScanInProgress={nestedScanInProgress}
         nestedScanId={nestedScanId}
+        hostSelector={hostSelector}
+        showRemoteAction={showRemoteAction}
+        canCreateProject={canCreateProject}
+        browseHostKind={browseHostKind}
         onBrowse={onBrowse}
         onOpenCloneStep={onOpenCloneStep}
         onOpenRemoteStep={onOpenRemoteStep}
@@ -166,11 +169,29 @@ export function AddRepoDialogStepContent({
     )
   }
 
+  if (step === 'server-path') {
+    return (
+      <AddRepoServerPathStartStep
+        serverPath={serverPath}
+        runtimeEnvironmentId={activeRuntimeEnvironmentId}
+        isAddingServerPath={isAddingServerPath}
+        addProjectBusyLabel={addProjectBusyLabel}
+        hostSelector={hostSelector}
+        initialBrowsing
+        onServerPathChange={onServerPathChange}
+        onAddServerPath={onAddServerPath}
+        onOpenCloneStep={onOpenCloneStep}
+        onOpenCreateStep={onOpenCreateStep}
+      />
+    )
+  }
+
   if (step === 'remote') {
     return (
       <RemoteStep
         sshTargets={sshTargets}
         selectedTargetId={selectedTargetId}
+        lockSshTargetSelection={lockSshTargetSelection}
         remotePath={remotePath}
         remoteError={remoteError}
         isAddingRemote={isAddingRemote}
@@ -195,6 +216,10 @@ export function AddRepoDialogStepContent({
         isCloning={isCloning}
         disableDestinationPicker={isRuntimeEnvironmentActive}
         runtimeEnvironmentId={activeRuntimeEnvironmentId}
+        sshTargetId={selectedSshTargetId}
+        cloneTargetLabel={
+          isRuntimeEnvironmentActive || selectedSshTargetId ? selectedHostLabel : null
+        }
         onUrlChange={onCloneUrlChange}
         onDestChange={onCloneDestinationChange}
         onPickDestination={onPickCloneDestination}
@@ -214,6 +239,7 @@ export function AddRepoDialogStepContent({
         onGroupNameChange={onNestedGroupNameChange}
         onSelectedPathsChange={onNestedSelectedPathsChange}
         onImport={onImportNestedRepos}
+        onOpenAsFolder={onOpenNestedRootFolder}
         onStopScan={onStopNestedScan}
       />
     )
@@ -224,18 +250,17 @@ export function AddRepoDialogStepContent({
       <CreateStep
         createName={createName}
         createParent={createParent}
-        createKind={createKind}
         createError={createError}
         isCreating={isCreating}
         defaultParent={createDefaultParent}
         gitAvailability={createGitAvailability}
         runtimeParentStatus={createRuntimeParentStatus}
         parentDefaultPending={createParentDefaultPending}
-        manualParentEntry={isRuntimeEnvironmentActive}
+        manualParentEntry={manualCreateParentEntry}
         runtimeEnvironmentId={activeRuntimeEnvironmentId}
+        sshTargetId={selectedSshTargetId}
         onNameChange={onCreateNameChange}
         onParentChange={onCreateParentChange}
-        onKindChange={onCreateKindChange}
         onPickParent={onPickCreateParent}
         onCreate={onCreate}
       />

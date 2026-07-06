@@ -3,13 +3,15 @@ stale-data handling, account-switch generation, and OpenCode config-change
 semantics covered in service.ts, which already carries the same pragma.
 Keeping them in one file makes the ordering contract reviewable as a unit. */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { EventEmitter } from 'events'
+import { EventEmitter } from 'node:events'
 import type { ProviderRateLimits } from '../../shared/rate-limit-types'
 import { RateLimitService } from './service'
 import { fetchClaudeRateLimits, fetchManagedAccountUsage } from './claude-fetcher'
 import { fetchCodexRateLimits } from './codex-fetcher'
 import { fetchGeminiRateLimits } from './gemini-usage-fetcher'
+import { fetchMiniMaxRateLimits } from './minimax-fetcher'
 import { fetchOpenCodeGoRateLimits } from './opencode-go-usage-fetcher'
+import { hasMiniMaxSessionCookie } from '../minimax/minimax-cookie-store'
 
 vi.mock('./claude-fetcher', () => ({
   fetchClaudeRateLimits: vi.fn(),
@@ -28,6 +30,14 @@ vi.mock('./opencode-go-usage-fetcher', () => ({
   fetchOpenCodeGoRateLimits: vi.fn()
 }))
 
+vi.mock('./minimax-fetcher', () => ({
+  fetchMiniMaxRateLimits: vi.fn()
+}))
+
+vi.mock('../minimax/minimax-cookie-store', () => ({
+  hasMiniMaxSessionCookie: vi.fn(() => false)
+}))
+
 type Deferred<T> = {
   promise: Promise<T>
   resolve: (value: T) => void
@@ -42,7 +52,7 @@ function deferred<T>(): Deferred<T> {
 }
 
 function okProvider(
-  provider: 'claude' | 'codex' | 'gemini' | 'opencode-go',
+  provider: 'claude' | 'codex' | 'gemini' | 'opencode-go' | 'minimax',
   usedPercent: number,
   updatedAt = Date.now()
 ): ProviderRateLimits {
@@ -62,7 +72,7 @@ function okProvider(
 }
 
 function errorProvider(
-  provider: 'claude' | 'codex' | 'gemini' | 'opencode-go',
+  provider: 'claude' | 'codex' | 'gemini' | 'opencode-go' | 'minimax',
   message: string
 ): ProviderRateLimits {
   return {
@@ -82,6 +92,10 @@ function serviceInternals(service: RateLimitService): { fetchAll: () => Promise<
 type RateLimitWindow = Parameters<RateLimitService['attach']>[0]
 
 class FakeRateLimitWindow extends EventEmitter {
+  focused = true
+  minimized = false
+  visible = true
+
   webContents = {
     send: vi.fn()
   }
@@ -91,15 +105,15 @@ class FakeRateLimitWindow extends EventEmitter {
   }
 
   isVisible(): boolean {
-    return true
+    return this.visible
   }
 
   isMinimized(): boolean {
-    return false
+    return this.minimized
   }
 
   isFocused(): boolean {
-    return true
+    return this.focused
   }
 }
 
@@ -112,6 +126,8 @@ describe('RateLimitService', () => {
     vi.clearAllMocks()
     vi.mocked(fetchGeminiRateLimits).mockResolvedValue(okProvider('gemini', 0, Date.now()))
     vi.mocked(fetchOpenCodeGoRateLimits).mockResolvedValue(okProvider('opencode-go', 0, Date.now()))
+    vi.mocked(fetchMiniMaxRateLimits).mockResolvedValue(okProvider('minimax', 0, Date.now()))
+    vi.mocked(hasMiniMaxSessionCookie).mockReturnValue(false)
   })
 
   it('does not refetch Claude when a Codex account switch is queued during fetchAll', async () => {
@@ -195,7 +211,7 @@ describe('RateLimitService', () => {
     }
   })
 
-  it('can defer the startup fetch until the attached window becomes active', async () => {
+  it('fetches usage on the first active window event after deferred startup', async () => {
     vi.mocked(fetchClaudeRateLimits).mockResolvedValue(okProvider('claude', 12))
     vi.mocked(fetchCodexRateLimits).mockResolvedValue(okProvider('codex', 24))
     const service = new RateLimitService()
@@ -208,14 +224,39 @@ describe('RateLimitService', () => {
     expect(fetchClaudeRateLimits).not.toHaveBeenCalled()
     expect(fetchCodexRateLimits).not.toHaveBeenCalled()
 
-    window.emit('show')
+    window.emit('focus')
+    await Promise.resolve()
+    await Promise.resolve()
 
-    await vi.waitFor(() => {
-      expect(fetchClaudeRateLimits).toHaveBeenCalledTimes(1)
-    })
+    expect(fetchClaudeRateLimits).toHaveBeenCalledTimes(1)
     expect(fetchCodexRateLimits).toHaveBeenCalledTimes(1)
 
     service.stop()
+  })
+
+  it('performs a one-shot active-window fetch when startup focus was missed', async () => {
+    vi.useFakeTimers()
+    try {
+      vi.mocked(fetchClaudeRateLimits).mockResolvedValue(okProvider('claude', 12))
+      vi.mocked(fetchCodexRateLimits).mockResolvedValue(okProvider('codex', 24))
+      const service = new RateLimitService()
+      const window = new FakeRateLimitWindow()
+
+      service.attach(asRateLimitWindow(window))
+      service.start({ fetchImmediately: false })
+
+      expect(fetchClaudeRateLimits).not.toHaveBeenCalled()
+      expect(fetchCodexRateLimits).not.toHaveBeenCalled()
+
+      await vi.advanceTimersByTimeAsync(1000)
+
+      expect(fetchClaudeRateLimits).toHaveBeenCalledTimes(1)
+      expect(fetchCodexRateLimits).toHaveBeenCalledTimes(1)
+
+      service.stop()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('keeps recent stale data across repeated failures', async () => {
@@ -304,12 +345,117 @@ describe('RateLimitService', () => {
     expect(fetchCodexRateLimits).toHaveBeenCalledTimes(2)
   })
 
+  it('aborts the active fetch cycle and clears queued refreshes on stop', async () => {
+    const service = new RateLimitService()
+    const capturedSignals: { claude?: AbortSignal; codex?: AbortSignal } = {}
+
+    vi.mocked(fetchClaudeRateLimits).mockImplementation(
+      (options) =>
+        new Promise((resolve) => {
+          capturedSignals.claude = options?.signal
+          options?.signal?.addEventListener(
+            'abort',
+            () => resolve(errorProvider('claude', 'aborted')),
+            { once: true }
+          )
+        })
+    )
+    vi.mocked(fetchCodexRateLimits).mockImplementation(
+      (options) =>
+        new Promise((resolve) => {
+          capturedSignals.codex = options?.signal
+          options?.signal?.addEventListener(
+            'abort',
+            () => resolve(errorProvider('codex', 'aborted')),
+            { once: true }
+          )
+        })
+    )
+
+    const activeFetch = serviceInternals(service).fetchAll()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    const queuedRefresh = service.refresh()
+    await Promise.resolve()
+
+    service.stop()
+
+    expect(capturedSignals.claude?.aborted).toBe(true)
+    expect(capturedSignals.codex?.aborted).toBe(true)
+
+    await queuedRefresh
+    await activeFetch
+
+    expect(fetchClaudeRateLimits).toHaveBeenCalledTimes(1)
+    expect(fetchCodexRateLimits).toHaveBeenCalledTimes(1)
+  })
+
+  it('aborts inactive Claude preview fetches on stop', async () => {
+    const service = new RateLimitService()
+    const account = { id: 'account-1', managedAuthPath: '/tmp/account-1/auth' }
+    const capturedSignals: { claude?: AbortSignal } = {}
+    service.setInactiveClaudeAccountsResolver(() => [account])
+    vi.mocked(fetchManagedAccountUsage).mockImplementation(
+      (_account, options) =>
+        new Promise((resolve) => {
+          capturedSignals.claude = options?.signal
+          options?.signal?.addEventListener(
+            'abort',
+            () => resolve(errorProvider('claude', 'aborted')),
+            { once: true }
+          )
+        })
+    )
+
+    const previewFetch = service.fetchInactiveClaudeAccountsOnOpen()
+    await Promise.resolve()
+
+    service.stop()
+
+    expect(capturedSignals.claude?.aborted).toBe(true)
+
+    await previewFetch
+
+    expect(service.getState().inactiveClaudeAccounts).toEqual([])
+  })
+
+  it('aborts inactive Codex preview fetches on stop', async () => {
+    const service = new RateLimitService()
+    const account = { id: 'account-1', managedHomePath: '/tmp/account-1/home' }
+    const capturedSignals: { codex?: AbortSignal } = {}
+    service.setInactiveCodexAccountsResolver(() => [account])
+    vi.mocked(fetchCodexRateLimits).mockImplementation(
+      (options) =>
+        new Promise((resolve) => {
+          capturedSignals.codex = options?.signal
+          options?.signal?.addEventListener(
+            'abort',
+            () => resolve(errorProvider('codex', 'aborted')),
+            { once: true }
+          )
+        })
+    )
+
+    const previewFetch = service.fetchInactiveCodexAccountsOnOpen()
+    await Promise.resolve()
+
+    service.stop()
+
+    expect(capturedSignals.codex?.aborted).toBe(true)
+
+    await previewFetch
+
+    expect(service.getState().inactiveCodexAccounts).toEqual([])
+  })
+
   it('fetches Gemini and OpenCode Go alongside Claude and Codex', async () => {
     const service = new RateLimitService()
-    service.setSettingsResolver(() => ({
-      opencodeSessionCookie: 'session=abc123',
-      opencodeWorkspaceId: ''
+    service.setOpenCodeGoConfigResolver(() => ({
+      sessionCookie: 'session=abc123',
+      workspaceIdOverride: ''
     }))
+    service.setGeminiCliOAuthEnabledResolver(() => true)
 
     vi.mocked(fetchClaudeRateLimits).mockResolvedValueOnce(okProvider('claude', 10, Date.now()))
     vi.mocked(fetchCodexRateLimits).mockResolvedValueOnce(okProvider('codex', 20, Date.now()))
@@ -321,12 +467,17 @@ describe('RateLimitService', () => {
     await service.refresh()
 
     expect(fetchClaudeRateLimits).toHaveBeenCalledTimes(1)
-    expect(fetchClaudeRateLimits).toHaveBeenCalledWith({
-      authPreparation: undefined,
-      allowPtyFallback: false
-    })
+    expect(fetchClaudeRateLimits).toHaveBeenCalledWith(
+      expect.objectContaining({
+        authPreparation: undefined,
+        allowPtyFallback: false,
+        allowUsagePanelSupplement: true,
+        signal: expect.any(AbortSignal)
+      })
+    )
     expect(fetchCodexRateLimits).toHaveBeenCalledTimes(1)
     expect(fetchGeminiRateLimits).toHaveBeenCalledTimes(1)
+    expect(fetchGeminiRateLimits).toHaveBeenCalledWith(true)
     expect(fetchOpenCodeGoRateLimits).toHaveBeenCalledTimes(1)
     expect(fetchOpenCodeGoRateLimits).toHaveBeenCalledWith('session=abc123', undefined)
 
@@ -421,16 +572,93 @@ describe('RateLimitService', () => {
     await service.refresh()
 
     expect(resolver).toHaveBeenCalledWith({ runtime: 'wsl', wslDistro: 'Ubuntu' })
-    expect(fetchClaudeRateLimits).toHaveBeenCalledWith({
-      authPreparation: expect.objectContaining({
-        runtime: 'wsl',
-        wslDistro: 'Ubuntu',
-        wslLinuxConfigDir: '/home/jin/.claude',
-        stripAuthEnv: true
-      }),
-      allowPtyFallback: false
-    })
+    expect(fetchClaudeRateLimits).toHaveBeenCalledWith(
+      expect.objectContaining({
+        authPreparation: expect.objectContaining({
+          runtime: 'wsl',
+          wslDistro: 'Ubuntu',
+          wslLinuxConfigDir: '/home/jin/.claude',
+          stripAuthEnv: true
+        }),
+        allowPtyFallback: true,
+        allowUsagePanelSupplement: true,
+        signal: expect.any(AbortSignal)
+      })
+    )
     expect(service.getState().claudeTarget).toEqual({ runtime: 'wsl', wslDistro: 'Ubuntu' })
+  })
+
+  it('does not use Claude PTY fallback for system-default usage refreshes', async () => {
+    const service = new RateLimitService()
+    service.setClaudeAuthPreparationResolver(async () => ({
+      configDir: '/tmp/.claude',
+      runtime: 'host',
+      wslDistro: null,
+      wslLinuxConfigDir: null,
+      envPatch: {},
+      stripAuthEnv: false,
+      provenance: 'system'
+    }))
+
+    vi.mocked(fetchClaudeRateLimits).mockResolvedValueOnce(okProvider('claude', 10, Date.now()))
+    vi.mocked(fetchCodexRateLimits).mockResolvedValueOnce(okProvider('codex', 20, Date.now()))
+
+    await service.refresh()
+
+    expect(fetchClaudeRateLimits).toHaveBeenCalledWith(
+      expect.objectContaining({
+        authPreparation: expect.objectContaining({ provenance: 'system' }),
+        allowPtyFallback: false,
+        allowUsagePanelSupplement: true,
+        signal: expect.any(AbortSignal)
+      })
+    )
+  })
+
+  it('does not use Claude PTY fallback when Claude auth preparation is unavailable', async () => {
+    const service = new RateLimitService()
+
+    vi.mocked(fetchClaudeRateLimits).mockResolvedValueOnce(okProvider('claude', 10, Date.now()))
+    vi.mocked(fetchCodexRateLimits).mockResolvedValueOnce(okProvider('codex', 20, Date.now()))
+
+    await service.refresh()
+
+    expect(fetchClaudeRateLimits).toHaveBeenCalledWith(
+      expect.objectContaining({
+        authPreparation: undefined,
+        allowPtyFallback: false,
+        allowUsagePanelSupplement: true,
+        signal: expect.any(AbortSignal)
+      })
+    )
+  })
+
+  it('does not use Claude PTY fallback for WSL system-default usage refreshes', async () => {
+    const service = new RateLimitService()
+    service.setClaudeFetchTarget({ runtime: 'wsl', wslDistro: 'Ubuntu' })
+    service.setClaudeAuthPreparationResolver(async () => ({
+      configDir: '\\\\wsl.localhost\\Ubuntu\\home\\jin\\.claude',
+      runtime: 'wsl',
+      wslDistro: 'Ubuntu',
+      wslLinuxConfigDir: '/home/jin/.claude',
+      envPatch: {},
+      stripAuthEnv: true,
+      provenance: 'wsl:Ubuntu:system'
+    }))
+
+    vi.mocked(fetchClaudeRateLimits).mockResolvedValueOnce(okProvider('claude', 10, Date.now()))
+    vi.mocked(fetchCodexRateLimits).mockResolvedValueOnce(okProvider('codex', 20, Date.now()))
+
+    await service.refresh()
+
+    expect(fetchClaudeRateLimits).toHaveBeenCalledWith(
+      expect.objectContaining({
+        authPreparation: expect.objectContaining({ provenance: 'wsl:Ubuntu:system' }),
+        allowPtyFallback: false,
+        allowUsagePanelSupplement: true,
+        signal: expect.any(AbortSignal)
+      })
+    )
   })
 
   it('does not cache host Codex usage under an outgoing WSL account', async () => {
@@ -488,7 +716,7 @@ describe('RateLimitService', () => {
     })
 
     expect(fetchClaudeRateLimits).toHaveBeenLastCalledWith(
-      expect.objectContaining({ allowPtyFallback: false })
+      expect.objectContaining({ allowPtyFallback: true, allowUsagePanelSupplement: true })
     )
 
     expect(service.getState().inactiveClaudeAccounts).not.toEqual(
@@ -507,10 +735,13 @@ describe('RateLimitService', () => {
 
     await service.fetchInactiveCodexAccountsOnOpen()
 
-    expect(fetchCodexRateLimits).toHaveBeenCalledWith({
-      codexHomePath: wslCodexHome,
-      allowPtyFallback: false
-    })
+    expect(fetchCodexRateLimits).toHaveBeenCalledWith(
+      expect.objectContaining({
+        codexHomePath: wslCodexHome,
+        allowPtyFallback: false,
+        signal: expect.any(AbortSignal)
+      })
+    )
     expect(service.getState().inactiveCodexAccounts).toEqual([
       {
         accountId: 'account-1',
@@ -522,6 +753,23 @@ describe('RateLimitService', () => {
         isFetching: false
       }
     ])
+  })
+
+  it('allows usage-panel Fable supplements for inactive Claude account previews', async () => {
+    const service = new RateLimitService()
+    const account = { id: 'account-1', managedAuthPath: '/tmp/account-1/auth' }
+    service.setInactiveClaudeAccountsResolver(() => [account])
+    vi.mocked(fetchManagedAccountUsage).mockResolvedValueOnce(okProvider('claude', 33, Date.now()))
+
+    await service.fetchInactiveClaudeAccountsOnOpen()
+
+    expect(fetchManagedAccountUsage).toHaveBeenCalledWith(
+      account,
+      expect.objectContaining({
+        allowUsagePanelSupplement: true,
+        signal: expect.any(AbortSignal)
+      })
+    )
   })
 
   it('does not start overlapping inactive Codex preview fetches', async () => {
@@ -649,7 +897,10 @@ describe('RateLimitService', () => {
 
   it('isolates provider failures so one error does not block others', async () => {
     const service = new RateLimitService()
-    service.setSettingsResolver(() => ({ opencodeSessionCookie: '', opencodeWorkspaceId: '' }))
+    service.setOpenCodeGoConfigResolver(() => ({
+      sessionCookie: '',
+      workspaceIdOverride: ''
+    }))
 
     vi.mocked(fetchClaudeRateLimits).mockRejectedValueOnce(new Error('claude down'))
     vi.mocked(fetchCodexRateLimits).mockResolvedValueOnce(okProvider('codex', 20, Date.now()))
@@ -672,7 +923,10 @@ describe('RateLimitService', () => {
   it('discards stale data when a provider becomes unavailable', async () => {
     const service = new RateLimitService()
     let cookie = 'session=valid'
-    service.setSettingsResolver(() => ({ opencodeSessionCookie: cookie, opencodeWorkspaceId: '' }))
+    service.setOpenCodeGoConfigResolver(() => ({
+      sessionCookie: cookie,
+      workspaceIdOverride: ''
+    }))
 
     // 1. Success fetch
     vi.mocked(fetchClaudeRateLimits).mockResolvedValue(okProvider('claude', 10, Date.now()))
@@ -707,9 +961,9 @@ describe('RateLimitService', () => {
   it('discards stale data when Workspace ID override is changed', async () => {
     const service = new RateLimitService()
     let workspaceId = 'wrk_A'
-    service.setSettingsResolver(() => ({
-      opencodeSessionCookie: 'session=valid',
-      opencodeWorkspaceId: workspaceId
+    service.setOpenCodeGoConfigResolver(() => ({
+      sessionCookie: 'session=valid',
+      workspaceIdOverride: workspaceId
     }))
 
     // 1. Success fetch for Workspace A
@@ -813,5 +1067,130 @@ describe('RateLimitService', () => {
         isFetching: false
       }
     ])
+  })
+
+  it('fetches MiniMax alongside other providers when a config resolver is set', async () => {
+    const service = new RateLimitService()
+    service.setMiniMaxConfigResolver(() => ({
+      sessionCookie: '_token=abc; minimax_group_id_v2=42',
+      groupId: '',
+      models: 'general'
+    }))
+    vi.mocked(hasMiniMaxSessionCookie).mockReturnValue(true)
+    vi.mocked(fetchMiniMaxRateLimits).mockResolvedValueOnce(okProvider('minimax', 50, Date.now()))
+
+    await service.refresh()
+
+    expect(fetchMiniMaxRateLimits).toHaveBeenCalledTimes(1)
+    expect(fetchMiniMaxRateLimits).toHaveBeenCalledWith({
+      cookie: '_token=abc; minimax_group_id_v2=42',
+      groupId: '',
+      models: 'general'
+    })
+
+    const state = service.getState()
+    expect(state.minimax?.status).toBe('ok')
+    expect(state.minimax?.session?.usedPercent).toBe(50)
+    expect(state.minimaxCookieConfigured).toBe(true)
+  })
+
+  it('reports minimaxCookieConfigured from the cookie store even without a resolver', () => {
+    const service = new RateLimitService()
+    vi.mocked(hasMiniMaxSessionCookie).mockReturnValue(true)
+    expect(service.getState().minimaxCookieConfigured).toBe(true)
+  })
+
+  it('discards the previous MiniMax snapshot when its config hash changes', async () => {
+    const service = new RateLimitService()
+    let models = 'general'
+    service.setMiniMaxConfigResolver(() => ({
+      sessionCookie: '_token=abc',
+      groupId: '',
+      models
+    }))
+    vi.mocked(hasMiniMaxSessionCookie).mockReturnValue(true)
+    vi.mocked(fetchMiniMaxRateLimits)
+      .mockResolvedValueOnce(okProvider('minimax', 40, Date.now()))
+      .mockResolvedValueOnce(okProvider('minimax', 10, Date.now()))
+
+    await service.refresh()
+    expect(service.getState().minimax?.session?.usedPercent).toBe(40)
+
+    models = 'premium'
+    await service.refresh()
+
+    const state = service.getState()
+    expect(fetchMiniMaxRateLimits).toHaveBeenCalledTimes(2)
+    expect(state.minimax?.session?.usedPercent).toBe(10)
+  })
+
+  it('does not apply an in-flight MiniMax result after credential invalidation', async () => {
+    const service = new RateLimitService()
+    const firstMiniMax = deferred<ProviderRateLimits>()
+    const secondMiniMax = deferred<ProviderRateLimits>()
+    service.setMiniMaxConfigResolver(() => ({
+      sessionCookie: '_token=abc',
+      groupId: '',
+      models: 'general'
+    }))
+    vi.mocked(fetchMiniMaxRateLimits)
+      .mockImplementationOnce(() => firstMiniMax.promise)
+      .mockImplementationOnce(() => secondMiniMax.promise)
+
+    const firstRefresh = service.refresh()
+    await Promise.resolve()
+
+    service.invalidateMiniMaxCredentialState()
+    const queuedRefresh = service.refresh()
+    await Promise.resolve()
+
+    firstMiniMax.resolve(okProvider('minimax', 50, Date.now()))
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(service.getState().minimax?.status).toBe('fetching')
+    expect(service.getState().minimax?.session).toBeNull()
+
+    secondMiniMax.resolve(okProvider('minimax', 10, Date.now()))
+    await firstRefresh
+    await queuedRefresh
+
+    const state = service.getState()
+    expect(fetchMiniMaxRateLimits).toHaveBeenCalledTimes(2)
+    expect(state.minimax?.session?.usedPercent).toBe(10)
+  })
+
+  it('isolates MiniMax failures from other providers', async () => {
+    const service = new RateLimitService()
+    service.setMiniMaxConfigResolver(() => ({
+      sessionCookie: '_token=abc',
+      groupId: '',
+      models: 'general'
+    }))
+    vi.mocked(fetchMiniMaxRateLimits).mockRejectedValueOnce(new Error('minimax down'))
+    vi.mocked(fetchClaudeRateLimits).mockResolvedValueOnce(okProvider('claude', 10, Date.now()))
+
+    await service.refresh()
+
+    const state = service.getState()
+    expect(state.minimax?.status).toBe('error')
+    expect(state.minimax?.error).toBe('minimax down')
+    expect(state.claude?.status).toBe('ok')
+  })
+
+  it('isolates MiniMax config resolver failures from other providers', async () => {
+    const service = new RateLimitService()
+    service.setMiniMaxConfigResolver(() => {
+      throw new Error('MiniMax session cookie could not be decrypted')
+    })
+    vi.mocked(fetchClaudeRateLimits).mockResolvedValueOnce(okProvider('claude', 10, Date.now()))
+
+    await service.refresh()
+
+    const state = service.getState()
+    expect(fetchMiniMaxRateLimits).not.toHaveBeenCalled()
+    expect(state.minimax?.status).toBe('error')
+    expect(state.minimax?.error).toBe('MiniMax session cookie could not be decrypted')
+    expect(state.claude?.status).toBe('ok')
   })
 })

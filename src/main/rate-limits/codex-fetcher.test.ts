@@ -1,8 +1,10 @@
 import { EventEmitter } from 'node:events'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { join } from 'node:path'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { childSpawnMock, resolveCodexCommandMock, ptySpawnMock } = vi.hoisted(() => ({
+const { childSpawnMock, readFileMock, resolveCodexCommandMock, ptySpawnMock } = vi.hoisted(() => ({
   childSpawnMock: vi.fn(),
+  readFileMock: vi.fn(),
   resolveCodexCommandMock: vi.fn(),
   ptySpawnMock: vi.fn()
 }))
@@ -11,6 +13,10 @@ vi.mock('electron', () => ({ app: { isPackaged: false } }))
 
 vi.mock('node:child_process', () => ({
   spawn: childSpawnMock
+}))
+
+vi.mock('node:fs/promises', () => ({
+  readFile: readFileMock
 }))
 
 vi.mock('../codex-cli/command', () => ({
@@ -29,6 +35,7 @@ vi.mock('./codex-auth-presence', () => ({
 
 import { fetchCodexRateLimits } from './codex-fetcher'
 import { codexAuthExists } from './codex-auth-presence'
+import { getActiveHiddenRateLimitPtyCount } from './hidden-pty-cleanup'
 
 function makeDisposable() {
   return { dispose: vi.fn() }
@@ -48,12 +55,37 @@ function makeRpcChild() {
   return child
 }
 
+function makePtyTerm() {
+  let dataHandler: ((data: string) => void) | null = null
+  let exitHandler: (() => void) | null = null
+  return {
+    onData: vi.fn((callback: (data: string) => void) => {
+      dataHandler = callback
+      return makeDisposable()
+    }),
+    onExit: vi.fn((callback: () => void) => {
+      exitHandler = callback
+      return makeDisposable()
+    }),
+    write: vi.fn(),
+    kill: vi.fn(),
+    emitData: (data: string) => dataHandler?.(data),
+    emitExit: () => exitHandler?.()
+  }
+}
+
 describe('fetchCodexRateLimits', () => {
   beforeEach(() => {
     vi.useFakeTimers()
     vi.clearAllMocks()
     resolveCodexCommandMock.mockReturnValue('codex')
     vi.mocked(codexAuthExists).mockReturnValue(true)
+    readFileMock.mockRejectedValue(new Error('no auth fixture'))
+    vi.stubGlobal('fetch', vi.fn())
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
   })
 
   it('does not spawn Codex when the user is not signed in', async () => {
@@ -96,6 +128,83 @@ describe('fetchCodexRateLimits', () => {
     expect(onExitDisposable.dispose.mock.invocationCallOrder[0]).toBeLessThan(
       killMock.mock.invocationCallOrder[0]
     )
+  })
+
+  it('spawns the RPC rate-limit reader in a bounded non-root cwd', async () => {
+    const rpcChild = makeRpcChild()
+    childSpawnMock.mockReturnValue(rpcChild)
+
+    const resultPromise = fetchCodexRateLimits({ allowPtyFallback: false })
+
+    const spawnCwd = childSpawnMock.mock.calls[0]?.[2]?.cwd as string
+    expect(spawnCwd).toContain('rate-limit-pty-cwd')
+    expect(spawnCwd).not.toBe('/')
+    expect(spawnCwd).not.toMatch(/^[A-Za-z]:\\?$/)
+
+    rpcChild.emit('close')
+    await resultPromise
+  })
+
+  it('spawns the PTY fallback in a bounded non-root cwd', async () => {
+    const term = makePtyTerm()
+    childSpawnMock.mockImplementation(() => {
+      throw new Error('rpc unavailable')
+    })
+    ptySpawnMock.mockReturnValue(term)
+
+    const resultPromise = fetchCodexRateLimits()
+    await vi.advanceTimersByTimeAsync(0)
+
+    const spawnCwd = ptySpawnMock.mock.calls[0]?.[2]?.cwd as string
+    expect(spawnCwd).toContain('rate-limit-pty-cwd')
+    expect(spawnCwd).not.toBe('/')
+    expect(spawnCwd).not.toMatch(/^[A-Za-z]:\\?$/)
+
+    term.emitExit()
+    await resultPromise
+  })
+
+  it('kills the RPC child and skips PTY fallback when the fetch signal aborts', async () => {
+    const rpcChild = makeRpcChild()
+    childSpawnMock.mockReturnValue(rpcChild)
+    const controller = new AbortController()
+
+    const resultPromise = fetchCodexRateLimits({ signal: controller.signal })
+
+    controller.abort()
+
+    await expect(resultPromise).resolves.toMatchObject({
+      provider: 'codex',
+      status: 'error',
+      error: 'Rate-limit fetch aborted'
+    })
+    expect(rpcChild.kill).toHaveBeenCalledTimes(1)
+    expect(ptySpawnMock).not.toHaveBeenCalled()
+  })
+
+  it('kills and unregisters the PTY fallback when the fetch signal aborts', async () => {
+    const term = makePtyTerm()
+    childSpawnMock.mockImplementation(() => {
+      throw new Error('rpc unavailable')
+    })
+    ptySpawnMock.mockReturnValue(term)
+    const controller = new AbortController()
+    const killMock = term.kill
+
+    const resultPromise = fetchCodexRateLimits({ signal: controller.signal })
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(getActiveHiddenRateLimitPtyCount()).toBe(1)
+
+    controller.abort()
+
+    await expect(resultPromise).resolves.toMatchObject({
+      provider: 'codex',
+      status: 'error',
+      error: 'Rate-limit fetch aborted'
+    })
+    expect(killMock).toHaveBeenCalledTimes(1)
+    expect(getActiveHiddenRateLimitPtyCount()).toBe(0)
   })
 
   it('falls back to the PTY status reader when RPC exits before returning usage', async () => {
@@ -217,6 +326,174 @@ describe('fetchCodexRateLimits', () => {
     expect(result.weekly?.windowMinutes).toBe(10080)
   })
 
+  it('fills reset-credit count from the backend when the installed app-server omits it', async () => {
+    const rpcChild = makeRpcChild()
+    childSpawnMock.mockReturnValue(rpcChild)
+    readFileMock.mockResolvedValue(
+      JSON.stringify({
+        tokens: {
+          access_token: 'access-token',
+          account_id: 'account-id'
+        }
+      })
+    )
+    vi.mocked(fetch).mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        available_count: 2,
+        total_earned_count: 3,
+        credits: [
+          {
+            status: 'available',
+            expires_at: '2026-06-25T12:00:00Z',
+            granted_at: '2026-06-18T12:00:00Z'
+          },
+          {
+            status: 'available',
+            expires_at: '2026-06-24T12:00:00Z',
+            granted_at: '2026-06-17T12:00:00Z'
+          },
+          {
+            status: 'redeemed',
+            expires_at: '2026-06-23T12:00:00Z',
+            granted_at: '2026-06-16T12:00:00Z'
+          }
+        ]
+      })
+    } as Response)
+    rpcChild.stdin.write.mockImplementation((line: string) => {
+      const msg = JSON.parse(line) as { id?: number; method?: string }
+      if (msg.method === 'initialize') {
+        setTimeout(() => {
+          rpcChild.stdout.emit(
+            'data',
+            Buffer.from(`${JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: {} })}\n`)
+          )
+        }, 0)
+      }
+      if (msg.method === 'account/rateLimits/read') {
+        setTimeout(() => {
+          rpcChild.stdout.emit(
+            'data',
+            Buffer.from(
+              `${JSON.stringify({
+                jsonrpc: '2.0',
+                id: msg.id,
+                result: {
+                  rateLimits: {
+                    primary: { usedPercent: 3 },
+                    secondary: { usedPercent: 4 }
+                  }
+                }
+              })}\n`
+            )
+          )
+        }, 0)
+      }
+    })
+
+    const resultPromise = fetchCodexRateLimits({ codexHomePath: '/managed/codex-home' })
+    await vi.advanceTimersByTimeAsync(1)
+    await vi.advanceTimersByTimeAsync(1)
+    const result = await resultPromise
+
+    expect(result.rateLimitResetCredits).toEqual({
+      availableCount: 2,
+      totalEarnedCount: 3,
+      nextExpiresAt: Date.parse('2026-06-24T12:00:00Z'),
+      credits: [
+        {
+          status: 'available',
+          expiresAt: Date.parse('2026-06-25T12:00:00Z'),
+          grantedAt: Date.parse('2026-06-18T12:00:00Z')
+        },
+        {
+          status: 'available',
+          expiresAt: Date.parse('2026-06-24T12:00:00Z'),
+          grantedAt: Date.parse('2026-06-17T12:00:00Z')
+        },
+        {
+          status: 'redeemed',
+          expiresAt: Date.parse('2026-06-23T12:00:00Z'),
+          grantedAt: Date.parse('2026-06-16T12:00:00Z')
+        }
+      ]
+    })
+    expect(readFileMock).toHaveBeenCalledWith(join('/managed/codex-home', 'auth.json'), 'utf8')
+    expect(fetch).toHaveBeenCalledWith(
+      'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits',
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          Authorization: 'Bearer access-token',
+          'ChatGPT-Account-Id': 'account-id',
+          'OpenAI-Beta': 'codex-1',
+          originator: 'Codex Desktop'
+        })
+      })
+    )
+  })
+
+  it('uses reset-credit count from newer app-server responses without backend fallback', async () => {
+    const rpcChild = makeRpcChild()
+    childSpawnMock.mockReturnValue(rpcChild)
+    rpcChild.stdin.write.mockImplementation((line: string) => {
+      const msg = JSON.parse(line) as { id?: number; method?: string }
+      if (msg.method === 'initialize') {
+        setTimeout(() => {
+          rpcChild.stdout.emit(
+            'data',
+            Buffer.from(`${JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: {} })}\n`)
+          )
+        }, 0)
+      }
+      if (msg.method === 'account/rateLimits/read') {
+        setTimeout(() => {
+          rpcChild.stdout.emit(
+            'data',
+            Buffer.from(
+              `${JSON.stringify({
+                jsonrpc: '2.0',
+                id: msg.id,
+                result: {
+                  rateLimits: { primary: { usedPercent: 5 } },
+                  rateLimitResetCredits: {
+                    availableCount: 1,
+                    credits: [
+                      {
+                        status: 'available',
+                        expiresAt: '1719326400',
+                        grantedAt: '1718721600000'
+                      }
+                    ]
+                  }
+                }
+              })}\n`
+            )
+          )
+        }, 0)
+      }
+    })
+
+    const resultPromise = fetchCodexRateLimits()
+    await vi.advanceTimersByTimeAsync(1)
+    await vi.advanceTimersByTimeAsync(1)
+    const result = await resultPromise
+
+    expect(result.rateLimitResetCredits).toEqual({
+      availableCount: 1,
+      nextExpiresAt: 1719326400 * 1000,
+      credits: [
+        {
+          status: 'available',
+          expiresAt: 1719326400 * 1000,
+          grantedAt: 1718721600000
+        }
+      ]
+    })
+    expect(readFileMock).not.toHaveBeenCalled()
+    expect(fetch).not.toHaveBeenCalled()
+  })
+
   it('runs rate-limit RPC through WSL when the Codex home is a WSL managed account', async () => {
     const originalPlatform = process.platform
     Object.defineProperty(process, 'platform', {
@@ -259,17 +536,18 @@ describe('fetchCodexRateLimits', () => {
       await vi.advanceTimersByTimeAsync(1)
       await resultPromise
 
-      expect(childSpawnMock).toHaveBeenCalledWith(
-        'wsl.exe',
-        [
-          '-d',
-          'Ubuntu',
-          '--',
-          'bash',
-          '-lc',
-          "export CODEX_HOME='/home/alice/.local/share/orca/account/home'; exec codex '-s' 'read-only' '-a' 'untrusted' 'app-server'"
-        ],
+      const [spawnFile, spawnArgs, spawnOptions] = childSpawnMock.mock.calls[0]
+      expect(spawnFile).toBe('wsl.exe')
+      const bashCommand = spawnArgs.at(-1) as string
+      expect(bashCommand).toContain('mkdir -p "$orca_rate_limit_cwd"')
+      expect(bashCommand).toContain('cd "$orca_rate_limit_cwd"')
+      expect(bashCommand).toContain(
+        "export CODEX_HOME='/home/alice/.local/share/orca/account/home'"
+      )
+      expect(bashCommand).toContain("exec codex '-s' 'read-only' '-a' 'untrusted' 'app-server'")
+      expect(spawnOptions).toEqual(
         expect.objectContaining({
+          cwd: expect.stringContaining('rate-limit-pty-cwd'),
           env: expect.not.objectContaining({ CODEX_HOME: expect.anything() })
         })
       )
@@ -310,17 +588,18 @@ describe('fetchCodexRateLimits', () => {
       rpcChild.emit('close')
       await vi.advanceTimersByTimeAsync(0)
 
-      expect(ptySpawnMock).toHaveBeenCalledWith(
-        'wsl.exe',
-        [
-          '-d',
-          'Ubuntu',
-          '--',
-          'bash',
-          '-lc',
-          "export CODEX_HOME='/home/alice/.local/share/orca/account/home'; exec codex "
-        ],
+      const [spawnFile, spawnArgs, spawnOptions] = ptySpawnMock.mock.calls[0]
+      expect(spawnFile).toBe('wsl.exe')
+      const bashCommand = spawnArgs.at(-1) as string
+      expect(bashCommand).toContain('mkdir -p "$orca_rate_limit_cwd"')
+      expect(bashCommand).toContain('cd "$orca_rate_limit_cwd"')
+      expect(bashCommand).toContain(
+        "export CODEX_HOME='/home/alice/.local/share/orca/account/home'"
+      )
+      expect(bashCommand).toContain('exec codex ')
+      expect(spawnOptions).toEqual(
         expect.objectContaining({
+          cwd: expect.stringContaining('rate-limit-pty-cwd'),
           env: expect.not.objectContaining({ CODEX_HOME: expect.anything() })
         })
       )

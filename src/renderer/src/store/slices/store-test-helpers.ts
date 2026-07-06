@@ -32,12 +32,16 @@ import { createBrowserSlice } from './browser'
 import { createRateLimitSlice } from './rate-limits'
 import { createSshSlice } from './ssh'
 import { createAgentStatusSlice } from './agent-status'
+import { createPaneForegroundAgentSlice } from './pane-foreground-agent'
 import { createDiffCommentsSlice } from './diffComments'
 import { createDetectedAgentsSlice } from './detected-agents'
 import { createWorktreeNavHistorySlice } from './worktree-nav-history'
 import { createDictationSlice } from './dictation'
 import { createWorkspaceCleanupSlice } from './workspace-cleanup'
+import { createRuntimeStatusSlice } from './runtime-status'
 import { createPullRequestGenerationSlice } from './pull-request-generation'
+import { createCommitMessageGenerationSlice } from './commit-message-generation'
+import { createPinnedTabCloseConfirmSlice } from './pinned-tab-close-confirm'
 import { translate } from '@/i18n/i18n'
 
 export const TEST_REPO = {
@@ -74,12 +78,16 @@ export function createTestStore() {
     ...createRateLimitSlice(...a),
     ...createSshSlice(...a),
     ...createAgentStatusSlice(...a),
+    ...createPaneForegroundAgentSlice(...a),
     ...createDiffCommentsSlice(...a),
     ...createDetectedAgentsSlice(...a),
     ...createWorktreeNavHistorySlice(...a),
     ...createDictationSlice(...a),
     ...createWorkspaceCleanupSlice(...a),
-    ...createPullRequestGenerationSlice(...a)
+    ...createRuntimeStatusSlice(...a),
+    ...createPullRequestGenerationSlice(...a),
+    ...createCommitMessageGenerationSlice(...a),
+    ...createPinnedTabCloseConfirmSlice(...a)
   }))
 }
 

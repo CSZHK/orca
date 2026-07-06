@@ -6,16 +6,38 @@ describe('renderer startup runtime routing', () => {
   it('loads settings before repo and worktree hydration', () => {
     const source = readFileSync(join(process.cwd(), 'src/renderer/src/App.tsx'), 'utf8')
     const startupBlockStart = source.indexOf('void (async () => {')
-    const startupBlockEnd = source.indexOf('const persistedUI = await window.api.ui.get()')
+    const startupBlockEnd = source.indexOf('const persistedUI = await uiGetPromise')
     const startupBlock = source.slice(startupBlockStart, startupBlockEnd)
 
-    expect(startupBlock.indexOf('await actions.fetchSettings()')).toBeGreaterThanOrEqual(0)
-    expect(startupBlock.indexOf('await actions.fetchSettings()')).toBeLessThan(
-      startupBlock.indexOf('await actions.fetchRepos()')
-    )
-    expect(startupBlock.indexOf('await actions.fetchSettings()')).toBeLessThan(
-      startupBlock.indexOf('await actions.fetchAllWorktrees()')
-    )
+    const settingsIndex = startupBlock.indexOf('actions.fetchSettings()')
+    expect(settingsIndex).toBeGreaterThanOrEqual(0)
+    expect(settingsIndex).toBeLessThan(startupBlock.indexOf('actions.fetchReposForAllHosts()'))
+    expect(settingsIndex).toBeLessThan(startupBlock.indexOf('actions.fetchAllWorktrees()'))
+  })
+
+  it('overlaps sidebar scope loads with worktree hydration before session hydration', () => {
+    const source = readFileSync(join(process.cwd(), 'src/renderer/src/App.tsx'), 'utf8')
+    const startupBlockStart = source.indexOf('void (async () => {')
+    const startupBlockEnd = source.indexOf('const persistedUI = await uiGetPromise')
+    const startupBlock = source.slice(startupBlockStart, startupBlockEnd)
+
+    const reposIndex = startupBlock.indexOf('actions.fetchReposForAllHosts()')
+    const scopeChainIndex = startupBlock.indexOf('const projectScopeChain = (async () => {')
+    const projectGroupsIndex = startupBlock.indexOf('actions.fetchProjectGroupsForAllHosts()')
+    const folderWorkspacesIndex = startupBlock.indexOf('actions.fetchFolderWorkspacesForAllHosts()')
+    const promiseAllIndex = startupBlock.indexOf('await Promise.all([')
+    const awaitedScopeChainIndex = startupBlock.indexOf('projectScopeChain', promiseAllIndex)
+    const worktreesIndex = startupBlock.indexOf('actions.fetchAllWorktrees()')
+    const lineageIndex = startupBlock.indexOf('actions.fetchWorktreeLineage()')
+
+    expect(reposIndex).toBeGreaterThanOrEqual(0)
+    expect(scopeChainIndex).toBeGreaterThan(reposIndex)
+    expect(projectGroupsIndex).toBeGreaterThan(scopeChainIndex)
+    expect(folderWorkspacesIndex).toBeGreaterThan(projectGroupsIndex)
+    expect(promiseAllIndex).toBeGreaterThan(scopeChainIndex)
+    expect(awaitedScopeChainIndex).toBeGreaterThan(promiseAllIndex)
+    expect(worktreesIndex).toBeGreaterThan(promiseAllIndex)
+    expect(lineageIndex).toBeGreaterThan(promiseAllIndex)
   })
 
   it('waits for first-window startup services before terminal reconnect', () => {
@@ -125,20 +147,62 @@ describe('renderer startup runtime routing', () => {
     expect(source).toContain('shouldMountTerminalWorkbench ?')
   })
 
+  it('keeps the new-workspace composer eager because it is a critical create surface', () => {
+    const source = readFileSync(join(process.cwd(), 'src/renderer/src/App.tsx'), 'utf8')
+    const lazyModalSource = readFileSync(
+      join(process.cwd(), 'src/renderer/src/lazy-modal-mount-state.ts'),
+      'utf8'
+    )
+
+    expect(source).toContain(
+      "import NewWorkspaceComposerModal from './components/NewWorkspaceComposerModal'"
+    )
+    expect(source).not.toContain("import('./components/NewWorkspaceComposerModal')")
+    expect(source).toContain("activeModal === 'new-workspace-composer'")
+    expect(lazyModalSource).not.toContain("'new-workspace-composer'")
+  })
+
   it('does not eagerly import inactive sidebar dialog flows on startup', () => {
-    const source = readFileSync(
+    const appSource = readFileSync(join(process.cwd(), 'src/renderer/src/App.tsx'), 'utf8')
+    const sidebarSource = readFileSync(
       join(process.cwd(), 'src/renderer/src/components/sidebar/index.tsx'),
       'utf8'
     )
 
-    expect(source).toContain("React.lazy(() => import('./AddRepoDialog'))")
-    expect(source).toContain("React.lazy(() => import('./WorktreeMetaDialog'))")
-    expect(source).not.toContain("from './AddRepoDialog'")
-    expect(source).not.toContain("from './WorktreeMetaDialog'")
-    expect(source).toContain("activeModal === 'add-repo'")
-    expect(source).toContain('shouldMountAddRepoDialog ? <AddRepoDialog /> : null')
-    expect(source).toContain('setTimeout(() =>')
-    expect(source).toContain("activeModal === 'edit-meta' ? <WorktreeMetaDialog /> : null")
+    expect(appSource).toContain("lazy(() => import('./components/sidebar/AddRepoDialog'))")
+    expect(appSource).toContain("lazy(() => import('./components/sidebar/NonGitFolderDialog'))")
+    expect(appSource).toContain("import('./components/sidebar/AddProjectFromFolderDialog')")
+    expect(appSource).toContain("lazy(() => import('./components/sidebar/ProjectAddedDialog'))")
+    expect(appSource).toContain("activeModal === 'add-repo'")
+    expect(appSource).toContain("activeModal === 'confirm-non-git-folder'")
+    expect(appSource).toContain("activeModal === 'confirm-add-project-from-folder'")
+    expect(appSource).toContain("activeModal === 'project-added'")
+    expect(appSource).toContain('shouldMountAddRepoDialog ? (')
+    expect(appSource).toContain('boundaryId="modal.add-repo"')
+    expect(appSource).toContain('boundaryId="modal.confirm-non-git-folder"')
+    expect(appSource).toContain('boundaryId="modal.confirm-add-project-from-folder"')
+    expect(appSource).toContain('boundaryId="modal.project-added"')
+    expect(appSource).toContain('setTimeout(() =>')
+    expect(sidebarSource).toContain("lazyWithRetry(() => import('./WorktreeMetaDialog'))")
+    expect(sidebarSource).not.toContain("from './AddRepoDialog'")
+    expect(sidebarSource).not.toContain("React.lazy(() => import('./AddRepoDialog'))")
+    expect(sidebarSource).not.toContain("React.lazy(() => import('./NonGitFolderDialog'))")
+    expect(sidebarSource).not.toContain("React.lazy(() => import('./AddProjectFromFolderDialog'))")
+    expect(sidebarSource).not.toContain("React.lazy(() => import('./ProjectAddedDialog'))")
+    expect(sidebarSource).not.toContain('shouldMountAddRepoDialog ? <AddRepoDialog /> : null')
+    expect(sidebarSource).not.toContain(
+      "activeModal === 'confirm-non-git-folder' ? <NonGitFolderDialog /> : null"
+    )
+    expect(sidebarSource).not.toContain(
+      "activeModal === 'confirm-add-project-from-folder' ? <AddProjectFromFolderDialog /> : null"
+    )
+    expect(sidebarSource).not.toContain(
+      "activeModal === 'project-added' ? <ProjectAddedDialog /> : null"
+    )
+    expect(sidebarSource).toContain("activeModal === 'edit-meta' ? <WorktreeMetaDialog /> : null")
+    expect(sidebarSource).toContain(
+      "activeModal === 'confirm-remove-folder' ? <RemoveFolderDialog /> : null"
+    )
   })
 
   it('does not eagerly import optional status-bar segments on startup', () => {

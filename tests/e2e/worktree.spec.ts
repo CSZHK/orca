@@ -65,10 +65,10 @@ test.describe('Create Workspace', () => {
       await expect(dialog).toBeVisible()
 
       // Wait for the composer to settle. The card fires several async effects
-      // on mount (detected-agent probe, repo combobox autofocus + hydration,
+      // on mount (detected-agent probe, name-field autofocus + hydration,
       // setup-hooks fetch). Clicking before those settle can race Radix's
       // FocusScope reparenting.
-      await expect(dialog.getByRole('combobox').first()).toBeVisible()
+      await expect(dialog.locator('[data-workspace-name-input="true"]')).toBeVisible()
 
       // Force the `getBaseRefDefault` IPC to round-trip so any consumer that
       // renders the envelope (e.g. SourceControl) has a chance to crash
@@ -180,7 +180,7 @@ test.describe('Create Workspace', () => {
 
       const dialog = orcaPage.getByRole('dialog', { name: /Create (Workspace|Worktree)/i })
       await expect(dialog).toBeVisible()
-      await expect(dialog.getByRole('combobox').first()).toBeVisible()
+      await expect(dialog.locator('[data-workspace-name-input="true"]')).toBeVisible()
 
       const nameInput = dialog.getByPlaceholder(/Type a name/i)
       await expect(nameInput).toBeVisible()
@@ -227,7 +227,7 @@ test.describe('Create Workspace', () => {
 
       const dialog = orcaPage.getByRole('dialog', { name: /Create (Workspace|Worktree)/i })
       await expect(dialog).toBeVisible()
-      await expect(dialog.getByRole('combobox').first()).toBeVisible()
+      await expect(dialog.locator('[data-workspace-name-input="true"]')).toBeVisible()
 
       await electronApp.evaluate(
         ({ ipcMain }, { title, url }) => {
@@ -263,9 +263,12 @@ test.describe('Create Workspace', () => {
             }
           )
           ipcMain.removeHandler('worktrees:resolvePrBase')
+          // Why: the fixture repo has no remote and its default branch name
+          // depends on the host's git init.defaultBranch (main vs master), so
+          // resolve the PR base to HEAD, which always exists regardless.
           ipcMain.handle('worktrees:resolvePrBase', () => {
             counters.__smartResolvePrBaseCount += 1
-            return { baseBranch: 'origin/main' }
+            return { baseBranch: 'HEAD' }
           })
         },
         { title, url }
@@ -299,6 +302,10 @@ test.describe('Create Workspace', () => {
       })
       await expect(orcaPage.getByRole('option', { name: url })).toHaveCount(0)
       await expect(orcaPage.getByText('Linked PR #2049')).toBeVisible()
+      // Why: quick create reuses the single GitHub lookup from typing (no
+      // redundant re-fetch), and since #5733 ("Create PR worktrees from the PR
+      // head") it resolves the PR start point exactly once at submit time — so
+      // the base resolves once here rather than being skipped.
       await expect
         .poll(() =>
           electronApp.evaluate(() => {
@@ -312,7 +319,7 @@ test.describe('Create Workspace', () => {
             }
           })
         )
-        .toEqual({ githubLookupCount: 1, resolvePrBaseCount: 0 })
+        .toEqual({ githubLookupCount: 1, resolvePrBaseCount: 1 })
     } finally {
       await orcaPage
         .evaluate(() => {
@@ -337,7 +344,7 @@ test.describe('Create Workspace', () => {
 
       const dialog = orcaPage.getByRole('dialog', { name: /Create (Workspace|Worktree)/i })
       await expect(dialog).toBeVisible()
-      await expect(dialog.getByRole('combobox').first()).toBeVisible()
+      await expect(dialog.locator('[data-workspace-name-input="true"]')).toBeVisible()
 
       await electronApp.evaluate(
         ({ ipcMain }, { title, url }) => {
@@ -358,9 +365,10 @@ test.describe('Create Workspace', () => {
             })
           )
           ipcMain.removeHandler('worktrees:resolvePrBase')
-          // Why: the fixture repo's default branch is master and has no
-          // remote; resolve the PR base to a ref that actually exists.
-          ipcMain.handle('worktrees:resolvePrBase', () => ({ baseBranch: 'master' }))
+          // Why: the fixture repo has no remote and its default branch name
+          // depends on the host's git init.defaultBranch (main vs master), so
+          // resolve the PR base to HEAD, which always exists regardless.
+          ipcMain.handle('worktrees:resolvePrBase', () => ({ baseBranch: 'HEAD' }))
         },
         { title, url }
       )

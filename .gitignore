@@ -61,6 +61,9 @@ pnpm-debug.log*
 # Coverage
 coverage/
 
+# Benchmark run output
+/tools/benchmarks/results/*.json
+
 # Temp
 tmp/
 .tmp/
@@ -93,6 +96,10 @@ docs/reference/react-performance-audit.md
 .validate-ui-screenshots/
 validation-screenshots/
 .stably-browser
+
+# PR verification evidence screenshots are referenced from notes but should not
+# be committed.
+notes/artifacts/
 
 # Playwright
 test-results/

@@ -1,4 +1,3 @@
-/* eslint-disable max-lines -- Why: onboarding E2E coverage shares one first-launch wizard fixture and step helpers; splitting this file would make the linear flow harder to audit. */
 /**
  * E2E tests for the first-launch Onboarding flow.
  *
@@ -12,6 +11,7 @@ import { test, expect } from './helpers/orca-app'
 import { waitForSessionReady } from './helpers/store'
 import type { Page } from '@stablyai/playwright-test'
 import type { GlobalSettings, TuiAgent } from '../../src/shared/types'
+import { ONBOARDING_FINAL_STEP } from '../../src/shared/constants'
 
 type OnboardingState = {
   closedAt: number | null
@@ -22,6 +22,7 @@ type OnboardingState = {
 
 const SKIP_TO_PROJECT_SETUP_BUTTON = /^Skip to project setup$/i
 const TASK_SOURCES_HEADING = /Set up GitHub tasks/i
+const WINDOWS_TERMINAL_HEADING = /Set Windows terminal defaults/i
 const ADD_PROJECT_DIALOG_HEADING = /Add (?:a server project|a project|another project)/i
 
 async function getOnboardingState(page: Page): Promise<OnboardingState> {
@@ -105,30 +106,31 @@ async function continueFromPostNotificationsToRepo(page: Page): Promise<void> {
   if (await page.getByRole('heading', { name: ADD_PROJECT_DIALOG_HEADING }).isVisible()) {
     return
   }
-  const taskSourcesVisible = await page
-    .getByRole('heading', { name: TASK_SOURCES_HEADING })
-    .waitFor({ state: 'visible', timeout: 1_000 })
-    .then(() => true)
-    .catch(() => false)
-  if (taskSourcesVisible) {
-    await expectOnboardingProgress(page, /^3 of 4$/)
-    await continueOnboarding(page)
-  }
+  await continueThroughOptionalTaskSourcesAndWindowsTerminal(page)
   await expect(page.getByRole('heading', { name: /Set up notifications/i })).toBeVisible()
-  await expectOnboardingProgress(page, /^[34] of [34]$/)
+  await expectOnboardingProgress(page, /^[345] of [345]$/)
   await expect(onboardingFooterButton(page, /^Add your first project\b/)).toBeVisible()
   await continueOnboarding(page)
   await expectAddProjectDialog(page)
 }
 
-async function continueThroughOptionalTaskSourcesToNotifications(page: Page): Promise<void> {
+async function continueThroughOptionalTaskSourcesAndWindowsTerminal(page: Page): Promise<void> {
   const taskSourcesVisible = await page
     .getByRole('heading', { name: TASK_SOURCES_HEADING })
     .waitFor({ state: 'visible', timeout: 1_000 })
     .then(() => true)
     .catch(() => false)
   if (taskSourcesVisible) {
-    await expectOnboardingProgress(page, /^3 of 4$/)
+    await expectOnboardingProgress(page, /^3 of [45]$/)
+    await continueOnboarding(page)
+  }
+  const windowsTerminalVisible = await page
+    .getByRole('heading', { name: WINDOWS_TERMINAL_HEADING })
+    .waitFor({ state: 'visible', timeout: 1_000 })
+    .then(() => true)
+    .catch(() => false)
+  if (windowsTerminalVisible) {
+    await expectOnboardingProgress(page, /^[34] of [45]$/)
     await continueOnboarding(page)
   }
   await expect(page.getByRole('heading', { name: /Set up notifications/i })).toBeVisible()
@@ -136,7 +138,7 @@ async function continueThroughOptionalTaskSourcesToNotifications(page: Page): Pr
 
 async function continueFromThemeToNotifications(page: Page): Promise<void> {
   await continueOnboarding(page)
-  await continueThroughOptionalTaskSourcesToNotifications(page)
+  await continueThroughOptionalTaskSourcesAndWindowsTerminal(page)
 }
 
 test.describe('Onboarding flow', () => {
@@ -156,7 +158,7 @@ test.describe('Onboarding flow', () => {
     await expect(orcaPage.getByRole('heading', { name: /Pick your default agent/i })).toBeVisible({
       timeout: 15_000
     })
-    await expectOnboardingProgress(orcaPage, /^1 of [34]$/)
+    await expectOnboardingProgress(orcaPage, /^1 of [345]$/)
     await expect(onboardingFooterButton(orcaPage, /^Continue\b/)).toBeVisible()
     await expect(onboardingFooterButton(orcaPage, SKIP_TO_PROJECT_SETUP_BUTTON)).toBeVisible()
     // Why: Back is not rendered on the first step (was previously rendered-but-
@@ -204,7 +206,7 @@ test.describe('Onboarding flow', () => {
 
     await continueOnboarding(orcaPage)
     await expect(orcaPage.getByRole('heading', { name: /Make it feel like home/i })).toBeVisible()
-    await expectOnboardingProgress(orcaPage, /^2 of [34]$/)
+    await expectOnboardingProgress(orcaPage, /^2 of [345]$/)
     await expect
       .poll(async () => (await getOnboardingState(orcaPage)).lastCompletedStep, {
         timeout: 5_000,
@@ -238,23 +240,28 @@ test.describe('Onboarding flow', () => {
       .toBe(oppositeTheme)
 
     await continueOnboarding(orcaPage)
-    await expect
-      .poll(async () => [2, 3].includes((await getOnboardingState(orcaPage)).lastCompletedStep), {
-        timeout: 5_000,
-        message: 'lastCompletedStep did not advance after second Continue'
-      })
-      .toBe(true)
-    await expect
-      .poll(async () => (await getSettings(orcaPage)).theme, { timeout: 5_000 })
-      .toBe(oppositeTheme)
-    await continueThroughOptionalTaskSourcesToNotifications(orcaPage)
-    await expectOnboardingProgress(orcaPage, /^[34] of [34]$/)
+    // Why: the theme Continue persists step 2, then persists *through* any
+    // skipped optional steps (integrations is skipped when gh is installed,
+    // windows_terminal off macOS), so lastCompletedStep can land at 2, 3, or 4.
+    // Key off the settled "theme step committed" lower bound rather than a fixed
+    // window that assumed integrations always renders.
     await expect
       .poll(async () => (await getOnboardingState(orcaPage)).lastCompletedStep, {
         timeout: 5_000,
-        message: 'lastCompletedStep did not include optional task-source progress'
+        message: 'lastCompletedStep did not advance past the theme step after second Continue'
       })
-      .toBe(3)
+      .toBeGreaterThanOrEqual(2)
+    await expect
+      .poll(async () => (await getSettings(orcaPage)).theme, { timeout: 5_000 })
+      .toBe(oppositeTheme)
+    await continueThroughOptionalTaskSourcesAndWindowsTerminal(orcaPage)
+    await expectOnboardingProgress(orcaPage, /^[345] of [345]$/)
+    await expect
+      .poll(async () => [3, 4].includes((await getOnboardingState(orcaPage)).lastCompletedStep), {
+        timeout: 5_000,
+        message: 'lastCompletedStep did not include optional setup progress'
+      })
+      .toBe(true)
 
     // --- Step 3: notifications ---
     await expectOnboardingNotificationSound(orcaPage, /System Default/i)
@@ -302,7 +309,7 @@ test.describe('Onboarding flow', () => {
         closedAt: 'set',
         outcome: 'completed',
         addedRepo: false,
-        lastCompletedStep: 4
+        lastCompletedStep: ONBOARDING_FINAL_STEP
       })
   })
 
@@ -367,7 +374,7 @@ test.describe('Onboarding flow', () => {
         closedAt: 'set',
         outcome: 'completed',
         dismissed: false,
-        lastCompletedStep: 4
+        lastCompletedStep: ONBOARDING_FINAL_STEP
       })
     await expect
       .poll(async () => (await getSettings(orcaPage)).defaultTuiAgent, { timeout: 5_000 })
@@ -411,7 +418,53 @@ test.describe('Onboarding flow', () => {
       timeout: 15_000
     })
     await orcaPage.evaluate(async () => {
-      await window.__store?.getState().updateSettings({ activeRuntimeEnvironmentId: 'env-e2e' })
+      const store = window.__store
+      if (!store) {
+        throw new Error('window.__store is not available')
+      }
+      // Why: after #5071 the server-path add step gates on the registered
+      // runtime-environment list (store.runtimeEnvironments), not just the
+      // activeRuntimeEnvironmentId setting. Seed a redacted environment so the
+      // host option exists and the "on host" add UI renders.
+      const now = Date.now()
+      store.getState().setRuntimeEnvironments([
+        {
+          id: 'env-e2e',
+          name: 'E2E Server',
+          createdAt: now,
+          updatedAt: now,
+          lastUsedAt: null,
+          runtimeId: null,
+          source: 'manual',
+          endpoints: [
+            {
+              id: 'ws-env-e2e',
+              kind: 'websocket',
+              label: 'WebSocket',
+              endpoint: 'wss://e2e.invalid/ws'
+            }
+          ],
+          preferredEndpointId: 'ws-env-e2e'
+        }
+      ])
+      // Why: a runtime host is only auto-selectable (health 'available') when it
+      // has a live, protocol-compatible status; without one it reads
+      // 'disconnected' and the Add Project dialog falls back to Local Mac.
+      // runtimeProtocolVersion 3 clears MIN_COMPATIBLE_RUNTIME_SERVER_VERSION.
+      store.getState().setRuntimeEnvironmentStatus('env-e2e', {
+        status: {
+          runtimeId: 'env-e2e-runtime',
+          rendererGraphEpoch: 0,
+          graphStatus: 'ready',
+          authoritativeWindowId: null,
+          liveTabCount: 0,
+          liveLeafCount: 0,
+          runtimeProtocolVersion: 3,
+          minCompatibleRuntimeClientVersion: 1
+        },
+        checkedAt: now
+      })
+      await store.getState().updateSettings({ activeRuntimeEnvironmentId: 'env-e2e' })
     })
     await expect
       .poll(async () => (await getSettings(orcaPage)).activeRuntimeEnvironmentId, {
@@ -422,10 +475,12 @@ test.describe('Onboarding flow', () => {
     await onboardingFooterButton(orcaPage, SKIP_TO_PROJECT_SETUP_BUTTON).click()
 
     await expectAddProjectDialog(orcaPage)
-    await expect(orcaPage.getByRole('button', { name: /Browse server/i })).toBeVisible()
+    // The runtime env is selected as the Add Project host and the browse action
+    // is host-scoped, proving the server project-setup UI is preserved on skip.
+    await expect(orcaPage.getByText('Existing Git repository or folder on this host')).toBeVisible()
+    await expect(orcaPage.getByRole('button', { name: /Browse folder/i })).toBeVisible()
     await expect(orcaPage.getByRole('button', { name: /Clone from URL/i })).toBeVisible()
-    await expect(orcaPage.getByRole('button', { name: /Create on server/i })).toBeVisible()
-    await expect(orcaPage.getByText(/Or enter a server path manually/i)).toBeVisible()
+    await expect(orcaPage.getByRole('button', { name: /Create new project/i })).toBeVisible()
     await expect(onboardingFooterButton(orcaPage, SKIP_TO_PROJECT_SETUP_BUTTON)).toHaveCount(0)
     expect((await getOnboardingState(orcaPage)).closedAt).not.toBeNull()
   })
@@ -550,7 +605,7 @@ test.describe('Onboarding flow', () => {
     // would otherwise match this regex.
     await orcaPage.getByRole('button', { name: 'Back', exact: true }).click()
     await expect(orcaPage.getByRole('heading', { name: /Pick your default agent/i })).toBeVisible()
-    await expectOnboardingProgress(orcaPage, /^1 of [34]$/)
+    await expectOnboardingProgress(orcaPage, /^1 of [345]$/)
 
     // Why: "without losing progress" means persisted lastCompletedStep stays
     // at 1 — Back rewinds the visible step but must not roll persistence back.
@@ -588,6 +643,6 @@ test.describe('Onboarding flow', () => {
     expect(final.closedAt).not.toBeNull()
     expect(final.outcome).toBe('completed')
     expect(final.checklist.dismissed).toBe(false)
-    expect(final.lastCompletedStep).toBe(4)
+    expect(final.lastCompletedStep).toBe(ONBOARDING_FINAL_STEP)
   })
 })

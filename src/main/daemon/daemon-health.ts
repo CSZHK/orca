@@ -1,9 +1,13 @@
 /* oxlint-disable max-lines -- Why: pid validation shares process-identity
 helpers with kill escalation so the SIGKILL safety checks stay co-located. */
-import { execFile, execFileSync } from 'child_process'
-import { existsSync, readFileSync, unlinkSync } from 'fs'
-import { connect, type Socket } from 'net'
-import { promisify } from 'util'
+import { execFile, execFileSync } from 'node:child_process'
+import { existsSync, readFileSync, unlinkSync } from 'node:fs'
+import { connect, type Socket } from 'node:net'
+import { promisify } from 'node:util'
+import {
+  getProcessOutputFields,
+  iterateProcessOutputLines
+} from '../../shared/process-output-field-scanner'
 import { isStartupDiagnosticsEnabled, logStartupDiagnostic } from '../startup/startup-diagnostics'
 import { encodeNdjson } from './ndjson'
 import { getDaemonPidPath } from './daemon-spawner'
@@ -21,7 +25,7 @@ const KILL_WAIT_MS = 3_000
 const KILL_POLL_MS = 100
 const START_TIME_TOLERANCE_MS = 1_500
 
-export type DaemonHealthCheckResult = 'healthy' | 'unhealthy' | 'pty-spawn-unhealthy'
+export type DaemonHealth = 'healthy' | 'unreachable' | 'pty-spawn-unhealthy'
 
 type ParsedDaemonPid = {
   pid: number
@@ -67,13 +71,10 @@ function canConnectSocket(socketPath: string): Promise<boolean> {
   })
 }
 
-export function checkDaemonHealth(
-  socketPath: string,
-  tokenPath: string
-): Promise<DaemonHealthCheckResult> {
+export function checkDaemonHealth(socketPath: string, tokenPath: string): Promise<DaemonHealth> {
   return new Promise((resolve) => {
     if (process.platform !== 'win32' && !existsSync(socketPath)) {
-      resolve('unhealthy')
+      resolve('unreachable')
       return
     }
 
@@ -81,13 +82,13 @@ export function checkDaemonHealth(
     try {
       token = readFileSync(tokenPath, 'utf8').trim()
     } catch {
-      resolve('unhealthy')
+      resolve('unreachable')
       return
     }
 
     let settled = false
     let sock: Socket | null = null
-    const settle = (result: DaemonHealthCheckResult): void => {
+    const settle = (result: DaemonHealth): void => {
       if (settled) {
         return
       }
@@ -102,7 +103,7 @@ export function checkDaemonHealth(
       sock?.off('connect', onConnect)
       sock?.off('data', onData)
     }
-    const onError = (): void => settle('unhealthy')
+    const onError = (): void => settle('unreachable')
     const onConnect = (): void => {
       const hello: HelloMessage = {
         type: 'hello',
@@ -133,38 +134,29 @@ export function checkDaemonHealth(
         try {
           message = JSON.parse(line) as Record<string, unknown>
         } catch {
-          settle('unhealthy')
+          settle('unreachable')
           return
         }
 
         if (message.type === 'hello') {
           if (!(message as HelloResponse).ok) {
-            settle('unhealthy')
+            settle('unreachable')
             return
           }
-          sock?.write(encodeNdjson({ id: 'health-1', type: 'ping' }))
+          // Why: a protocol-live daemon with a stale cwd or node-pty helper
+          // will answer ping but cannot create terminals, so reuse must check
+          // the PTY spawn prerequisites too.
+          sock?.write(encodeNdjson({ id: 'health-1', type: 'ptySpawnHealth' }))
           continue
         }
 
         if (message.id === 'health-1') {
-          if (!message.ok) {
-            settle('unhealthy')
-            return
-          }
-          // Why: protocol ping only proves the socket loop is alive. New
-          // terminals also depend on node-pty's native helper state inside
-          // the daemon process, which can go stale after dev rebuilds.
-          sock?.write(encodeNdjson({ id: 'health-2', type: 'ptySpawnHealth' }))
-          continue
-        }
-
-        if (message.id === 'health-2') {
-          settle(message.ok ? 'healthy' : 'pty-spawn-unhealthy')
+          settle(message.ok === true ? 'healthy' : 'pty-spawn-unhealthy')
           return
         }
       }
     }
-    const timer = setTimeout(() => settle('unhealthy'), HEALTH_CHECK_TIMEOUT_MS)
+    const timer = setTimeout(() => settle('unreachable'), HEALTH_CHECK_TIMEOUT_MS)
 
     sock = connect({ path: socketPath })
     sock.on('error', onError)
@@ -334,13 +326,8 @@ export function parseDaemonPidFile(contents: string): ParsedDaemonPid | null {
 function getLinuxProcessStartedAtMs(pid: number): number | null {
   try {
     const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
-    const afterCommand = stat.slice(stat.lastIndexOf(')') + 2)
-    const fields = afterCommand.split(' ')
-    const startTicks = Number(fields[19])
-    const bootTimeLine = readFileSync('/proc/stat', 'utf8')
-      .split('\n')
-      .find((line) => line.startsWith('btime '))
-    const bootTimeSeconds = bootTimeLine ? Number(bootTimeLine.split(/\s+/)[1]) : Number.NaN
+    const startTicks = parseLinuxProcStartTicks(stat)
+    const bootTimeSeconds = parseLinuxBootTimeSeconds(readFileSync('/proc/stat', 'utf8'))
     const ticksPerSecond = Number(
       execFileSync('getconf', ['CLK_TCK'], { encoding: 'utf8', timeout: 1_000 }).trim()
     )
@@ -356,6 +343,26 @@ function getLinuxProcessStartedAtMs(pid: number): number | null {
   } catch {
     return null
   }
+}
+
+export function parseLinuxProcStartTicks(stat: string): number {
+  const commandEndIndex = stat.lastIndexOf(')')
+  if (commandEndIndex === -1) {
+    return Number.NaN
+  }
+
+  const fields = getProcessOutputFields(stat.slice(commandEndIndex + 1), 20)
+  return Number(fields[19])
+}
+
+export function parseLinuxBootTimeSeconds(procStat: string): number {
+  for (const line of iterateProcessOutputLines(procStat)) {
+    if (!line.startsWith('btime ')) {
+      continue
+    }
+    return Number(getProcessOutputFields(line, 2)[1])
+  }
+  return Number.NaN
 }
 
 export function getProcessStartedAtMs(pid: number): number | null {
