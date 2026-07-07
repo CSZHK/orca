@@ -23,11 +23,19 @@ function buildNativeRebuildArgs(context) {
   const platform = readPlatformName(context?.platform)
   const arch = readArchName(context?.arch)
 
+  // Why: --force is only needed for cross-platform/cross-arch builds (e.g. CI
+  // arm64), where the host can't load foreign-arch modules to verify them —
+  // rebuild-native-deps.mjs also auto-forces in that case. For native builds,
+  // omit --force so it skips the recompile when modules already load in
+  // Electron, avoiding a redundant from-source rebuild that can trip MSVC's
+  // C1001 internal compiler error on node-pty.
+  const isCrossBuild = platform !== process.platform || arch !== process.arch
+
   return [
     'config/scripts/rebuild-native-deps.mjs',
     `--platform=${platform}`,
     `--arch=${arch}`,
-    '--force'
+    ...(isCrossBuild ? ['--force'] : [])
   ]
 }
 
