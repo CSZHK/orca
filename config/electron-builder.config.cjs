@@ -60,6 +60,15 @@ module.exports = {
     '!skills{,/**/*}',
     '!tests{,/**/*}',
     '!Casks{,/**/*}',
+    // Why: stray build outputs and local deploy artifacts in the project root
+    // would otherwise be swept into app.asar — a leftover dist-new/ once
+    // inflated the asar to ~4.5GB and exceeded NSIS's 32-bit mmap limit.
+    '!dist-new{,/**/*}',
+    '!tmp-cli-deploy{,/**/*}',
+    '!.locked-watcher-bak{,/**/*}',
+    '!orca-cli-deploy.tar.gz',
+    '!.claude{,/**/*}',
+    '!{dist-new-build,dist-new,build-win}.log',
     '!{AGENTS.md,CLAUDE.md,DEVELOPING.md,bundle-size-progress.md}',
     '!out/**/*.test.js',
     '!electron.vite.config.{js,ts,mjs,cjs}',
