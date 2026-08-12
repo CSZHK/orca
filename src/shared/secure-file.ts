@@ -134,9 +134,24 @@ export function writeSecureFile(
 }
 
 export function fsyncFileSync(path: string): void {
-  const descriptor = openSync(path, 'r')
+  // Why: a read-only handle cannot fsync on Windows — openSync(path, 'r') +
+  // fsyncSync throws EPERM (FlushFileBuffers on a read-only handle), which
+  // stalls startup when profile-index writes fsync. Open writable so the flush
+  // succeeds; the file can also be briefly AV-locked right after write, so on
+  // Windows degrade to best-effort if the platform still refuses.
+  let descriptor: number = 0
+  try {
+    descriptor = openSync(path, 'r+')
+  } catch {
+    descriptor = openSync(path, 'r')
+  }
   try {
     fsyncSync(descriptor)
+  } catch (error) {
+    if (process.platform === 'win32') {
+      return
+    }
+    throw error
   } finally {
     closeSync(descriptor)
   }
