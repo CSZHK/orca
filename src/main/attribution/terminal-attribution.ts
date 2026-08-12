@@ -5,10 +5,10 @@ instead of scattering generated shell fragments across files. */
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join, win32 as pathWin32 } from 'node:path'
 import { ORCA_GIT_COMMIT_TRAILER } from '../../shared/orca-attribution'
-import { findEnvPathKey } from '../pty/env-path-key'
+import { resolvePathEnvKey } from '../pty/windows-environment-path'
 
 const ATTRIBUTION_ROOT_DIR = 'orca-terminal-attribution'
-const ATTRIBUTION_SHIM_VERSION = '6'
+const ATTRIBUTION_SHIM_VERSION = '7'
 const ORCA_PRODUCT_URL = 'https://github.com/stablyai/orca'
 const ORCA_GH_FOOTER = `Made with [Orca](${ORCA_PRODUCT_URL}) 🐋`
 const SHELL_DOLLAR = '$'
@@ -74,12 +74,8 @@ export function applyTerminalAttributionEnv(
   }
 
   const pathDelimiter = platform === 'win32' ? ';' : ':'
-  // Why: Windows spreads process.env into a plain object keyed `Path`, so
-  // hardcoding `baseEnv.PATH` reads undefined and a later write would mint a
-  // duplicate key that shadows the real PATH in the ConPTY env block. Read and
-  // write the actual key so attribution-enabled Windows PTYs keep their PATH.
-  const pathKey = findEnvPathKey(baseEnv)
-  const basePath = baseEnv[pathKey] ?? process.env.PATH ?? ''
+  const pathKey = resolvePathEnvKey(baseEnv, platform)
+  const basePath = baseEnv[pathKey] ?? process.env[pathKey] ?? ''
   // Why: resolve real Windows commands before prepending shims so cmd wrappers
   // cannot recursively point ORCA_REAL_* at themselves.
   const resolvedGit = platform === 'win32' ? resolveWindowsExecutable('git', basePath) : null
@@ -140,7 +136,7 @@ function clearTerminalAttributionEnv(
   // Why: mirror the read/write key resolution in applyTerminalAttributionEnv so
   // clearing shims on Windows touches the real `Path` key instead of leaving a
   // stale duplicate behind.
-  const pathKey = findEnvPathKey(baseEnv)
+  const pathKey = resolvePathEnvKey(baseEnv, platform)
   const cleanedPath = stripAttributionPathEntries(baseEnv[pathKey] ?? '', pathDelimiter)
   if (cleanedPath) {
     baseEnv[pathKey] = cleanedPath
@@ -652,6 +648,8 @@ if not "%ORCA_ENABLE_GIT_ATTRIBUTION%"=="1" goto run
 if "%ORCA_ATTRIBUTION_BYPASS%"=="1" goto run
 call :orca_is_git_commit %*
 if errorlevel 1 goto run
+call :orca_has_bare_dash %*
+if not errorlevel 1 goto run
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0git-wrapper.ps1" %*
 exit /b %ERRORLEVEL%
 :run
@@ -686,6 +684,15 @@ goto orca_is_git_commit
 :skip_one
 shift
 goto orca_is_git_commit
+
+rem Why: powershell.exe -File rejects a bare "-" while binding arguments, so the
+rem script never runs. Pass those straight to git, which is what the PS wrapper
+rem does with a stdin message anyway.
+:orca_has_bare_dash
+if "%~1"=="" exit /b 1
+if "%~1"=="-" exit /b 0
+shift
+goto orca_has_bare_dash
 `
 
 const WIN32_GH_CMD_WRAPPER = String.raw`@echo off
@@ -696,6 +703,8 @@ if /I "%~1"=="pr" if /I "%~2"=="create" goto wrap
 if /I "%~1"=="issue" if /I "%~2"=="create" goto wrap
 goto run
 :wrap
+call :orca_has_bare_dash %*
+if not errorlevel 1 goto run
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0gh-wrapper.ps1" %*
 exit /b %ERRORLEVEL%
 :run
@@ -706,6 +715,14 @@ if defined ORCA_REAL_GH (
   exit /b 127
 )
 exit /b %ERRORLEVEL%
+
+rem Why: powershell.exe -File rejects a bare "-" while binding arguments, so the
+rem script never runs. Creating without the footer beats not creating at all.
+:orca_has_bare_dash
+if "%~1"=="" exit /b 1
+if "%~1"=="-" exit /b 0
+shift
+goto orca_has_bare_dash
 `
 
 const WIN32_GIT_PS_WRAPPER = String.raw`$ErrorActionPreference = 'Stop'

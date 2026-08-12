@@ -5,14 +5,24 @@ export function shouldRepairActiveTerminalTab(args: {
   activeTabId: string | null
   tabs: TerminalTab[]
 }): boolean {
-  if (args.activeTabType !== 'terminal') {
-    return false
+  return (
+    args.activeTabType === 'terminal' &&
+    args.tabs.length > 0 &&
+    (!args.activeTabId || !args.tabs.some((tab) => tab.id === args.activeTabId))
+  )
+}
+
+export function resolveRepairedActiveTerminalTabId(args: {
+  activeTabType: WorkspaceVisibleTabType
+  activeTabId: string | null
+  rememberedTabId: string | null | undefined
+  tabs: TerminalTab[]
+}): string | null {
+  if (!shouldRepairActiveTerminalTab(args)) {
+    return null
   }
-  if (args.tabs.length === 0) {
-    return false
+  if (args.rememberedTabId && args.tabs.some((tab) => tab.id === args.rememberedTabId)) {
+    return args.rememberedTabId
   }
-  if (args.activeTabId && args.tabs.some((tab) => tab.id === args.activeTabId)) {
-    return false
-  }
-  return true
+  return args.tabs[0].id
 }
