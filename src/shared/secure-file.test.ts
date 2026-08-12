@@ -15,7 +15,7 @@ import {
 
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs')>()
-  return { ...actual, fsyncSync: vi.fn((...args) => actual.fsyncSync(...args)) }
+  return { ...actual, fsyncSync: vi.fn((fd: number) => actual.fsyncSync(fd)) }
 })
 
 const posixModeIt = process.platform === 'win32' ? it.skip : it
