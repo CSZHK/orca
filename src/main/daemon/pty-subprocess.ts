@@ -34,7 +34,6 @@ import { isPwshAvailable } from '../pwsh'
 import { isHostCodexHomeForWsl, isWslCodexHomeForHost } from '../pty/codex-home-wsl-env'
 import { removeInheritedNoColor } from '../pty/terminal-color-env'
 import { removeAppImageRuntimeEnv } from '../pty/appimage-terminal-env'
-import { normalizeWindowsEnvPathKey } from '../pty/env-path-key'
 import { stripInheritedBuildModeEnv } from '../pty/build-mode-env'
 import { resolvePathEnvKey } from '../pty/windows-environment-path'
 import { parseWslPath } from '../wsl'
@@ -641,12 +640,6 @@ export function createPtySubprocess(opts: PtySubprocessOptions): SubprocessHandl
   removeInheritedElectronRunAsNode(env)
   removeAppImageRuntimeEnv(env)
   removeInheritedNoColor(env)
-  // Why: this daemon subprocess re-spreads its own process.env (keyed `Path` on
-  // Windows) over opts.env (the authoritative PATH from the main process, often
-  // keyed `PATH`), which re-mints the duplicate Path/PATH key that shadows the
-  // real value in ConPTY. buildPtyHostEnv normalizes in the main process but
-  // cannot reach this separate fork, so collapse the duplicate here too.
-  normalizeWindowsEnvPathKey(env)
 
   env.LANG ??= 'en_US.UTF-8'
   // Why: shellOverride must win over env.COMSPEC, or Windows always resolves to cmd.exe/PowerShell regardless of the user's pick.

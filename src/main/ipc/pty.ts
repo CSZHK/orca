@@ -157,7 +157,6 @@ import {
   clearMigrationUnsupportedPtysForPaneKey
 } from '../agent-hooks/migration-unsupported-pty-state'
 import { parseWslPath, wslUncDirectoryExistsAsync } from '../wsl'
-import { normalizeWindowsEnvPathKey } from '../pty/env-path-key'
 import { mergePersistedWindowsPath, resolvePathEnvKey } from '../pty/windows-environment-path'
 import { addOrcaWslInteropEnv, stampWslOrchestrationCompatibilityHost } from '../pty/wsl-orca-env'
 import { PtyProducerFlowController } from './pty-producer-flow-control'
@@ -1909,10 +1908,6 @@ export function buildPtyHostEnv(
       isWsl: opts.isWsl
     })
   })
-  // Why: on Windows the daemon and attribution paths can each touch a different
-  // case of the PATH key. Collapse any `Path`/`PATH` duplicate into one before
-  // the env reaches node-pty so ConPTY sees a single authoritative PATH.
-  normalizeWindowsEnvPathKey(baseEnv)
 
   return baseEnv
 }
