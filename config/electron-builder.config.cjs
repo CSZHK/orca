@@ -1,4 +1,4 @@
-const { chmodSync, existsSync, readdirSync } = require('node:fs')
+const { chmodSync, existsSync, readdirSync, statSync } = require('node:fs')
 const { execFileSync } = require('node:child_process')
 const { join, resolve } = require('node:path')
 const electronBuilderNativeRebuild = require('./scripts/electron-builder-native-rebuild.cjs')
@@ -234,6 +234,20 @@ module.exports = {
         : join(context.appOutDir, 'resources')
     if (!existsSync(resourcesDir)) {
       throw new Error(`Missing packaged resources directory: ${resourcesDir}`)
+    }
+    // Why: two asar-bloat regressions (4.5GB / 1.6GB) shipped because the files
+    // blacklist missed a stray output dir. Fail packaging when app.asar far
+    // exceeds the healthy ~110MB so bloat is caught at build time, not release.
+    const asarPath = join(resourcesDir, 'app.asar')
+    if (existsSync(asarPath)) {
+      const asarBytes = statSync(asarPath).size
+      const ASAR_BLOAT_LIMIT_BYTES = 500 * 1024 * 1024
+      if (asarBytes > ASAR_BLOAT_LIMIT_BYTES) {
+        throw new Error(
+          `app.asar is ${(asarBytes / 1048576).toFixed(0)}MB (>500MB) — a stray build output ` +
+            `was likely swept into the bundle; check the electron-builder files excludes.`
+        )
+      }
     }
     if (context.electronPlatformName === 'darwin') {
       const architectureByEnum = { 1: 'x64', 3: 'arm64' }

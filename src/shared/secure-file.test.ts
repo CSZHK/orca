@@ -1,5 +1,5 @@
 import { execFile, execFileSync } from 'node:child_process'
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, fsyncSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -7,10 +7,16 @@ import {
   __getSecureFileHardeningCacheStateForTests,
   __resetSecureFileHardenedPathsForTests,
   __resetSecureFileWindowsUserSidForTests,
+  fsyncFileSync,
   hardenExistingSecureFile,
   hardenSecurePath,
   writeSecureFile
 } from './secure-file'
+
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>()
+  return { ...actual, fsyncSync: vi.fn((...args) => actual.fsyncSync(...args)) }
+})
 
 const posixModeIt = process.platform === 'win32' ? it.skip : it
 
@@ -465,3 +471,53 @@ async function waitForFileTimestampTick(): Promise<void> {
 function statMode(path: string): number {
   return statSync(path).mode & 0o777
 }
+
+const win32ModeIt = process.platform === 'win32' ? it : it.skip
+
+describe('fsyncFileSync', () => {
+  it('flushes a file opened through a writable handle', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'secure-file-fsync-'))
+    const file = join(dir, 'state.json')
+    try {
+      writeFileSync(file, '{"ok":true}', 'utf-8')
+      expect(() => fsyncFileSync(file)).not.toThrow()
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  win32ModeIt(
+    'degrades best-effort for read-only-handle EPERM on Windows',
+    () => {
+      const dir = mkdtempSync(join(tmpdir(), 'secure-file-fsync-'))
+      const file = join(dir, 'state.json')
+      try {
+        writeFileSync(file, '{}', 'utf-8')
+        vi.mocked(fsyncSync).mockImplementationOnce(() => {
+          const error = new Error('EPERM') as NodeJS.ErrnoException
+          error.code = 'EPERM'
+          throw error
+        })
+        expect(() => fsyncFileSync(file)).not.toThrow()
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
+    }
+  )
+
+  it('re-throws real IO errors (EIO) instead of swallowing them', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'secure-file-fsync-'))
+    const file = join(dir, 'state.json')
+    try {
+      writeFileSync(file, '{}', 'utf-8')
+      vi.mocked(fsyncSync).mockImplementationOnce(() => {
+        const error = new Error('EIO') as NodeJS.ErrnoException
+        error.code = 'EIO'
+        throw error
+      })
+      expect(() => fsyncFileSync(file)).toThrow('EIO')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})

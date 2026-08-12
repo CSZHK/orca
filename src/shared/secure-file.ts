@@ -44,6 +44,9 @@ const DEFAULT_HARDENING_CACHE_BOUNDS: SecurePathHardeningCacheBounds = {
 }
 
 const UNSUPPORTED_DIRECTORY_FSYNC_CODES = new Set(['EINVAL', 'ENOTSUP', 'EOPNOTSUPP'])
+// Why: only these are platform/environment noise (read-only handle, AV lock).
+// EIO/ENOSPC etc. are real IO failures and must keep propagating.
+const WINDOWS_BEST_EFFORT_FSYNC_CODES = new Set(['EPERM', 'EACCES', 'EBUSY'])
 
 // Why: PowerShell hardening (~1-1.5s) stalls the main thread, so cache idempotent re-hardens per process.
 let hardenedPathsThisProcess = new SecurePathHardeningCache<HardenedPathCacheEntry>(
@@ -148,7 +151,12 @@ export function fsyncFileSync(path: string): void {
   try {
     fsyncSync(descriptor)
   } catch (error) {
-    if (process.platform === 'win32') {
+    if (
+      process.platform === 'win32' &&
+      error instanceof Error &&
+      'code' in error &&
+      WINDOWS_BEST_EFFORT_FSYNC_CODES.has(String((error as NodeJS.ErrnoException).code))
+    ) {
       return
     }
     throw error
