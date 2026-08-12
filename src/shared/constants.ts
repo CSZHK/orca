@@ -340,6 +340,7 @@ export function getDefaultSettings(homedir: string): GlobalSettings {
     terminalMacOptionAsAlt: 'auto',
     terminalMacOptionAsAltMigrated: false,
     terminalJISYenToBackslash: false,
+    rpcBindHost: '127.0.0.1',
     experimentalMobile: false,
     mobileEmulatorEnabled: true,
     mobileEmulatorDefaultDeviceUdid: null,

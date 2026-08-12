@@ -2825,6 +2825,11 @@ export type GlobalSettings = {
   /** Controls whether macOS terminal input translates the physical JIS Yen (¥)
    *  key to a backslash, matching the common terminal expectation for that key. */
   terminalJISYenToBackslash: boolean
+  /** Which network interface the WebSocket RPC server binds to.
+   *  '127.0.0.1' (default) restricts access to the local machine.
+   *  '0.0.0.0' exposes the port to the local network (required for
+   *  direct mobile pairing without an SSH relay). */
+  rpcBindHost?: '127.0.0.1' | '0.0.0.0'
   experimentalMobile: boolean
   /** Why: the iOS Simulator feature is default-on for capable macOS hosts, but
    *  users need a durable off switch that hides UI affordances and blocks CLI attach. */

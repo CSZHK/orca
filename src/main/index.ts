@@ -2040,6 +2040,9 @@ app.whenReady().then(async () => {
     // across restarts/updates. See persistence.ts:getCanonicalUserDataPath.
     userDataPath: getCanonicalUserDataPath(),
     enableWebSocket: true,
+    // Why: loopback-only by default; '0.0.0.0' opts into LAN exposure for
+    // direct mobile QR pairing without an SSH relay.
+    wsHost: store.getSettings().rpcBindHost ?? '127.0.0.1',
     ...(isE2E ? { wsPort: 0 } : {}),
     ...(devWsPort !== undefined ? { wsPort: devWsPort } : {}),
     ...(serveOptions?.wsPort !== undefined ? { wsPort: serveOptions.wsPort } : {}),
