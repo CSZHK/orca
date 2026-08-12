@@ -129,11 +129,17 @@ module.exports = {
     // would otherwise be swept into app.asar — a leftover dist-new/ once
     // inflated the asar to ~4.5GB and exceeded NSIS's 32-bit mmap limit.
     '!dist-new{,/**/*}',
+    // Why: dist/ is the default electron-builder output dir and may hold a
+    // previous win-unpacked (incl. a locked app.asar) when the output is
+    // redirected to dist-merged/. Without this exclude that stale tree gets
+    // swept into the new app.asar and inflates it GB-scale.
+    '!dist{,/**/*}',
+    '!dist-staged{,/**/*}',
     '!tmp-cli-deploy{,/**/*}',
     '!.locked-watcher-bak{,/**/*}',
     '!orca-cli-deploy.tar.gz',
     '!.claude{,/**/*}',
-    '!{dist-new-build,dist-new,build-win}.log',
+    '!{dist-new-build,dist-new,build-win,build-dist-new}.log',
     '!{AGENTS.md,CLAUDE.md,DEVELOPING.md,bundle-size-progress.md,ORCHESTRATION_IMPLEMENTATION_CHECKLIST.md,ORCHESTRATION_STRUCTURED_OUTPUT_DESIGN.md}',
     '!out/**/*.test.js',
     // Why: Vite's manifest is only used to project the paired web client.
