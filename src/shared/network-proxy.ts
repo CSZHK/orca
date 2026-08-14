@@ -107,10 +107,12 @@ export function buildConfiguredProxyEnv(
     all_proxy: proxy.value
   }
   const bypassRules = normalizeProxyBypassRules(settings?.httpProxyBypassRules)
-  // Why: explicit Orca proxy settings should not accidentally inherit a
-  // parent shell's NO_PROXY. The bypass field above is the single source for
-  // local child process bypass behavior when a configured proxy is present.
-  const noProxy = bypassRules ? bypassRules.replaceAll(';', ',') : ''
+  // Why: explicit Orca proxy settings should not accidentally inherit a parent
+  // shell's NO_PROXY. But when no explicit bypass rules are given, default to
+  // the localhost loopback bypass: children must never route local git/codex
+  // traffic (git push to http://localhost, a local registry, ...) through the
+  // proxy, where it would fail unless the proxy loop-backs.
+  const noProxy = bypassRules ? bypassRules.replaceAll(';', ',') : 'localhost,127.0.0.1,::1'
   env.NO_PROXY = noProxy
   env.no_proxy = noProxy
   return env
