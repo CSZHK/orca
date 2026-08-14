@@ -26,7 +26,23 @@ export function buildWslCodexIdentityArgs(distro: string): string[] {
   return buildWslCodexShellArgs(distro, command)
 }
 
-export function buildWslCodexAppServerArgs(distro: string, linuxHomePath: string): string[] {
+function proxyExportCommands(proxyEnv: Record<string, string> | undefined): string[] {
+  // Why: Windows-side env does not cross into the distro without WSLENV, so the
+  // configured proxy must be exported inside the Linux command for the inner codex.
+  // Tradeoff (matches claude-pty.ts:280): a proxy URL with credentials rides the
+  // wsl.exe argv, which is visible to same-session processes on Windows. Values
+  // are single-quote-escaped here; a WSLENV-based forward would be more discreet
+  // but is a larger refactor shared with the Claude path.
+  return Object.entries(proxyEnv ?? {}).map(
+    ([key, value]) => `export ${key}=${quotePosixShell(value)}`
+  )
+}
+
+export function buildWslCodexAppServerArgs(
+  distro: string,
+  linuxHomePath: string,
+  proxyEnv?: Record<string, string>
+): string[] {
   const command = [
     buildCodexPathLookup(),
     'if [ -z "$resolved" ]; then',
@@ -34,12 +50,17 @@ export function buildWslCodexAppServerArgs(distro: string, linuxHomePath: string
     '  exit 127',
     'fi',
     `export CODEX_HOME=${quotePosixShell(linuxHomePath)}`,
+    ...proxyExportCommands(proxyEnv),
     'exec "$resolved" app-server'
   ].join('\n')
   return buildWslCodexShellArgs(distro, command)
 }
 
-export function buildWslCodexLoginArgs(distro: string, linuxHomePath: string): string[] {
+export function buildWslCodexLoginArgs(
+  distro: string,
+  linuxHomePath: string,
+  proxyEnv?: Record<string, string>
+): string[] {
   const command = [
     buildCodexPathLookup(),
     'if [ -z "$resolved" ]; then',
@@ -47,6 +68,7 @@ export function buildWslCodexLoginArgs(distro: string, linuxHomePath: string): s
     '  exit 127',
     'fi',
     `export CODEX_HOME=${quotePosixShell(linuxHomePath)}`,
+    ...proxyExportCommands(proxyEnv),
     'exec "$resolved" login'
   ].join('\n')
   return buildWslCodexShellArgs(distro, command)

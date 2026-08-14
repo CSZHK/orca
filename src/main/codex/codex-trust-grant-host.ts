@@ -1,6 +1,7 @@
 import { execFileSync } from 'node:child_process'
 import { resolveCodexCommand } from '../codex-cli/command'
 import { getSpawnArgsForWindows } from '../win32-utils'
+import { configuredProxyEnv } from '../network/configured-proxy-env'
 import {
   buildWslCodexAppServerArgs,
   buildWslCodexIdentityArgs,
@@ -43,7 +44,11 @@ export function resolveCodexTrustGrantHost(host: CodexTrustGrantHost): ResolvedC
       buildRequest: (input) => ({
         invocation: {
           command: 'wsl.exe',
-          args: buildWslCodexAppServerArgs(host.distro, host.linuxRuntimeHome),
+          args: buildWslCodexAppServerArgs(
+            host.distro,
+            host.linuxRuntimeHome,
+            configuredProxyEnv()
+          ),
           timeoutMs: WSL_GRANT_TIMEOUT_MS
         },
         hooksListCwd: host.linuxRuntimeHome,

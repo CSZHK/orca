@@ -9,6 +9,7 @@ import { readManagedHookHostIdentity } from '../agent-hooks/managed-hook-owner-i
 import { buildWslCodexAppServerArgs } from '../codex-accounts/wsl-codex-command'
 import { resolveCodexCommand } from '../codex-cli/command'
 import { terminateCodexProbeChild } from '../rate-limits/codex-probe-termination'
+import { configuredProxyEnv } from '../network/configured-proxy-env'
 import { getSpawnArgsForWindows } from '../win32-utils'
 import { getOrcaUserDataPath } from './codex-home-paths'
 import {
@@ -90,11 +91,11 @@ function spawnRecoveryProcess(
   if (wslHome) {
     return dependencies.spawnProcess(
       'wsl.exe',
-      buildWslCodexAppServerArgs(wslHome.distro, wslHome.linuxPath),
+      buildWslCodexAppServerArgs(wslHome.distro, wslHome.linuxPath, configuredProxyEnv()),
       {
         stdio: ['pipe', 'ignore', 'ignore'],
         windowsHide: true,
-        env: process.env
+        env: { ...process.env, ...configuredProxyEnv() }
       }
     )
   }
@@ -104,7 +105,7 @@ function spawnRecoveryProcess(
     cwd: codexHomePath,
     stdio: ['pipe', 'ignore', 'ignore'],
     windowsHide: true,
-    env: { ...process.env, CODEX_HOME: codexHomePath }
+    env: { ...process.env, ...configuredProxyEnv(), CODEX_HOME: codexHomePath }
   })
 }
 

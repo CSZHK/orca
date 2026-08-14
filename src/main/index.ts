@@ -337,6 +337,9 @@ import {
 import { LocalPtyProvider } from './providers/local-pty-provider'
 import { KeybindingService } from './keybindings/keybinding-service'
 import { applyElectronProxySettings } from './network/proxy-settings'
+import { updateGlobalFetchProxyRouting } from './network/global-fetch-proxy'
+import { normalizeProxyUrl } from '../shared/network-proxy'
+import { setConfiguredProxySettingsResolver } from './network/configured-proxy-env'
 import { preserveAgentAuthBeforeRestart } from './agent-auth-restart-preservation'
 import { CliInstaller } from './cli/cli-installer'
 import { installLinuxBareOrcaDispatcher } from './cli/linux-bare-orca-dispatcher'
@@ -2255,6 +2258,12 @@ void app.whenReady().then(async () => {
   } catch {
     console.warn('[proxy] Failed to apply network proxy settings')
   }
+  // Why: bare fetch() in main is Node undici and bypasses the session proxy just
+  // applied above. When a proxy is configured (and the URL is actually valid),
+  // route it through Electron's net.fetch so every HTTP client in the main process
+  // honors the proxy; when no valid proxy is configured the patch is NOT installed,
+  // keeping undici byte-for-byte as before (see global-fetch-proxy.ts).
+  updateGlobalFetchProxyRouting(normalizeProxyUrl(store.getSettings().httpProxyUrl).value !== '')
   // Why: browser sessions serve desktop webviews and runtime profile commands, so init at app startup rather than via a renderer IPC path.
   initializeBrowserSessionsForApp({
     orcaProfileId: activeOrcaProfile.profile.id,
@@ -2366,6 +2375,10 @@ void app.whenReady().then(async () => {
   openCodeUsage = new OpenCodeUsageStore(store)
   rateLimits = new RateLimitService()
   codexRuntimeHome = new CodexRuntimeHomeService(store)
+  // Why: register before any background codex spawn so a spawn that runs on
+  // first tick (backfill recovery) already has the proxy source. {} fallback is
+  // the safe direction, but must never silently regress to direct.
+  setConfiguredProxySettingsResolver(() => store!.getSettings())
   void startCodexStateDbBackfillRecoveryInBackground(getOrcaManagedCodexHomePath())
   // Why: an incapable trust-grant host must fall back to the managed home for
   // every consumer (PTY env, rate limits, commit messages) in one place.

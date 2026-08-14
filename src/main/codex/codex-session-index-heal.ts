@@ -1,6 +1,7 @@
 import { dirname, join } from 'node:path'
 import { resolveCodexCommand } from '../codex-cli/command'
 import { getSpawnArgsForWindows } from '../win32-utils'
+import { configuredProxyEnv } from '../network/configured-proxy-env'
 import { getCodexSessionBackfillStateDirPath } from './codex-home-paths'
 import { resolveCodexSessionBackfillPaths } from './codex-session-backfill'
 import {
@@ -270,7 +271,11 @@ function buildNativeHealInvocation(
     // Why: pin the real home explicitly — nested Orca launches can inherit a
     // managed CODEX_HOME from the daemon environment, which would index the
     // wrong sqlite DB.
-    env: { CODEX_HOME: systemCodexHomePath },
+    env: {
+      ...process.env,
+      ...configuredProxyEnv(),
+      CODEX_HOME: systemCodexHomePath
+    },
     timeoutMs
   }
 }

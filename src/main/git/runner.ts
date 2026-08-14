@@ -33,6 +33,7 @@ import {
   appendGitConfigEnv,
   gitCredentialPromptGuardEnv
 } from '../../shared/git-credential-prompt-env'
+import { configuredProxyEnv } from '../network/configured-proxy-env'
 import { getSpawnArgsForWindows, isWindowsBatchScript, resolveWindowsCommand } from '../win32-utils'
 import {
   buildWslLoginShellCommand,
@@ -66,6 +67,13 @@ const GIT_OUTPUT_LOCALE_SHELL_PREFIX = Object.entries(UNTRANSLATED_GIT_OUTPUT_EN
 const GIT_OUTPUT_LOCALE_ENV_ARGS = Object.entries(UNTRANSLATED_GIT_OUTPUT_ENV).map(
   ([key, value]) => `${key}=${value}`
 )
+
+// Why: WSL-routed git can't receive the proxy via the spawn env (Windows-side env
+// does not cross into the distro without WSLENV), so ride the command string the
+// same way the locale does. Values are proxy URLs / host lists — shell-safe unquoted.
+function wslProxyEnvAssignments(): string[] {
+  return Object.entries(configuredProxyEnv()).map(([key, value]) => `${key}=${value}`)
+}
 
 type ResolvedCommand = {
   binary: string
@@ -329,14 +337,19 @@ function resolveCommand(
   const translatedArgs = translateArgsForWsl(args)
   // Why: env on wsl.exe stays Windows-side (WSLENV forwards only named vars), so the locale must ride the command string (issue #7808).
   const localePrefix = command === 'git' ? `${GIT_OUTPUT_LOCALE_SHELL_PREFIX} ` : ''
+  // Why: same ride-the-command mechanism for the configured proxy, so WSL git/gh
+  // clone/fetch/push honors it. Empty when no proxy is configured.
+  const proxyPrefix = wslProxyEnvAssignments().length
+    ? `${wslProxyEnvAssignments().join(' ')} `
+    : ''
   const escapedCommand = quotePosixShell(command)
   // Why: shell-escape each arg to prevent word splitting / glob expansion inside the bash -c string.
   const escapedArgs = translatedArgs.map(quotePosixShell)
   // Why: prepend `cd <linuxPath> &&` for a UNC cwd; skip it when only a distro override was given (global gh needs no cwd).
   const linuxCwd = cwdWsl?.linuxPath ?? (cwd && wslDistroOverride ? translateArgForWsl(cwd) : null)
   const shellCmd = linuxCwd
-    ? `cd ${quotePosixShell(linuxCwd)} && ${localePrefix}${escapedCommand} ${escapedArgs.join(' ')}`
-    : `${localePrefix}${escapedCommand} ${escapedArgs.join(' ')}`
+    ? `cd ${quotePosixShell(linuxCwd)} && ${proxyPrefix}${localePrefix}${escapedCommand} ${escapedArgs.join(' ')}`
+    : `${proxyPrefix}${localePrefix}${escapedCommand} ${escapedArgs.join(' ')}`
 
   if (command === 'git' && options.wslGitReadEnvironment) {
     const optionalLocks = options.env?.GIT_OPTIONAL_LOCKS
@@ -351,6 +364,7 @@ function resolveCommand(
         `HOME=${options.wslGitReadEnvironment.home}`,
         ...GIT_OUTPUT_LOCALE_ENV_ARGS,
         ...(optionalLocks !== undefined ? [`GIT_OPTIONAL_LOCKS=${optionalLocks}`] : []),
+        ...wslProxyEnvAssignments(),
         options.wslGitReadEnvironment.gitPath,
         ...(linuxCwd ? ['-C', linuxCwd] : []),
         ...translatedArgs
@@ -841,7 +855,13 @@ export function promptGuardGitEnv(
   env: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform
 ): NodeJS.ProcessEnv {
-  return gitCredentialPromptGuardEnv(untranslatedGitOutputEnv(env), platform)
+  const next = gitCredentialPromptGuardEnv(untranslatedGitOutputEnv(env), platform)
+  // Why: git/gh/glab subprocesses inherit the main process env, which is launched
+  // by the desktop shell and has no proxy. Inject the configured proxy so remote
+  // clone/fetch/push honors it; on hosts without a proxy configuredProxyEnv()
+  // returns {} and the env is untouched.
+  Object.assign(next, configuredProxyEnv())
+  return next
 }
 
 /**

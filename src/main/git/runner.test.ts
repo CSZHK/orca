@@ -13,6 +13,7 @@ import {
   redirectPortedHostnameToEnv,
   untranslatedGitOutputEnv
 } from './runner'
+import { setConfiguredProxySettingsResolver } from '../network/configured-proxy-env'
 import { mergeGitConfigEnvProtocol } from '../../shared/git-credential-prompt-env'
 
 // Reads git config injected via the GIT_CONFIG_COUNT/KEY/VALUE env protocol
@@ -231,6 +232,29 @@ describe('mergeGitConfigEnvProtocol', () => {
     expect(env.GIT_CONFIG_KEY_0).toBe('override.zero')
     expect(env.GIT_CONFIG_KEY_1).toBeUndefined()
     expect(env.GIT_CONFIG_VALUE_1).toBeUndefined()
+  })
+})
+
+describe('promptGuardGitEnv configured-proxy injection', () => {
+  afterEach(() => {
+    // Resolver reset: an empty settings object yields no proxy env (same as unset).
+    setConfiguredProxySettingsResolver(() => ({}))
+  })
+
+  it('injects the configured proxy env into git/gh/glab subprocesses', () => {
+    setConfiguredProxySettingsResolver(() => ({ httpProxyUrl: 'http://127.0.0.1:51081' }))
+    const env = promptGuardGitEnv({ PATH: '/usr/bin' })
+    expect(env.HTTP_PROXY).toBe('http://127.0.0.1:51081')
+    expect(env.https_proxy).toBe('http://127.0.0.1:51081')
+    // Why: localhost must never route through the proxy (P1-2).
+    expect(env.NO_PROXY).toBe('localhost,127.0.0.1,::1')
+  })
+
+  it('does not inject proxy env when no proxy is configured (regression safety)', () => {
+    setConfiguredProxySettingsResolver(() => ({}))
+    const env = promptGuardGitEnv({ PATH: '/usr/bin' })
+    expect(env.HTTP_PROXY).toBeUndefined()
+    expect(env.https_proxy).toBeUndefined()
   })
 })
 

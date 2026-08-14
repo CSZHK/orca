@@ -46,6 +46,7 @@ import {
   buildWslCodexLoginArgs,
   WSL_CODEX_AVAILABILITY_TIMEOUT_MS
 } from './wsl-codex-command'
+import { configuredProxyEnv } from '../network/configured-proxy-env'
 import {
   getCodexSelectionTargetForAccount,
   getSelectedCodexAccountIdForTarget,
@@ -1634,11 +1635,14 @@ export class CodexAccountService {
       : readLoginAuthSnapshot(join(managedHomePath, 'auth.json'))
 
     await new Promise<void>((resolvePromise, rejectPromise) => {
+      const proxyEnv = configuredProxyEnv()
       const spawnConfig = wslInfo
         ? {
             command: 'wsl.exe',
-            args: buildWslCodexLoginArgs(wslInfo.distro, wslInfo.linuxPath),
-            env: process.env,
+            // Why: Windows-side env does not cross WSLENV, so the proxy is also
+            // exported inside the Linux login command.
+            args: buildWslCodexLoginArgs(wslInfo.distro, wslInfo.linuxPath, proxyEnv),
+            env: { ...process.env, ...proxyEnv },
             codexCommand: 'codex'
           }
         : (() => {
@@ -1650,6 +1654,7 @@ export class CodexAccountService {
               args: spawnArgs,
               env: {
                 ...process.env,
+                ...proxyEnv,
                 CODEX_HOME: managedHomePath
               },
               codexCommand

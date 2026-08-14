@@ -17,6 +17,7 @@ import { normalizeProxyBypassRules, normalizeProxyUrl } from '../../shared/netwo
 import { normalizeAppIconId } from '../../shared/app-icon'
 import { normalizeUiLanguage } from '../../shared/ui-language'
 import { applyAppIcon } from '../app-icon'
+import { updateGlobalFetchProxyRouting } from '../network/global-fetch-proxy'
 import { normalizeTerminalCustomThemes } from '../../shared/terminal-custom-themes'
 import { normalizeDesktopTerminalScrollbackRows } from '../../shared/terminal-scrollback-policy'
 import { normalizeTerminalLineHeight } from '../../shared/terminal-line-height-settings'
@@ -243,6 +244,10 @@ export function registerSettingsHandlers(
       } catch {
         console.warn('[settings] failed to apply network proxy settings')
       }
+      // Why: keep the global fetch routing in lockstep with the session proxy —
+      // installing it when a valid proxy is added, restoring undici when it is
+      // removed or invalid (a whitespace/invalid URL must not flip routing).
+      updateGlobalFetchProxyRouting(normalizeProxyUrl(result.httpProxyUrl).value !== '')
     }
     if ('appIcon' in sanitizedArgs && before.appIcon !== result.appIcon) {
       applyAppIcon(result.appIcon)

@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { waitForProcessExitUntil } from './codex-process-exit-deadline'
 import { stderrIndicatesMissingAppServer } from './codex-app-server-capability-signal'
+import { configuredProxyEnv } from '../network/configured-proxy-env'
 
 // Why: `codex app-server` is Orca's sanctioned RPC surface into Codex-owned
 // state (hook trust hashes, the sqlite thread index). This module owns the
@@ -107,7 +108,13 @@ export async function runCodexAppServerSession<T>(
 ): Promise<T> {
   // Why: a default-home grant must run against the real ~/.codex, so strip an
   // inherited CODEX_HOME (envToDelete) after applying the overlay, not before.
-  const childEnv: NodeJS.ProcessEnv = { ...process.env, ...invocation.env }
+  // Why: these app-server sessions (trust-grant, hook rebase) hit the network
+  // on auth refresh; inject the configured proxy so they don't bypass it.
+  const childEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    ...configuredProxyEnv(),
+    ...invocation.env
+  }
   for (const key of invocation.envToDelete ?? []) {
     delete childEnv[key]
   }
