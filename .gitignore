@@ -22,6 +22,8 @@ node_modules/
 dist/
 dist-new/
 dist-electron/
+dist-merged/
+dist-staged/
 out/
 /build/
 release/
