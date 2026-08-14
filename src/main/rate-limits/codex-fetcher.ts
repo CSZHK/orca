@@ -20,6 +20,7 @@ import {
 } from './codex-rate-limit-window-classification'
 import { resolveCodexCommand } from '../codex-cli/command'
 import { withMacTailscaleDnsHint } from '../network/macos-tailscale-dns-diagnostic'
+import { buildConfiguredProxyEnv, type NetworkProxySettings } from '../../shared/network-proxy'
 import { getCmdExePath, getSpawnArgsForWindows } from '../win32-utils'
 import { cleanupHiddenRateLimitPty, registerHiddenRateLimitPty } from './hidden-pty-cleanup'
 import { parseWslUncPath } from '../../shared/wsl-paths'
@@ -70,6 +71,7 @@ export type FetchCodexRateLimitsOptions = {
   codexHomePath?: string | null
   allowPtyFallback?: boolean
   signal?: AbortSignal
+  networkProxySettings?: NetworkProxySettings
 }
 
 // ---------------------------------------------------------------------------
@@ -164,7 +166,7 @@ function shellQuote(value: string): string {
 function buildWslCodexCommand(
   codexHomePath: string,
   args: string[],
-  options?: { isolateRpcStdio?: boolean }
+  options?: { isolateRpcStdio?: boolean; proxyEnv?: Record<string, string> }
 ): {
   command: string
   args: string[]
@@ -173,9 +175,15 @@ function buildWslCodexCommand(
   if (process.platform !== 'win32' || !wslInfo) {
     return null
   }
+  // Why: Windows-side env does not cross into the distro without WSLENV, so the
+  // configured proxy must be exported inside the Linux command for the inner
+  // codex, mirroring the Claude PTY path (claude-pty.ts:280).
   const setupCommands = [
     ...getHiddenRateLimitWslCwdSetupCommands(),
-    `export CODEX_HOME=${shellQuote(wslInfo.linuxPath)}`
+    `export CODEX_HOME=${shellQuote(wslInfo.linuxPath)}`,
+    ...Object.entries(options?.proxyEnv ?? {}).map(
+      ([key, value]) => `export ${key}=${shellQuote(value)}`
+    )
   ].join(' && ')
   const execSuffix = `${args.map(shellQuote).join(' ')}${
     options?.isolateRpcStdio ? ' <&3 >&4 3<&- 4>&-' : ''
@@ -629,7 +637,10 @@ async function fetchViaRpc(options?: FetchCodexRateLimitsOptions): Promise<Provi
 
     const codexArgs = ['-s', 'read-only', '-a', 'untrusted', 'app-server']
     const wslCodex = options?.codexHomePath
-      ? buildWslCodexCommand(options.codexHomePath, codexArgs, { isolateRpcStdio: true })
+      ? buildWslCodexCommand(options.codexHomePath, codexArgs, {
+          isolateRpcStdio: true,
+          proxyEnv: buildConfiguredProxyEnv(options?.networkProxySettings)
+        })
       : null
     // Why: cold WSL startup can exceed the host budgets.
     const initTimeoutMs = wslCodex ? WSL_RPC_INIT_TIMEOUT_MS : RPC_INIT_TIMEOUT_MS
@@ -647,6 +658,11 @@ async function fetchViaRpc(options?: FetchCodexRateLimitsOptions): Promise<Provi
       windowsHide: true,
       env: {
         ...(wslCodex ? cloneProcessEnvWithoutCodexHome() : process.env),
+        // Why: this hidden rate-limit probe spawns `codex` directly, not the
+        // user's terminal shell, so without the configured proxy it would reach
+        // chatgpt.com/backend-api from the app's own IP and fail on hosts that
+        // require a proxy. Falls back to {} when no proxy is configured.
+        ...buildConfiguredProxyEnv(options?.networkProxySettings),
         ...(options?.codexHomePath && !wslCodex ? { CODEX_HOME: options.codexHomePath } : {})
       }
     })
@@ -959,7 +975,11 @@ async function fetchViaPty(options?: FetchCodexRateLimitsOptions): Promise<Provi
   if (options?.signal?.aborted) {
     return abortedCodexRateLimitResult()
   }
-  const wslCodex = options?.codexHomePath ? buildWslCodexCommand(options.codexHomePath, []) : null
+  const wslCodex = options?.codexHomePath
+    ? buildWslCodexCommand(options.codexHomePath, [], {
+        proxyEnv: buildConfiguredProxyEnv(options?.networkProxySettings)
+      })
+    : null
   const codexCommand = wslCodex ? 'codex' : resolveCodexCommand()
 
   // Why: use cmd.exe on Windows so PATHEXT resolves codex.cmd under Electron's minimal PATH.
@@ -981,6 +1001,9 @@ async function fetchViaPty(options?: FetchCodexRateLimitsOptions): Promise<Provi
       cwd: resolveHiddenRateLimitPtyCwd(),
       env: {
         ...(wslCodex ? cloneProcessEnvWithoutCodexHome() : process.env),
+        // Why: same proxy rationale as the RPC path — the hidden /status PTY
+        // spawns `codex` directly and must honor the configured proxy.
+        ...buildConfiguredProxyEnv(options?.networkProxySettings),
         TERM: 'xterm-256color',
         ...(options?.codexHomePath && !wslCodex ? { CODEX_HOME: options.codexHomePath } : {})
       }

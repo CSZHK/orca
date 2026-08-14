@@ -1,3 +1,4 @@
+/* eslint-disable max-lines -- Why: suite covers RPC/PTY/backend rate-limit paths, proxy env injection, and shutdown settling; co-locating scenarios avoids fixture drift across files. */
 import { EventEmitter } from 'node:events'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -141,6 +142,7 @@ describe('fetchCodexRateLimits', () => {
 
   afterEach(() => {
     vi.unstubAllGlobals()
+    vi.unstubAllEnvs()
   })
 
   it('does not spawn Codex when the user is not signed in', async () => {
@@ -289,7 +291,10 @@ describe('fetchCodexRateLimits', () => {
       status: 'error',
       error: 'Rate-limit fetch aborted'
     })
-    expect(rpcChild.kill).toHaveBeenCalledTimes(1)
+    // Why: termination is graceful-first — stdin EOF requests the JSON-RPC
+    // server shutdown; hard kill is only the win32 escalation when EOF doesn't
+    // drain in time, so assert the graceful request, not the platform-specific kill.
+    expect(rpcChild.stdin.end).toHaveBeenCalledTimes(1)
     expect(ptySpawnMock).not.toHaveBeenCalled()
   })
 
@@ -390,7 +395,8 @@ describe('fetchCodexRateLimits', () => {
       status: 'error',
       error: 'RPC timeout'
     })
-    expect(rpcChild.kill).toHaveBeenCalledTimes(1)
+    // Why: graceful stdin-EOF termination request, not the platform-specific kill.
+    expect(rpcChild.stdin.end).toHaveBeenCalledTimes(1)
     expect(rpcChild.stdout.listenerCount('data')).toBe(0)
     expect(rpcChild.stderr.listenerCount('data')).toBe(0)
     expect(rpcChild.listenerCount('error')).toBe(0)
@@ -793,6 +799,133 @@ describe('fetchCodexRateLimits', () => {
         })
       )
     } finally {
+      Object.defineProperty(process, 'platform', {
+        configurable: true,
+        value: originalPlatform
+      })
+    }
+  })
+
+  it('injects the configured proxy env into the RPC codex spawn', async () => {
+    const rpcChild = makeRpcChild()
+    childSpawnMock.mockReturnValue(rpcChild)
+    respondToRpcRateLimitRead(rpcChild, {
+      primary: { usedPercent: 11, windowDurationMins: 10080 },
+      secondary: null
+    })
+
+    const resultPromise = fetchCodexRateLimits({
+      networkProxySettings: { httpProxyUrl: 'http://127.0.0.1:51081' }
+    })
+    await vi.advanceTimersByTimeAsync(1)
+    await vi.advanceTimersByTimeAsync(1)
+    await resultPromise
+
+    const [, , spawnOptions] = childSpawnMock.mock.calls[0]
+    // Why: buildConfiguredProxyEnv emits upper+lower pairs; the CLI reads the
+    // upper-case keys, and this mirrors the Claude PTY path's proxy handling.
+    expect(spawnOptions.env.HTTP_PROXY).toBe('http://127.0.0.1:51081')
+    expect(spawnOptions.env.https_proxy).toBe('http://127.0.0.1:51081')
+  })
+
+  it('does not inject proxy env into the codex spawn when no proxy is configured', async () => {
+    // Why: isolate from any proxy vars a CI/dev shell already has in process.env.
+    for (const key of [
+      'HTTP_PROXY',
+      'http_proxy',
+      'HTTPS_PROXY',
+      'https_proxy',
+      'ALL_PROXY',
+      'all_proxy',
+      'NO_PROXY',
+      'no_proxy'
+    ]) {
+      vi.stubEnv(key, undefined)
+    }
+
+    const rpcChild = makeRpcChild()
+    childSpawnMock.mockReturnValue(rpcChild)
+    respondToRpcRateLimitRead(rpcChild, {
+      primary: { usedPercent: 11, windowDurationMins: 10080 },
+      secondary: null
+    })
+
+    const resultPromise = fetchCodexRateLimits()
+    await vi.advanceTimersByTimeAsync(1)
+    await vi.advanceTimersByTimeAsync(1)
+    await resultPromise
+
+    const [, , spawnOptions] = childSpawnMock.mock.calls[0]
+    expect(spawnOptions.env.HTTP_PROXY).toBeUndefined()
+    expect(spawnOptions.env.https_proxy).toBeUndefined()
+  })
+
+  it('injects the configured proxy env into the PTY codex spawn', async () => {
+    const term = makePtyTerm()
+    childSpawnMock.mockImplementation(() => {
+      throw new Error('rpc unavailable')
+    })
+    ptySpawnMock.mockReturnValue(term)
+
+    const resultPromise = fetchCodexRateLimits({
+      networkProxySettings: { httpProxyUrl: 'http://127.0.0.1:51081' }
+    })
+    await vi.advanceTimersByTimeAsync(0)
+
+    const [, , spawnOptions] = ptySpawnMock.mock.calls[0]
+    expect(spawnOptions.env.HTTP_PROXY).toBe('http://127.0.0.1:51081')
+    expect(spawnOptions.env.https_proxy).toBe('http://127.0.0.1:51081')
+
+    term.emitExit()
+    await resultPromise
+    // Why: flush the module-level withCodexHomeProcessLock tail (default home
+    // key) so sibling tests that spawn RPC without a codexHomePath start clean.
+    await vi.advanceTimersByTimeAsync(0)
+  })
+
+  it('exports the configured proxy into the WSL codex command', async () => {
+    const originalPlatform = process.platform
+    const originalCodexHome = process.env.CODEX_HOME
+    Object.defineProperty(process, 'platform', {
+      configurable: true,
+      value: 'win32'
+    })
+    process.env.CODEX_HOME = 'C:\\Users\\alice\\.codex'
+
+    const rpcChild = makeRpcChild()
+    const term = makePtyTerm()
+    childSpawnMock.mockReturnValue(rpcChild)
+    ptySpawnMock.mockReturnValue(term)
+
+    try {
+      const resultPromise = fetchCodexRateLimits({
+        codexHomePath: '\\\\wsl.localhost\\Ubuntu\\home\\alice\\.local\\share\\orca\\account\\home',
+        networkProxySettings: { httpProxyUrl: 'http://127.0.0.1:51081' }
+      })
+      await vi.advanceTimersByTimeAsync(0)
+      rpcChild.emit('close')
+      await vi.advanceTimersByTimeAsync(0)
+
+      const [spawnFile, spawnArgs] = ptySpawnMock.mock.calls[0]
+      expect(spawnFile).toBe('wsl.exe')
+      const shellCommand = spawnArgs.at(-1) as string
+      // Why: buildWslLoginShellCommand single-quotes the whole inner command, so
+      // each shell-quote becomes '\'' in the final wsl.exe argument — the same
+      // escaping the existing CODEX_HOME assertion below matches.
+      expect(shellCommand).toContain("export HTTP_PROXY='\\''http://127.0.0.1:51081'\\''")
+      expect(shellCommand).toContain("export https_proxy='\\''http://127.0.0.1:51081'\\''")
+
+      term.emitExit()
+      await resultPromise
+      // Why: flush the module-level withCodexHomeProcessLock tail so the next
+      // test using the same UNC home key starts with a clean lock queue.
+      await vi.advanceTimersByTimeAsync(0)
+    } finally {
+      if (originalCodexHome === undefined) {
+        delete process.env.CODEX_HOME
+      } else {
+        process.env.CODEX_HOME = originalCodexHome
+      }
       Object.defineProperty(process, 'platform', {
         configurable: true,
         value: originalPlatform
