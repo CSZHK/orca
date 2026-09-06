@@ -21,7 +21,6 @@ import { normalizeProxyBypassRules, normalizeProxyUrl } from '../../shared/netwo
 import { normalizeAppIconId } from '../../shared/app-icon'
 import { normalizeUiLanguage } from '../../shared/ui-language'
 import { applyAppIcon } from '../app-icon'
-import { updateGlobalFetchProxyRouting } from '../network/global-fetch-proxy'
 import { normalizeTerminalCustomThemes } from '../../shared/terminal-custom-themes'
 import { normalizeDesktopTerminalScrollbackRows } from '../../shared/terminal-scrollback-policy'
 import { normalizeTerminalLineHeight } from '../../shared/terminal-line-height-settings'

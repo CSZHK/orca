@@ -19,6 +19,14 @@ const {
   startBackfillRecoveryMock: vi.fn(() => Promise.resolve(null))
 }))
 
+const configuredProxyEnvState = vi.hoisted(() => ({
+  value: {} as Record<string, string>
+}))
+
+vi.mock('../network/configured-proxy-env', () => ({
+  configuredProxyEnv: () => configuredProxyEnvState.value
+}))
+
 vi.mock('electron', () => ({ app: { isPackaged: false } }))
 
 vi.mock('node:child_process', () => ({
@@ -818,16 +826,18 @@ describe('fetchCodexRateLimits', () => {
       secondary: null
     })
 
-    const resultPromise = fetchCodexRateLimits({
-      networkProxySettings: { httpProxyUrl: 'http://127.0.0.1:51081' }
-    })
+    configuredProxyEnvState.value = {
+      HTTP_PROXY: 'http://127.0.0.1:51081',
+      https_proxy: 'http://127.0.0.1:51081'
+    }
+    const resultPromise = fetchCodexRateLimits({})
     await vi.advanceTimersByTimeAsync(1)
     await vi.advanceTimersByTimeAsync(1)
     await resultPromise
 
     const [, , spawnOptions] = childSpawnMock.mock.calls[0]
-    // Why: buildConfiguredProxyEnv emits upper+lower pairs; the CLI reads the
-    // upper-case keys, and this mirrors the Claude PTY path's proxy handling.
+    // Why: the resolver-backed configuredProxyEnv emits upper+lower pairs; the
+    // CLI reads the upper-case keys, and this mirrors the Claude PTY path.
     expect(spawnOptions.env.HTTP_PROXY).toBe('http://127.0.0.1:51081')
     expect(spawnOptions.env.https_proxy).toBe('http://127.0.0.1:51081')
   })
@@ -854,6 +864,7 @@ describe('fetchCodexRateLimits', () => {
       secondary: null
     })
 
+    configuredProxyEnvState.value = {}
     const resultPromise = fetchCodexRateLimits()
     await vi.advanceTimersByTimeAsync(1)
     await vi.advanceTimersByTimeAsync(1)
@@ -871,9 +882,11 @@ describe('fetchCodexRateLimits', () => {
     })
     ptySpawnMock.mockReturnValue(term)
 
-    const resultPromise = fetchCodexRateLimits({
-      networkProxySettings: { httpProxyUrl: 'http://127.0.0.1:51081' }
-    })
+    configuredProxyEnvState.value = {
+      HTTP_PROXY: 'http://127.0.0.1:51081',
+      https_proxy: 'http://127.0.0.1:51081'
+    }
+    const resultPromise = fetchCodexRateLimits({})
     await vi.advanceTimersByTimeAsync(0)
 
     const [, , spawnOptions] = ptySpawnMock.mock.calls[0]
@@ -902,9 +915,12 @@ describe('fetchCodexRateLimits', () => {
     ptySpawnMock.mockReturnValue(term)
 
     try {
+      configuredProxyEnvState.value = {
+        HTTP_PROXY: 'http://127.0.0.1:51081',
+        https_proxy: 'http://127.0.0.1:51081'
+      }
       const resultPromise = fetchCodexRateLimits({
-        codexHomePath: '\\\\wsl.localhost\\Ubuntu\\home\\alice\\.local\\share\\orca\\account\\home',
-        networkProxySettings: { httpProxyUrl: 'http://127.0.0.1:51081' }
+        codexHomePath: '\\\\wsl.localhost\\Ubuntu\\home\\alice\\.local\\share\\orca\\account\\home'
       })
       await vi.advanceTimersByTimeAsync(0)
       rpcChild.emit('close')
