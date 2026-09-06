@@ -136,15 +136,14 @@ export function writeSecureFile(
   }
 }
 
-export function fsyncFileSync(path: string): void {
-  // Why: a read-only handle cannot fsync on Windows — openSync(path, 'r') +
-  // fsyncSync throws EPERM (FlushFileBuffers on a read-only handle), which
-  // stalls startup when profile-index writes fsync. Open writable so the flush
-  // succeeds; the file can also be briefly AV-locked right after write, so on
-  // Windows degrade to best-effort if the platform still refuses.
-  let descriptor: number = 0
+function fsyncPathSync(path: string, flags: 'r' | 'r+'): void {
+  // Why: a read-only handle cannot fsync on Windows — FlushFileBuffers needs a
+  // writable handle or fsyncSync throws EPERM and stalls startup. Open writable,
+  // falling back to read-only; if the platform still refuses (brief AV lock),
+  // the win32 best-effort codes below degrade instead of throwing.
+  let descriptor: number
   try {
-    descriptor = openSync(path, 'r+')
+    descriptor = openSync(path, flags)
   } catch {
     descriptor = openSync(path, 'r')
   }
@@ -165,12 +164,17 @@ export function fsyncFileSync(path: string): void {
   }
 }
 
+export function fsyncFileSync(path: string): void {
+  // FlushFileBuffers requires a write-capable handle on Windows.
+  fsyncPathSync(path, process.platform === 'win32' ? 'r+' : 'r')
+}
+
 export function bestEffortFsyncDirectorySync(directory: string): void {
   if (process.platform === 'win32') {
     return
   }
   try {
-    fsyncFileSync(directory)
+    fsyncPathSync(directory, 'r')
   } catch (error) {
     if (
       error instanceof Error &&

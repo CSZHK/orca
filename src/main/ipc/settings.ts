@@ -1,6 +1,7 @@
 import { app, BrowserWindow, ipcMain, nativeTheme } from 'electron'
 import type { Store } from '../persistence'
-import type { GlobalSettings, PersistedState } from '../../shared/types'
+import type { GlobalSettings } from '../../shared/global-settings-types'
+import type { PersistedState } from '../../shared/persisted-state-types'
 import { listSystemFontFamilies } from '../system-fonts'
 import { previewGhosttyImport } from '../ghostty/index'
 import { previewWarpThemeImport } from '../warp-themes'
@@ -13,6 +14,9 @@ import { sanitizeFloatingWorkspaceDirectorySetting } from './floating-workspace-
 import { applyAgentStatusHooksEnabled } from '../agent-hooks/managed-agent-hook-controls'
 import { recordManagedHookInstallFailure } from '../agent-hooks/install-telemetry'
 import { applyElectronProxySettings } from '../network/proxy-settings'
+import { updateGlobalFetchProxyRouting } from '../network/global-fetch-proxy'
+import { applyBrowserSessionProxies } from '../browser/browser-session-proxy'
+import { browserSessionRegistry } from '../browser/browser-session-registry'
 import { normalizeProxyBypassRules, normalizeProxyUrl } from '../../shared/network-proxy'
 import { normalizeAppIconId } from '../../shared/app-icon'
 import { normalizeUiLanguage } from '../../shared/ui-language'
@@ -194,6 +198,32 @@ export function registerSettingsHandlers(
       notifyListeners: true,
       originWebContentsId: event.sender.id
     })
+    const proxySettingsChanged =
+      ('httpProxyUrl' in sanitizedArgs && before.httpProxyUrl !== result.httpProxyUrl) ||
+      ('httpProxyBypassRules' in sanitizedArgs &&
+        before.httpProxyBypassRules !== result.httpProxyBypassRules)
+    if (proxySettingsChanged) {
+      // Start both authorities before yielding so requests cannot enter between their barriers.
+      const defaultSessionApply = applyElectronProxySettings(result)
+      const browserSessionsApply = applyBrowserSessionProxies(
+        browserSessionRegistry.listProfiles(),
+        result
+      )
+      const [defaultSessionResult, browserSessionsResult] = await Promise.allSettled([
+        defaultSessionApply,
+        browserSessionsApply
+      ])
+      if (defaultSessionResult.status === 'rejected') {
+        console.warn('[settings] failed to apply network proxy settings')
+      }
+      if (browserSessionsResult.status === 'rejected') {
+        console.warn('[settings] failed to apply network proxy settings to browser sessions')
+      }
+      // Why: keep the global fetch routing in lockstep with the session proxy —
+      // installing it when a valid proxy is added, restoring undici when it is
+      // removed or invalid (a whitespace/invalid URL must not flip routing).
+      updateGlobalFetchProxyRouting(normalizeProxyUrl(result.httpProxyUrl).value !== '')
+    }
     if (
       'computerAwakeMode' in sanitizedArgs ||
       'keepComputerAwakeWhileAgentsRun' in sanitizedArgs
@@ -210,6 +240,7 @@ export function registerSettingsHandlers(
     if (hookSettingChanged) {
       try {
         await applyAgentStatusHooksEnabled(result.agentStatusHooksEnabled, result, {
+          userInitiated: true,
           shouldHydrateShellPath: app.isPackaged,
           onInstallError: recordManagedHookInstallFailure,
           shouldContinue: (agent) => {
@@ -237,17 +268,6 @@ export function registerSettingsHandlers(
     }
     if (APPEARANCE_MENU_KEYS.some((key) => key in sanitizedArgs)) {
       rebuildAppMenu()
-    }
-    if ('httpProxyUrl' in sanitizedArgs || 'httpProxyBypassRules' in sanitizedArgs) {
-      try {
-        await applyElectronProxySettings(result)
-      } catch {
-        console.warn('[settings] failed to apply network proxy settings')
-      }
-      // Why: keep the global fetch routing in lockstep with the session proxy —
-      // installing it when a valid proxy is added, restoring undici when it is
-      // removed or invalid (a whitespace/invalid URL must not flip routing).
-      updateGlobalFetchProxyRouting(normalizeProxyUrl(result.httpProxyUrl).value !== '')
     }
     if ('appIcon' in sanitizedArgs && before.appIcon !== result.appIcon) {
       applyAppIcon(result.appIcon)

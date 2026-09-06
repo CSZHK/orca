@@ -1,4 +1,4 @@
-import { createReadStream } from 'node:fs'
+import { openTranscriptReadStream } from '../native-chat/wsl-transcript-fs-access'
 import { createInterface } from 'node:readline'
 import type { AiVaultSession } from '../../shared/ai-vault-types'
 import { readCodexSessionIndexTitle } from './session-scanner-codex-title-index'
@@ -34,6 +34,7 @@ import {
   subtractCodexUsage
 } from './session-scanner-values'
 import { remoteSessionContentLines } from './remote-session-content-lines'
+import { readCodexTimelineOnlyRecord } from './session-scanner-codex-record-fast-path'
 
 export async function parseCodexSessionFile(
   file: FileWithMtime,
@@ -42,7 +43,7 @@ export async function parseCodexSessionFile(
   executionHostId?: ExecutionHostId
 ): Promise<AiVaultSession | null> {
   const lines = createInterface({
-    input: createReadStream(file.path, { encoding: 'utf-8' }),
+    input: openTranscriptReadStream(file.path, { encoding: 'utf-8' }, 'scan'),
     crlfDelay: Infinity
   })
 
@@ -270,6 +271,15 @@ function codexResumeStateFromParseState(
 ): ResumableSessionParseState {
   return {
     consumeLine: (line) => consumeCodexRecordLine(state, line),
+    consumeLineBytes: (line) => {
+      const timelineOnlyRecord = readCodexTimelineOnlyRecord(line)
+      if (timelineOnlyRecord) {
+        updateTimeline(state.accumulator, timelineOnlyRecord.timestamp)
+      } else {
+        consumeCodexRecordLine(state, line.toString('utf8'))
+      }
+    },
+    shouldStop: () => state.rejectedWorkerSession,
     clone: () =>
       codexResumeStateFromParseState(cloneCodexParseState(state), codexHome, titleReader),
     touchFile: (file) => {
@@ -305,12 +315,8 @@ async function parseCodexSessionLines(args: {
   })
 }
 
-function extractCodexThreadSource(payload: Record<string, unknown>): string | null {
-  return extractString(payload.thread_source) ?? extractString(payload.threadSource)
-}
-
 function isCodexWorkerSession(payload: Record<string, unknown>): boolean {
-  const threadSource = extractCodexThreadSource(payload)
+  const threadSource = extractString(payload.thread_source) ?? extractString(payload.threadSource)
   if (threadSource) {
     return threadSource.toLowerCase() !== 'user'
   }

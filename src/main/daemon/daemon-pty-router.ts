@@ -89,8 +89,12 @@ export class DaemonPtyRouter implements IPtyProvider {
     return await this.ownerResolver.probe(id)
   }
 
-  write(id: string, data: string): void {
-    this.adapterFor(id).write(id, data)
+  write(id: string, data: string): boolean {
+    return this.adapterFor(id).write(id, data)
+  }
+
+  writeWithSettlement(id: string, data: string): Promise<boolean> {
+    return this.adapterFor(id).writeWithSettlement(id, data)
   }
 
   resize(id: string, cols: number, rows: number): void {
@@ -173,12 +177,19 @@ export class DaemonPtyRouter implements IPtyProvider {
     return this.adapterFor(id).getForegroundProcess(id)
   }
 
-  async inspectProcess(id: string): Promise<PtyProcessInspection> {
-    return this.adapterForInspection(id).inspectProcess(id)
+  async inspectProcess(
+    id: string,
+    options?: { expectedIncarnationId?: string; steadyState?: boolean }
+  ): Promise<PtyProcessInspection> {
+    return this.adapterForInspection(id).inspectProcess(id, options)
   }
 
   async confirmForegroundProcess(id: string): Promise<string | null> {
     return this.adapterFor(id).confirmForegroundProcess(id)
+  }
+
+  async confirmShellForeground(id: string): Promise<boolean> {
+    return (await this.adapterFor(id).confirmShellForeground?.(id)) ?? false
   }
 
   async serialize(ids: string[]): Promise<string> {

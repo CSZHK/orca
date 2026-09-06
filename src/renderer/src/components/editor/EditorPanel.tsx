@@ -2,7 +2,7 @@ import React, { useCallback, useMemo, useRef, useState } from 'react'
 import { useAppStore } from '@/store'
 import { getConnectionId } from '@/lib/connection-context'
 import { detectLanguage } from '@/lib/language-detect'
-import { openFilePreviewToSide } from '@/lib/file-preview'
+import { canShowWorkspaceFileBrowserAction, openFilePreviewToSide } from '@/lib/file-preview'
 import { getEditorHeaderCopyState } from './editor-header'
 import { isLocalPathOpenBlocked, showLocalPathOpenBlockedToast } from '@/lib/local-path-open-guard'
 import { settingsForRuntimeOwner } from '@/runtime/runtime-rpc-client'
@@ -18,6 +18,7 @@ import { useEditorPanelContentState } from './useEditorPanelContentState'
 import { useMarkdownPreviewShortcut } from './useMarkdownPreviewShortcut'
 import { useUntitledFileRename } from './useUntitledFileRename'
 import { extractFrontMatter } from './markdown-frontmatter'
+import { useEditorContentChangeHandler } from './use-editor-content-change-handler'
 import {
   selectEditorPanelGitBranchEntries,
   selectEditorPanelGitStatusEntries
@@ -45,6 +46,11 @@ function EditorPanelInner({
   const activeViewStateId = activeViewStateIdProp ?? activeFileId
   const activeFile = openFiles.find((f) => f.id === activeFileId) ?? null
   const activeWorktreeId = activeFile?.worktreeId
+  const canOpenWorkspaceFileBrowser = useAppStore((s) =>
+    activeWorktreeId && activeFile
+      ? canShowWorkspaceFileBrowserAction(s, activeWorktreeId, activeFile.filePath)
+      : false
+  )
   const markFileDirty = useAppStore((s) => s.markFileDirty)
   const pendingEditorReveal = useAppStore((s) => s.pendingEditorReveal)
   // Why: background Git refreshes for other worktrees must not wake every
@@ -57,6 +63,9 @@ function EditorPanelInner({
   )
   const markdownViewMode = useAppStore((s) => s.markdownViewMode)
   const setMarkdownViewMode = useAppStore((s) => s.setMarkdownViewMode)
+  const markdownRichModeSizeOverridden = useAppStore(
+    (s) => activeFileId !== null && s.markdownRichModeSizeOverride[activeFileId] === true
+  )
   const editorViewMode = useAppStore((s) => s.editorViewMode)
   const setEditorViewMode = useAppStore((s) => s.setEditorViewMode)
   const openFile = useAppStore((s) => s.openFile)
@@ -71,7 +80,6 @@ function EditorPanelInner({
     [activeFile]
   )
   const editorDrafts = useAppStore(editorDraftSelector)
-  const setEditorDraft = useAppStore((s) => s.setEditorDraft)
   const settings = useAppStore((s) => s.settings)
   const panelRef = useRef<HTMLDivElement>(null)
   const [copiedPathToast, setCopiedPathToast] = useState<{ fileId: string; token: number } | null>(
@@ -137,29 +145,7 @@ function EditorPanelInner({
   useClosedEditorTabCleanup(openFiles)
   useMarkdownPreviewShortcut({ activeFile, panelRef, openMarkdownPreview })
 
-  const handleContentChangeForFile = useCallback(
-    (file: typeof activeFile, content: string) => {
-      if (!file) {
-        return
-      }
-      setEditorDraft(file.id, content)
-      const normalize =
-        file.language === 'markdown'
-          ? (value: string): string => value.trimEnd()
-          : (value: string): string => value
-      if (file.mode === 'edit') {
-        markFileDirty(
-          file.id,
-          normalize(content) !== normalize(fileContents[file.id]?.content ?? '')
-        )
-        return
-      }
-      const diffContent = diffContents[file.id]
-      const original = diffContent?.kind === 'text' ? diffContent.modifiedContent : ''
-      markFileDirty(file.id, normalize(content) !== normalize(original))
-    },
-    [diffContents, fileContents, markFileDirty, setEditorDraft]
-  )
+  const handleContentChangeForFile = useEditorContentChangeHandler({ fileContents, diffContents })
 
   const handleContentChange = useCallback(
     (content: string) => {
@@ -229,7 +215,9 @@ function EditorPanelInner({
     gitStatusEntries,
     gitBranchEntries,
     markdownViewMode,
-    isChangesMode
+    markdownRichModeSizeOverridden,
+    isChangesMode,
+    canOpenWorkspaceFileBrowser
   })
 
   const handleOpenPreviewToSide = (): void => {

@@ -6,6 +6,7 @@ import type {
   PairingGetEndpointsResult,
   PairingProvisionRelayParams
 } from '../../../shared/mobile-relay-credential-contract'
+import type { RelayHostCloseReason } from '../../../shared/relay-host-close-reason'
 import { readRelayAuthContext } from './relay-auth-context'
 import { RelayAuthCoordinator } from './relay-auth-coordinator'
 import { RelaySessionBroker, type RelayBrokerStatus } from './relay-session-broker'
@@ -18,6 +19,7 @@ import type {
 import type { DeviceCredentialInstallAuthorization } from './relay-control-requests'
 import { deriveRelayHostId } from './relay-http-client'
 import { RelayDemandLedger } from './relay-demand-ledger'
+import { createRelayRegionPreferenceReader } from './relay-region-preference'
 
 type DesktopRelayServiceOptions = {
   authConfig: OrcaCloudAuthConfig
@@ -69,6 +71,7 @@ export class DesktopRelayService {
       revokeOutbox: this.revokeOutbox,
       relayHostId: deriveRelayHostId(keypair.publicKey)
     })
+    const resolvePreferredRegion = createRelayRegionPreferenceReader(options)
     this.coordinator = new RelayAuthCoordinator({
       readContext: () => readRelayAuthContext(options.authConfig, options.userDataPath),
       hasDemand: ({ identity }) =>
@@ -85,6 +88,7 @@ export class DesktopRelayService {
           mobileSocketWiring,
           isCurrent,
           refreshAccessToken,
+          resolvePreferredRegion,
           onStatus: options.onStatus
         })
         void this.flushRevokeOutbox(broker)
@@ -109,7 +113,7 @@ export class DesktopRelayService {
     this.refreshDemand()
   }
 
-  fenceAndCloseNow(): void {
+  fenceAndCloseNow(hostCloseReason?: RelayHostCloseReason): void {
     // Why: a fence must be hard — a surviving liveness tick could catch the
     // window between the pre-sign-out fence and the profile wipe and briefly
     // resurrect a broker. The next auth mutation re-arms via refreshDemand.
@@ -117,7 +121,7 @@ export class DesktopRelayService {
       clearInterval(this.livenessTimer)
       this.livenessTimer = null
     }
-    this.coordinator.fenceAndCloseNow()
+    this.coordinator.fenceAndCloseNow(hostCloseReason)
   }
 
   async createPairingRelay(
@@ -294,8 +298,7 @@ export class DesktopRelayService {
   }
 
   private async activeBrokerForDemand(): Promise<RelaySessionBroker | null> {
-    const broker =
-      this.coordinator.getActiveBroker() ?? (await this.coordinator.waitForActiveBroker())
+    const broker = this.coordinator.getLiveBroker() ?? (await this.coordinator.waitForLiveBroker())
     return broker instanceof RelaySessionBroker ? broker : null
   }
 

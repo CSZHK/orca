@@ -46,9 +46,9 @@ jobs:
           persist-credentials: false
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
+        uses: pnpm/setup@v2
         with:
-          run_install: false
+          install: false
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -215,6 +215,7 @@ jobs:
         with:
           name: orca-windows-installer-unsigned-${{ github.run_id }}
           path: dist/orca-windows-setup.exe
+          compression-level: 0
           if-no-files-found: error
 
       - name: Submit Windows installer signing request
