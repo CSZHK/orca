@@ -1,15 +1,18 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type RefObject } from 'react'
 import { ArrowRight, Loader2, Share2 } from 'lucide-react'
-import type { ArtifactWriteRequest } from '../../../../shared/artifacts'
+import type { ArtifactWriteRequest } from '../../../../shared/artifacts/artifacts'
 import { Button } from '@/components/ui/button'
-import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
+import { Popover, PopoverAnchor, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
-import { translate } from '@/i18n/i18n'
-import { cn } from '@/lib/utils'
-import { useAppStore } from '@/store'
+import { useTranslate } from '@/i18n/use-translate'
+import { cn } from '@/lib/class-names'
+import { useAppStore } from '@/store/index'
+import { useOrcaTeamFeatureBlocked } from '@/lib/orca-team-policy'
+import { ORCA_CLOUD_TEAM_POLICY_FLAGS } from '../../../../shared/orca-profiles/orca-cloud-team-policy'
 import { ArtifactPublishedLinkPanel } from './ArtifactPublishedLinkPanel'
 import { getPublishedArtifactLink } from './artifact-published-link-client'
 import { publishArtifactFromSurface } from './artifact-publish-flow'
+import { OrcaSignInButton, OrcaSignInWaitNotice } from '../orca-profiles/OrcaSignInProgress'
 
 type PublishedLinkLookup = {
   key: string
@@ -21,27 +24,45 @@ export function ArtifactPublishButton({
   sourceKey,
   createRequest,
   className,
-  disabled
+  variant = 'ghost',
+  size = 'icon-sm',
+  disabled,
+  anchorRef,
+  open: controlledOpen,
+  onOpenChange
 }: {
   sourceKey: string
   createRequest: () => Promise<ArtifactWriteRequest>
   className?: string
+  /** For a toolbar whose other buttons use a different style. */
+  variant?: React.ComponentProps<typeof Button>['variant']
+  size?: React.ComponentProps<typeof Button>['size']
   disabled?: boolean
-}): React.JSX.Element {
-  const [open, setOpen] = useState(false)
+} & (
+  | { anchorRef?: never; open?: never; onOpenChange?: never }
+  | {
+      anchorRef?: RefObject<HTMLButtonElement | null>
+      open: boolean
+      onOpenChange: (open: boolean) => void
+    }
+)): React.JSX.Element {
+  const t = useTranslate()
+  const [ownOpen, setOwnOpen] = useState(false)
+  const open = controlledOpen ?? ownOpen
+  const setOpen = onOpenChange ?? setOwnOpen
   const [publishing, setPublishing] = useState(false)
   const [lookupRevision, setLookupRevision] = useState(0)
   const [linkLookup, setLinkLookup] = useState<PublishedLinkLookup | null>(null)
   const lookupSequence = useRef(0)
   const popoverContentRef = useRef<HTMLDivElement>(null)
+  const dismissedByExternalFocusRef = useRef(false)
   const authStatus = useAppStore((state) => state.orcaProfileAuthStatus)
-  const connecting = useAppStore((state) => state.orcaProfileConnecting)
-  const connect = useAppStore((state) => state.connectCurrentOrcaProfile)
   const openSettingsPage = useAppStore((state) => state.openSettingsPage)
   const openSettingsTarget = useAppStore((state) => state.openSettingsTarget)
   const settings = useAppStore((state) => state.settings)
   const signedIn = authStatus?.state === 'connected'
-  const sharingEnabled = settings?.artifactSharingEnabled === true
+  const teamBlocked = useOrcaTeamFeatureBlocked(ORCA_CLOUD_TEAM_POLICY_FLAGS.artifactSharing)
+  const sharingEnabled = !teamBlocked && settings?.artifactSharingEnabled === true
   const accountKey =
     authStatus?.state === 'connected'
       ? JSON.stringify([
@@ -56,7 +77,7 @@ export function ArtifactPublishButton({
   const checkingLink =
     signedIn && currentLookup?.status !== 'loaded' && currentLookup?.status !== 'error'
   const publishedLink = currentLookup?.status === 'loaded' ? currentLookup.shareUrl : null
-  const busy = publishing || connecting
+  const busy = publishing
   const blocked = disabled || busy
 
   useEffect(() => {
@@ -83,6 +104,36 @@ export function ArtifactPublishButton({
     }
   }, [lookupKey, lookupRevision, open, sourceKey])
 
+  // Why: out-of-process <webview> and <iframe> clicks bypass Radix's document pointerdown outside-dismiss.
+  useEffect(() => {
+    if (!open || busy) {
+      return
+    }
+    dismissedByExternalFocusRef.current = false
+    const isEmbeddedPageElement = (target: EventTarget | null): boolean =>
+      target instanceof HTMLElement && (target.tagName === 'WEBVIEW' || target.tagName === 'IFRAME')
+    const dismiss = (): void => {
+      dismissedByExternalFocusRef.current = true
+      setOpen(false)
+    }
+    const handleWindowBlur = (): void => {
+      if (isEmbeddedPageElement(document.activeElement)) {
+        dismiss()
+      }
+    }
+    const handleFocusIn = (event: FocusEvent): void => {
+      if (isEmbeddedPageElement(event.target)) {
+        dismiss()
+      }
+    }
+    window.addEventListener('blur', handleWindowBlur)
+    document.addEventListener('focusin', handleFocusIn, true)
+    return () => {
+      window.removeEventListener('blur', handleWindowBlur)
+      document.removeEventListener('focusin', handleFocusIn, true)
+    }
+  }, [busy, open, setOpen])
+
   const publish = async (): Promise<void> => {
     if (blocked || !signedIn || !sharingEnabled) {
       return
@@ -106,31 +157,35 @@ export function ArtifactPublishButton({
     openSettingsPage()
   }
 
-  const label = translate(
-    'auto.components.artifacts.ArtifactPublishButton.a4a49da6af',
-    'Share as artifact'
-  )
+  const label = t('auto.components.artifacts.ArtifactPublishButton.a4a49da6af', 'Share as artifact')
   return (
     <Popover open={open} onOpenChange={(nextOpen) => !busy && setOpen(nextOpen)}>
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <PopoverTrigger asChild>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-sm"
-              className={cn('shrink-0', className)}
-              disabled={blocked}
-              aria-label={label}
-            >
-              {publishing ? <Loader2 className="animate-spin" /> : <Share2 />}
-            </Button>
-          </PopoverTrigger>
-        </TooltipTrigger>
-        <TooltipContent side="bottom" sideOffset={4}>
-          {label}
-        </TooltipContent>
-      </Tooltip>
+      {anchorRef ? (
+        <PopoverAnchor
+          // oxlint-disable-next-line typescript/consistent-type-assertions -- SAFETY: DOM refs are transiently null before mount, though Radix's virtualRef type omits that lifecycle state.
+          virtualRef={anchorRef as RefObject<HTMLButtonElement>}
+        />
+      ) : (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <PopoverTrigger asChild>
+              <Button
+                type="button"
+                variant={variant}
+                size={size}
+                className={cn('shrink-0', className)}
+                disabled={blocked}
+                aria-label={label}
+              >
+                {publishing ? <Loader2 className="animate-spin" /> : <Share2 />}
+              </Button>
+            </PopoverTrigger>
+          </TooltipTrigger>
+          <TooltipContent side="bottom" sideOffset={4}>
+            {label}
+          </TooltipContent>
+        </Tooltip>
+      )}
 
       <PopoverContent
         ref={popoverContentRef}
@@ -142,21 +197,30 @@ export function ArtifactPublishButton({
           event.preventDefault()
           popoverContentRef.current?.focus({ preventScroll: true })
         }}
+        onCloseAutoFocus={(event) => {
+          if (dismissedByExternalFocusRef.current) {
+            dismissedByExternalFocusRef.current = false
+            event.preventDefault()
+            return
+          }
+          if (!anchorRef) {
+            return
+          }
+          event.preventDefault()
+          anchorRef.current?.focus({ preventScroll: true })
+        }}
       >
         <div className="space-y-1 border-b border-border/60 px-4 py-3.5">
           <h3 className="text-sm font-semibold">
-            {translate(
-              'auto.components.artifacts.ArtifactPublishButton.confirmTitle',
-              'Share as artifact'
-            )}
+            {t('auto.components.artifacts.ArtifactPublishButton.confirmTitle', 'Share as artifact')}
           </h3>
           <p className="text-xs leading-5 text-muted-foreground">
             {publishedLink
-              ? translate(
+              ? t(
                   'auto.components.artifacts.ArtifactPublishButton.publishedDescription',
                   'Anyone with this link can view the shared file.'
                 )
-              : translate(
+              : t(
                   'auto.components.artifacts.ArtifactPublishButton.confirmDescription',
                   'This publishes the current file at a link anyone with the URL can view.'
                 )}
@@ -168,58 +232,56 @@ export function ArtifactPublishButton({
             <div className="flex items-center justify-between gap-3">
               <div className="min-w-0 space-y-0.5">
                 <p className="text-xs font-medium">
-                  {translate(
+                  {t(
                     'auto.components.artifacts.ArtifactPublishButton.accountTitle',
                     'Orca account'
                   )}
                 </p>
                 <p className="text-[11px] leading-4 text-muted-foreground">
-                  {translate(
+                  {t(
                     'auto.components.artifacts.ArtifactPublishButton.accountDescription',
                     'Sign in to create and manage this link.'
                   )}
                 </p>
               </div>
-              <Button
-                type="button"
+              <OrcaSignInButton
                 variant="outline"
                 size="xs"
-                disabled={connecting || authStatus?.configured !== true}
-                onClick={() => void connect()}
+                disabled={authStatus?.configured !== true}
               >
-                {connecting
-                  ? translate(
-                      'auto.components.artifacts.ArtifactPublishButton.signingIn',
-                      'Signing in…'
+                {authStatus?.state === 'reconnect-required'
+                  ? t(
+                      'auto.components.artifacts.ArtifactPublishButton.signInAgain',
+                      'Sign in again'
                     )
-                  : authStatus?.state === 'reconnect-required'
-                    ? translate(
-                        'auto.components.artifacts.ArtifactPublishButton.signInAgain',
-                        'Sign in again'
-                      )
-                    : translate(
-                        'auto.components.artifacts.ArtifactPublishButton.signIn',
-                        'Sign in'
-                      )}
-              </Button>
+                  : t('auto.components.artifacts.ArtifactPublishButton.signIn', 'Sign in')}
+              </OrcaSignInButton>
             </div>
           ) : null}
+          {!signedIn ? <OrcaSignInWaitNotice /> : null}
 
           {!sharingEnabled ? (
             <div className={cn('space-y-2', !signedIn && 'border-t border-border/60 pt-3')}>
               <div className="space-y-0.5">
                 <p className="text-xs font-medium">
-                  {translate(
-                    'auto.components.artifacts.ArtifactPublishButton.publishingOffTitle',
-                    'Artifact sharing is off'
-                  )}
+                  {teamBlocked
+                    ? t(
+                        'settings.artifacts.teamDisabled',
+                        'Artifact sharing is turned off by your team.'
+                      )
+                    : t(
+                        'auto.components.artifacts.ArtifactPublishButton.publishingOffTitle',
+                        'Artifact sharing is off'
+                      )}
                 </p>
-                <p className="text-[11px] leading-4 text-muted-foreground">
-                  {translate(
-                    'auto.components.artifacts.ArtifactPublishButton.publishingOffDescription',
-                    'Learn about public links and enable sharing in Settings.'
-                  )}
-                </p>
+                {!teamBlocked && (
+                  <p className="text-[11px] leading-4 text-muted-foreground">
+                    {t(
+                      'auto.components.artifacts.ArtifactPublishButton.publishingOffDescription',
+                      'Learn about public links and enable sharing in Settings.'
+                    )}
+                  </p>
+                )}
               </div>
               <Button
                 type="button"
@@ -228,7 +290,7 @@ export function ArtifactPublishButton({
                 className="w-full"
                 onClick={openArtifactsSettings}
               >
-                {translate(
+                {t(
                   'auto.components.artifacts.ArtifactPublishButton.openSettings',
                   'Open Artifacts settings'
                 )}
@@ -240,7 +302,7 @@ export function ArtifactPublishButton({
           {checkingLink ? (
             <div className="flex items-center justify-center gap-2 py-2 text-xs text-muted-foreground">
               <Loader2 className="size-3.5 animate-spin" />
-              {translate(
+              {t(
                 'auto.components.artifacts.ArtifactPublishButton.checkingLink',
                 'Checking for an existing link…'
               )}
@@ -248,7 +310,7 @@ export function ArtifactPublishButton({
           ) : currentLookup?.status === 'error' ? (
             <div className="space-y-2">
               <p className="text-xs leading-5 text-muted-foreground">
-                {translate(
+                {t(
                   'auto.components.artifacts.ArtifactPublishButton.checkFailed',
                   'Could not check for an existing link.'
                 )}
@@ -260,7 +322,7 @@ export function ArtifactPublishButton({
                 className="w-full"
                 onClick={() => setLookupRevision((current) => current + 1)}
               >
-                {translate('auto.components.artifacts.ArtifactPublishButton.tryAgain', 'Try again')}
+                {t('auto.components.artifacts.ArtifactPublishButton.tryAgain', 'Try again')}
               </Button>
             </div>
           ) : publishedLink ? (
@@ -281,8 +343,8 @@ export function ArtifactPublishButton({
             >
               {publishing ? <Loader2 className="animate-spin" /> : <Share2 />}
               {publishing
-                ? translate('auto.components.artifacts.ArtifactPublishButton.sharing', 'Sharing…')
-                : translate(
+                ? t('auto.components.artifacts.ArtifactPublishButton.sharing', 'Sharing…')
+                : t(
                     'auto.components.artifacts.ArtifactPublishButton.sharePublicLink',
                     'Generate link'
                   )}

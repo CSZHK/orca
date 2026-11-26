@@ -1,20 +1,23 @@
+import { attachCrewMutationNotifications } from '../crew/crew-mutation-notifications'
+import { attachAttemptObservationStore } from './attempt-observation-store'
+import { attachBotRequestStore } from './bot-requests/bot-request-store'
+import { attachBotConversationActsForStore } from './bot-requests/bot-conversation-acts-for-store'
+import { attachBotRunResendStore } from './bot-requests/bot-run-resend-store'
+import { attachBotRequestOutcomes } from './bot-requests/bot-request-outcomes'
 import { attachCoordinatorRunStore } from './coordinator-runs/coordinator-run-store'
 import { attachDecisionGateStore } from './decision-gates/decision-gate-store'
-import { attachDispatchCapability } from './dispatch-context/dispatch-capability'
 import { attachDispatchCompletion } from './dispatch-context/dispatch-completion'
 import { attachDispatchContextStore } from './dispatch-context/dispatch-context-store'
+import { attachDispatchLinksById } from './dispatch-context/dispatch-links-by-id'
+import { attachSessionPartyRows } from './worker-terminal/session-party-rows'
 import { attachDispatchLookup } from './dispatch-context/dispatch-lookup'
 import { attachDispatchDepth } from './dispatch-depth'
 import { attachWorkerReportSettlement } from './dispatch-context/worker-report-settlement'
-import { attachFederatedDispatchStore } from './federation/federated-dispatch-store'
 import { attachFederationRelayAck } from './federation/federation-relay-ack'
-import { attachFederationRelayEnqueue } from './federation/federation-relay-enqueue'
-import { attachFederationRelayImport } from './federation/federation-relay-import'
-import { attachFederationRelayItem } from './federation/federation-relay-item'
-import { attachRemoteDispatchAttachmentAuthority } from './federation/remote-dispatch-attachment-authority'
-import { attachRemoteDispatchAttachmentCreate } from './federation/remote-dispatch-attachment-create'
-import { attachRemoteDispatchAttachmentStop } from './federation/remote-dispatch-attachment-stop'
-import { attachRemoteQuestionStore } from './federation/remote-question-store'
+import { attachLegacyRemoteDbMethods } from '../legacy-remote/legacy-remote-db-methods'
+import { attachLegacyRemoteHomeDbMethods } from '../legacy-remote-home/legacy-remote-home-db-methods'
+import { attachPeerMailStore } from './federation/peer-mail-store'
+import { attachPeerRunStore } from './peer-runs/peer-run-store'
 import { attachLegacyAskOperation } from './legacy/legacy-ask-operation'
 import { attachLegacyCompatibilityCandidates } from './legacy/legacy-compatibility-candidates'
 import { attachLegacyCompatibilityPrincipals } from './legacy/legacy-compatibility-principals'
@@ -27,9 +30,13 @@ import { attachLegacyReplyOperation } from './legacy/legacy-reply-operation'
 import { attachLegacyWorkerCompletion } from './legacy/legacy-worker-completion'
 import { attachDirectMailboxRouting } from './messages/direct-mailbox-routing'
 import { attachForeignDirectMailboxRouting } from './messages/foreign-direct-mailbox-routing'
+import { attachMailboxPointerEnterState } from './messages/mailbox-pointer-enter-state'
 import { attachMessageInbox } from './messages/message-inbox'
 import { attachMessageInsert } from './messages/message-insert'
+import { attachRoleMailboxDelivery } from './messages/role-mailbox-delivery'
+import { attachStructuredMailSendStore } from './messages/structured-mail-send-store'
 import { attachMutationReceiptStore } from './mutation-receipts/mutation-receipt-store'
+import { attachLifecycleTransition } from './lifecycle-transition'
 import { attachQuestionThreads } from './questions/question-threads'
 import { attachOrchestrationReset } from './reset/orchestration-reset'
 import { attachRunBinding } from './runs/run-binding'
@@ -46,7 +53,6 @@ import { attachSchemaMigrate } from './schema/migrate'
 import { attachSchemaColumnProbes } from './schema/schema-column-probes'
 import { attachTaskStore } from './tasks/task-store'
 import { attachTaskStatusTransition } from './tasks/task-status-transition'
-import { attachFederatedWorkerStartReconcile } from './worker-dispatch/federated-worker-start-reconcile'
 import { attachWorkerDispatchAbandon } from './worker-dispatch/worker-dispatch-abandon'
 import { attachWorkerDispatchAuthority } from './worker-dispatch/worker-dispatch-authority'
 import { attachWorkerDispatchOutcome } from './worker-dispatch/worker-dispatch-outcome'
@@ -55,12 +61,20 @@ import { attachWorkerDispatchStart } from './worker-dispatch/worker-dispatch-sta
 import { attachWorkerDispatchStop } from './worker-dispatch/worker-dispatch-stop'
 import { attachWorkerTerminalRecovery } from './worker-dispatch/worker-terminal-recovery'
 import { attachWorkerTerminalArchive } from './worker-terminal/worker-terminal-archive'
+import { attachWorkerTerminalAutoRelease } from './worker-terminal/worker-terminal-auto-release'
 import { attachWorkerTerminalListing } from './worker-terminal/worker-terminal-listing'
 import { attachWorkerTerminalRelease } from './worker-terminal/worker-terminal-release'
 import { attachWorkerTerminalResourceStore } from './worker-terminal/worker-terminal-resource-store'
+import { attachMailWakeAttemptStore } from './messages/mail-wake-attempt-store'
 import { attachWorkerTerminalTransfer } from './worker-terminal/worker-terminal-transfer'
 
 export function attachOrchestrationDbMethods(ctor: { prototype: object }): void {
+  attachAttemptObservationStore(ctor)
+  attachBotRequestStore(ctor)
+  attachBotConversationActsForStore(ctor)
+  attachBotRunResendStore(ctor)
+  attachMailWakeAttemptStore(ctor)
+  attachBotRequestOutcomes(ctor)
   attachCreateTables(ctor)
   attachSchemaMigrate(ctor)
   attachSchemaColumnProbes(ctor)
@@ -68,6 +82,7 @@ export function attachOrchestrationDbMethods(ctor: { prototype: object }): void 
   attachBackfillLegacyQuestionThreads(ctor)
   attachAdoptLegacyRun(ctor)
   attachMutationReceiptStore(ctor)
+  attachLifecycleTransition(ctor)
   attachLegacyCompatibilityPrincipals(ctor)
   attachLegacyCompatibilityCandidates(ctor)
   attachLegacyWorkerCompletion(ctor)
@@ -85,7 +100,10 @@ export function attachOrchestrationDbMethods(ctor: { prototype: object }): void 
   attachLegacyCoordinatorMailTakeover(ctor)
   attachRunDelivery(ctor)
   attachMessageInsert(ctor)
+  attachRoleMailboxDelivery(ctor)
+  attachStructuredMailSendStore(ctor)
   attachMessageInbox(ctor)
+  attachMailboxPointerEnterState(ctor)
   attachDirectMailboxRouting(ctor)
   attachForeignDirectMailboxRouting(ctor)
   attachQuestionThreads(ctor)
@@ -95,26 +113,23 @@ export function attachOrchestrationDbMethods(ctor: { prototype: object }): void 
   attachWorkerDispatchStage(ctor)
   attachWorkerDispatchAuthority(ctor)
   attachWorkerDispatchOutcome(ctor)
-  attachFederatedWorkerStartReconcile(ctor)
   attachWorkerTerminalRecovery(ctor)
   attachWorkerDispatchStop(ctor)
   attachWorkerDispatchAbandon(ctor)
-  attachFederatedDispatchStore(ctor)
-  attachRemoteDispatchAttachmentCreate(ctor)
-  attachRemoteDispatchAttachmentAuthority(ctor)
-  attachRemoteDispatchAttachmentStop(ctor)
-  attachFederationRelayEnqueue(ctor)
+  attachLegacyRemoteHomeDbMethods(ctor)
+  attachLegacyRemoteDbMethods(ctor)
   attachFederationRelayAck(ctor)
-  attachFederationRelayImport(ctor)
-  attachRemoteQuestionStore(ctor)
-  attachFederationRelayItem(ctor)
+  attachPeerMailStore(ctor)
+  attachPeerRunStore(ctor)
   attachWorkerTerminalResourceStore(ctor)
   attachWorkerTerminalTransfer(ctor)
   attachWorkerTerminalRelease(ctor)
   attachWorkerTerminalArchive(ctor)
+  attachWorkerTerminalAutoRelease(ctor)
   attachWorkerTerminalListing(ctor)
   attachDispatchContextStore(ctor)
-  attachDispatchCapability(ctor)
+  attachDispatchLinksById(ctor)
+  attachSessionPartyRows(ctor)
   attachDispatchLookup(ctor)
   attachDispatchDepth(ctor)
   attachDispatchCompletion(ctor)
@@ -122,4 +137,5 @@ export function attachOrchestrationDbMethods(ctor: { prototype: object }): void 
   attachDecisionGateStore(ctor)
   attachCoordinatorRunStore(ctor)
   attachOrchestrationReset(ctor)
+  attachCrewMutationNotifications(ctor)
 }

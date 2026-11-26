@@ -1,30 +1,69 @@
-import type { WorkerDispatchRow } from '../../types'
+import type { WorkerDispatchRow } from '../orchestration-records'
 import { OrchestrationError } from '../../orchestration-error'
 import type { OrchestrationDb } from '../orchestration-db'
+import { transitionLifecycleWithDb } from '../lifecycle-transition'
+import { recordFailedStartDispatchIdentity } from '../worker-terminal/failed-start-dispatch-identity'
+import { DISPATCH_CIRCUIT_BREAK_FAILURES } from '../dispatch-context/dispatch-circuit-breaker'
+import { mergeWorkerLaunchObservation } from '../../workers/launch/worker-launch-observation'
+import { WORKER_DISPATCH_COLUMN_LIST } from '../row-column-lists'
+import { resumeTaskBlockedByUnknownStart } from '../dispatch-context/task-dispatch-reconciliation'
 
+export function retainWorkerLaunchObservation(
+  this: OrchestrationDb,
+  dispatchId: string,
+  observation: unknown
+): void {
+  this.db.exec('BEGIN IMMEDIATE')
+  try {
+    const worker = this.getWorkerDispatch(dispatchId)
+    const options = worker && mergeWorkerLaunchObservation(worker.start_options, observation)
+    if (worker && options !== undefined && options !== worker.start_options) {
+      this.db
+        .prepare('UPDATE worker_dispatches SET start_options = ? WHERE dispatch_id = ?')
+        .run(options, dispatchId)
+      this.workerDockSources?.changedDispatch(dispatchId)
+    }
+    this.db.exec('COMMIT')
+  } catch (error) {
+    this.db.exec('ROLLBACK')
+    throw error
+  }
+}
+
+/** `from: 'start_unknown'` is a start whose turn was seen only later: it lifts the block that put on its Task. */
 export function markWorkerDispatchReady(
   this: OrchestrationDb,
   dispatchId: string,
-  effects?: unknown[]
+  effects?: unknown[],
+  from: 'starting' | 'start_unknown' = 'starting'
 ): WorkerDispatchRow {
   this.db.exec('BEGIN IMMEDIATE')
   try {
     const dispatch = this.getDispatchContextById(dispatchId)
     const worker = this.getWorkerDispatch(dispatchId)
-    if (!dispatch || dispatch.status !== 'pending' || worker?.state !== 'starting') {
-      throw new OrchestrationError('dispatch_inactive', `Dispatch ${dispatchId} is not starting.`)
+    if (!dispatch || dispatch.status !== 'pending' || worker?.state !== from) {
+      throw new OrchestrationError('dispatch_inactive', `Dispatch ${dispatchId} is not ${from}.`)
     }
-    this.db
-      .prepare("UPDATE dispatch_contexts SET status = 'dispatched' WHERE id = ?")
-      .run(dispatchId)
-    this.db
-      .prepare(
-        `UPDATE worker_dispatches
-         SET state = 'ready', stage = 'input_accepted',
-             effects = COALESCE(?, effects), updated_at = datetime('now')
-         WHERE dispatch_id = ?`
-      )
-      .run(effects ? JSON.stringify(effects) : null, dispatchId)
+    transitionLifecycleWithDb(this.db, {
+      entity: 'dispatch',
+      id: dispatchId,
+      from: 'pending',
+      to: 'dispatched'
+    })
+    transitionLifecycleWithDb(this.db, {
+      entity: 'worker',
+      id: dispatchId,
+      from,
+      to: 'ready',
+      projection: {
+        stage: 'input_accepted',
+        ...(from === 'start_unknown' ? { last_error: null } : {}),
+        effects: effects ? JSON.stringify(effects) : worker.effects
+      }
+    })
+    if (from === 'start_unknown') {
+      resumeTaskBlockedByUnknownStart(this, dispatch.task_id)
+    }
     this.db.exec('COMMIT')
     return this.getWorkerDispatch(dispatchId) as WorkerDispatchRow
   } catch (error) {
@@ -37,11 +76,7 @@ export function failWorkerStart(
   this: OrchestrationDb,
   dispatchId: string,
   stage: string,
-  reason: string,
-  // Why (#16095): revocation exists to stop a worker acting on a dispatch that never landed. A
-  // prompt whose turn start went unobserved provably landed, so its worker keeps the authority its
-  // own report needs.
-  options: { retainCapability?: boolean } = {}
+  reason: string
 ): WorkerDispatchRow {
   this.db.exec('BEGIN IMMEDIATE')
   try {
@@ -50,32 +85,48 @@ export function failWorkerStart(
     if (!dispatch || !worker || worker.state !== 'starting') {
       throw new OrchestrationError('dispatch_inactive', `Dispatch ${dispatchId} is not starting.`)
     }
-    this.db
-      .prepare(
-        `UPDATE dispatch_contexts
-         SET status = 'failed', last_failure = ?, completed_at = datetime('now'),
-             capability_revoked_at = CASE WHEN ? = 1 THEN capability_revoked_at
-               ELSE COALESCE(capability_revoked_at, datetime('now')) END
-         WHERE id = ?`
-      )
-      .run(reason, options.retainCapability ? 1 : 0, dispatchId)
-    this.db
-      .prepare(
-        `UPDATE worker_dispatches
-         SET state = 'failed', stage = ?, last_error = ?, updated_at = datetime('now')
-         WHERE dispatch_id = ?`
-      )
-      .run(stage, reason, dispatchId)
-    this.db
-      .prepare(
-        `UPDATE tasks SET status = 'failed', completed_at = datetime('now')
-         WHERE id = ? AND NOT EXISTS (
-           SELECT 1 FROM dispatch_contexts
-           WHERE task_id = tasks.id AND status IN ('pending', 'dispatched')
-         )`
-      )
-      .run(dispatch.task_id)
+    const now = new Date().toISOString()
+    // A start that never ran counts toward the breaker, or a retry loop of failed starts never ends.
+    const failureCount = dispatch.failure_count + 1
+    transitionLifecycleWithDb(this.db, {
+      entity: 'dispatch',
+      id: dispatchId,
+      from: dispatch.status,
+      to: failureCount >= DISPATCH_CIRCUIT_BREAK_FAILURES ? 'circuit_broken' : 'failed',
+      projection: {
+        failure_count: failureCount,
+        last_failure: reason,
+        completed_at: now,
+        capability_revoked_at: dispatch.capability_revoked_at ?? now
+      }
+    })
+    transitionLifecycleWithDb(this.db, {
+      entity: 'worker',
+      id: dispatchId,
+      from: 'starting',
+      to: 'failed',
+      projection: { stage, last_error: reason, updated_at: now }
+    })
+    const hasActiveDispatch = Boolean(
+      this.db
+        .prepare(
+          `SELECT 1 FROM dispatch_contexts
+           WHERE task_id = ? AND status IN ('pending', 'dispatched') LIMIT 1`
+        )
+        .get(dispatch.task_id)
+    )
+    const task = this.getTask(dispatch.task_id)
+    if (!hasActiveDispatch && task && task.status !== 'completed') {
+      transitionLifecycleWithDb(this.db, {
+        entity: 'task',
+        id: dispatch.task_id,
+        from: task.status,
+        to: 'failed',
+        projection: { completed_at: now }
+      })
+    }
     this.closeQuestionsForDispatch(dispatchId)
+    recordFailedStartDispatchIdentity(this, this.getWorkerDispatch(dispatchId) as WorkerDispatchRow)
     this.db.exec('COMMIT')
     return this.getWorkerDispatch(dispatchId) as WorkerDispatchRow
   } catch (error) {
@@ -88,7 +139,8 @@ export function markWorkerStartUnknown(
   this: OrchestrationDb,
   dispatchId: string,
   stage: string,
-  reason: string
+  reason: string,
+  effects?: unknown[]
 ): WorkerDispatchRow {
   this.db.exec('BEGIN IMMEDIATE')
   try {
@@ -97,22 +149,31 @@ export function markWorkerStartUnknown(
     if (!dispatch || !worker || worker.state !== 'starting') {
       throw new OrchestrationError('dispatch_inactive', `Dispatch ${dispatchId} is not starting.`)
     }
-    this.db
-      .prepare(
-        `UPDATE worker_dispatches
-         SET state = 'start_unknown', stage = ?, last_error = ?, updated_at = datetime('now')
-         WHERE dispatch_id = ?`
-      )
-      .run(stage, reason, dispatchId)
-    this.db
-      .prepare(
-        `UPDATE dispatch_contexts
-         SET capability_revoked_at = COALESCE(capability_revoked_at, datetime('now'))
-         WHERE id = ?`
-      )
-      .run(dispatchId)
-    this.db.prepare("UPDATE tasks SET status = 'blocked' WHERE id = ?").run(dispatch.task_id)
-    this.closeQuestionsForDispatch(dispatchId)
+    transitionLifecycleWithDb(this.db, {
+      entity: 'worker',
+      id: dispatchId,
+      from: 'starting',
+      to: 'start_unknown',
+      projection: {
+        stage,
+        last_error: reason,
+        updated_at: new Date().toISOString(),
+        ...(effects ? { effects: JSON.stringify(effects) } : {})
+      }
+    })
+    transitionLifecycleWithDb(this.db, {
+      entity: 'dispatch',
+      id: dispatchId,
+      from: dispatch.status,
+      to: dispatch.status
+    })
+    transitionLifecycleWithDb(this.db, {
+      entity: 'task',
+      id: dispatch.task_id,
+      from: 'dispatched',
+      to: 'blocked'
+    })
+    // Authority survives uncertainty, so its outstanding questions must remain answerable.
     this.db.exec('COMMIT')
     return this.getWorkerDispatch(dispatchId) as WorkerDispatchRow
   } catch (error) {
@@ -125,12 +186,16 @@ export function getWorkerDispatch(
   this: OrchestrationDb,
   dispatchId: string
 ): WorkerDispatchRow | undefined {
-  return this.db
-    .prepare('SELECT * FROM worker_dispatches WHERE dispatch_id = ?')
-    .get(dispatchId) as WorkerDispatchRow | undefined
+  // An explicit projection, so SyncDatabase keeps this hot statement compiled; `SELECT *` is never cached.
+  const row = this.db
+    .prepare(`SELECT ${WORKER_DISPATCH_COLUMN_LIST} FROM worker_dispatches WHERE dispatch_id = ?`)
+    .get(dispatchId)
+  // oxlint-disable-next-line typescript/consistent-type-assertions -- SAFETY: the column list is checked against WorkerDispatchRow, and projected-row-getters.test.ts verifies the returned row.
+  return row as WorkerDispatchRow | undefined
 }
 
 export type WorkerDispatchOutcomeMethods = {
+  retainWorkerLaunchObservation: typeof retainWorkerLaunchObservation
   markWorkerDispatchReady: typeof markWorkerDispatchReady
   failWorkerStart: typeof failWorkerStart
   markWorkerStartUnknown: typeof markWorkerStartUnknown
@@ -139,6 +204,7 @@ export type WorkerDispatchOutcomeMethods = {
 
 export function attachWorkerDispatchOutcome(ctor: { prototype: object }): void {
   Object.assign(ctor.prototype, {
+    retainWorkerLaunchObservation,
     markWorkerDispatchReady,
     failWorkerStart,
     markWorkerStartUnknown,

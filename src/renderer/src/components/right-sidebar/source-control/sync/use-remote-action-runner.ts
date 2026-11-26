@@ -1,7 +1,7 @@
 import { useCallback } from 'react'
-import { getConnectionId } from '@/lib/connection-context'
-import { isSyncPushStageError } from '@/lib/source-control-remote-error'
-import { shouldForcePushWithLeaseForUpstream } from '../../../../../../shared/git-upstream-status'
+import { sourceControlConnectionId, useSourceControlScope } from '../panel/worktree-scope'
+import { isSyncPushStageError } from '@/lib/source-control/remote/source-control-remote-error'
+import { shouldForcePushWithLeaseForUpstream } from '../../../../../../shared/git/remotes/git-upstream-status'
 import {
   captureSourceControlRecoveryEntrySnapshot,
   type SourceControlActionError,
@@ -14,6 +14,7 @@ import type { SourceControlStoreActions } from '../listing/use-store-actions'
 import type { SourceControlWorktreeContext } from '../listing/use-worktree-context'
 import type { SourceControlWorktreeOperationState } from '../panel/use-worktree-operation-state'
 import { refreshSourceControlAfterRemoteAction, resolveRemoteActionError } from './remote-refresh'
+import { orcaRebaseMarkerFromResult } from './orca-rebase-marker'
 import type { SourceControlStatusRefresh } from './use-status-refresh'
 
 export type SourceControlRemoteActionKind =
@@ -26,19 +27,16 @@ export type SourceControlRemoteActionKind =
   | 'publish'
   | 'rebase'
 
-// Why: statuses distinguish real failures from supersession and no-ops; collapsing to { ok: false } made Create PR treat supersession as a destructive failure.
+// Distinguish failures from supersession/no-ops so Create PR cannot treat supersession as destructive failure.
 export type RunRemoteActionResult =
   | { status: 'ok' }
   | { status: 'failed'; error: SourceControlActionError }
   | { status: 'superseded' }
   | { status: 'skipped' }
 
-/**
- * Single dispatcher for remote-only actions; error-swallow lives here since store slices already
- * surface actionable toasts.
- */
+/** Store slices own failure toasts; swallow remote-action errors here. */
 export function useSourceControlRemoteActionRunner({
-  activeRepoSettings,
+  activeRepoTarget,
   activeWorktree,
   activeWorktreeId,
   branchName,
@@ -47,20 +45,19 @@ export function useSourceControlRemoteActionRunner({
   fetchBranch,
   grouped,
   handleCommit,
+  operationStore,
   pullBranch,
   pushBranch,
   rebaseFromBase,
   refreshActiveGitStatusAfterMutation,
   refreshBranchCompareRef,
   refreshGitHistoryRef,
-  remoteActionErrorSequenceByWorktreeRef,
   remoteStatus,
   remoteStatusForActions,
-  setRemoteActionErrors,
   syncBranch,
   worktreePath
 }: {
-  activeRepoSettings: SourceControlWorktreeContext['activeRepoSettings']
+  activeRepoTarget: SourceControlWorktreeContext['activeRepoTarget']
   activeWorktree: SourceControlWorktreeContext['activeWorktree']
   activeWorktreeId: string | null
   branchName: string
@@ -69,19 +66,19 @@ export function useSourceControlRemoteActionRunner({
   fetchBranch: SourceControlStoreActions['fetchBranch']
   grouped: SourceControlFileListing['grouped']
   handleCommit: SourceControlCommitAction['handleCommit']
+  operationStore: SourceControlWorktreeOperationState['operationStore']
   pullBranch: SourceControlStoreActions['pullBranch']
   pushBranch: SourceControlStoreActions['pushBranch']
   rebaseFromBase: SourceControlStoreActions['rebaseFromBase']
   refreshActiveGitStatusAfterMutation: SourceControlStatusRefresh['refreshActiveGitStatusAfterMutation']
   refreshBranchCompareRef: React.RefObject<() => Promise<void>>
   refreshGitHistoryRef: React.RefObject<() => Promise<void>>
-  remoteActionErrorSequenceByWorktreeRef: SourceControlWorktreeOperationState['remoteActionErrorSequenceByWorktreeRef']
   remoteStatus: SourceControlWorktreeContext['remoteStatus']
   remoteStatusForActions: SourceControlWorktreeContext['remoteStatus']
-  setRemoteActionErrors: SourceControlWorktreeOperationState['setRemoteActionErrors']
   syncBranch: SourceControlStoreActions['syncBranch']
   worktreePath: string | null
 }) {
+  const scope = useSourceControlScope()
   const runRemoteAction = useCallback(
     async (
       kind: SourceControlRemoteActionKind,
@@ -94,18 +91,18 @@ export function useSourceControlRemoteActionRunner({
         options?.target ??
         (activeWorktreeId && worktreePath
           ? {
-              settings: activeRepoSettings,
+              target: activeRepoTarget,
               worktreeId: activeWorktreeId,
               worktreePath,
-              connectionId: getConnectionId(activeWorktreeId) ?? undefined,
+              connectionId: sourceControlConnectionId(scope, activeWorktreeId),
               pushTarget: activeWorktree?.pushTarget
             }
           : null)
       if (!target) {
         return { status: 'skipped' }
       }
-      const sequence = (remoteActionErrorSequenceByWorktreeRef.current[target.worktreeId] ?? 0) + 1
-      remoteActionErrorSequenceByWorktreeRef.current[target.worktreeId] = sequence
+      const sequence = operationStore.getState().remoteActionSequence + 1
+      operationStore.setState({ remoteActionSequence: sequence, remoteActionError: null })
       const targetIsActiveWorktree = target.worktreeId === activeWorktreeId
       const recoveryEntrySnapshot = captureSourceControlRecoveryEntrySnapshot(
         targetIsActiveWorktree
@@ -117,7 +114,13 @@ export function useSourceControlRemoteActionRunner({
           : []
       )
       const failureBranchName = targetIsActiveWorktree ? branchName || null : null
-      setRemoteActionErrors((prev) => ({ ...prev, [target.worktreeId]: null }))
+      // A push or pull that lands reconciles with the remote, so the post-rebase Pull hiding retires.
+      // A rejected one leaves the divergence the rebase made, so the marker stays.
+      const retireOrcaRebaseMarker = (): void => {
+        if (targetIsActiveWorktree) {
+          operationStore.setState({ orcaRebase: null })
+        }
+      }
       try {
         if (kind === 'publish') {
           await pushBranch(
@@ -126,20 +129,22 @@ export function useSourceControlRemoteActionRunner({
             true,
             target.connectionId,
             target.pushTarget,
-            { runtimeTargetSettings: target.settings }
+            { runtimeTarget: target.target }
           )
+          retireOrcaRebaseMarker()
           return { status: 'ok' }
         }
         if (kind === 'push') {
-          // Why: kind 'push' must stay a regular push; auto-upgrading made the always-enabled dropdown Push row silently force-push against its tooltip.
+          // Keep Push regular; automatic force escalation would contradict its dropdown tooltip.
           await pushBranch(
             target.worktreeId,
             target.worktreePath,
             false,
             target.connectionId,
             target.pushTarget,
-            { runtimeTargetSettings: target.settings }
+            { runtimeTarget: target.target }
           )
+          retireOrcaRebaseMarker()
           return { status: 'ok' }
         }
         if (kind === 'force_push') {
@@ -149,8 +154,9 @@ export function useSourceControlRemoteActionRunner({
             false,
             target.connectionId,
             target.pushTarget,
-            { forceWithLease: true, runtimeTargetSettings: target.settings }
+            { forceWithLease: true, runtimeTarget: target.target }
           )
+          retireOrcaRebaseMarker()
           return { status: 'ok' }
         }
         if (kind === 'pull') {
@@ -160,9 +166,10 @@ export function useSourceControlRemoteActionRunner({
             target.connectionId,
             target.pushTarget,
             {
-              runtimeTargetSettings: target.settings
+              runtimeTarget: target.target
             }
           )
+          retireOrcaRebaseMarker()
           return { status: 'ok' }
         }
         if (kind === 'fast_forward') {
@@ -171,8 +178,9 @@ export function useSourceControlRemoteActionRunner({
             target.worktreePath,
             target.connectionId,
             target.pushTarget,
-            { runtimeTargetSettings: target.settings }
+            { runtimeTarget: target.target }
           )
+          retireOrcaRebaseMarker()
           return { status: 'ok' }
         }
         if (kind === 'fetch') {
@@ -182,24 +190,31 @@ export function useSourceControlRemoteActionRunner({
             target.connectionId,
             target.pushTarget,
             {
-              runtimeTargetSettings: target.settings
+              runtimeTarget: target.target
             }
           )
           return { status: 'ok' }
         }
         if (kind === 'rebase') {
+          // A new rebase replaces any earlier marker, whether or not it completes.
+          retireOrcaRebaseMarker()
           const baseRef = options?.baseRef ?? effectiveBaseRef
           if (!baseRef) {
             return { status: 'skipped' }
           }
-          await rebaseFromBase(
+          const result = await rebaseFromBase(
             target.worktreeId,
             target.worktreePath,
             baseRef,
             target.connectionId,
             target.pushTarget,
-            { runtimeTargetSettings: target.settings }
+            { runtimeTarget: target.target }
           )
+          // Main reports the upstream tip only when this rebase integrated it, so only then hide Pull.
+          // The store is the active worktree's; another target's rebase must not touch its marker.
+          if (targetIsActiveWorktree) {
+            operationStore.setState({ orcaRebase: orcaRebaseMarkerFromResult(branchName, result) })
+          }
           return { status: 'ok' }
         }
         await syncBranch(
@@ -208,16 +223,17 @@ export function useSourceControlRemoteActionRunner({
           target.connectionId,
           target.pushTarget,
           {
-            runtimeTargetSettings: target.settings
+            runtimeTarget: target.target
           }
         )
-        if (remoteActionErrorSequenceByWorktreeRef.current[target.worktreeId] === sequence) {
-          setRemoteActionErrors((prev) => ({ ...prev, [target.worktreeId]: null }))
+        retireOrcaRebaseMarker()
+        if (operationStore.getState().remoteActionSequence === sequence) {
+          operationStore.setState({ remoteActionError: null })
         }
         return { status: 'ok' }
       } catch (error) {
-        // Why: editor-slice actions own the failure toast; keep the latest failure inline too since dropdown-only actions like Fetch look silent once the menu closes.
-        if (remoteActionErrorSequenceByWorktreeRef.current[target.worktreeId] !== sequence) {
+        // Keep failures inline after dropdowns close; store actions already own the toast.
+        if (operationStore.getState().remoteActionSequence !== sequence) {
           return { status: 'superseded' }
         }
         const actionError: SourceControlActionError = {
@@ -231,11 +247,12 @@ export function useSourceControlRemoteActionRunner({
           entriesSnapshotTotalCount: recoveryEntrySnapshot.totalCount,
           sequence
         }
-        setRemoteActionErrors((prev) => ({ ...prev, [target.worktreeId]: actionError }))
+        operationStore.setState({ remoteActionError: actionError })
         return { status: 'failed', error: actionError }
       } finally {
         if (!options?.target) {
           refreshSourceControlAfterRemoteAction({
+            worktreeId: target.worktreeId,
             refreshGitStatus: refreshActiveGitStatusAfterMutation,
             refreshBranchCompare: refreshBranchCompareRef.current,
             refreshGitHistory: refreshGitHistoryRef.current
@@ -244,7 +261,8 @@ export function useSourceControlRemoteActionRunner({
       }
     },
     [
-      activeRepoSettings,
+      scope,
+      activeRepoTarget,
       activeWorktree?.pushTarget,
       activeWorktreeId,
       branchName,
@@ -254,27 +272,26 @@ export function useSourceControlRemoteActionRunner({
       grouped.staged,
       grouped.unstaged,
       grouped.untracked,
+      operationStore,
       pullBranch,
       pushBranch,
       rebaseFromBase,
       refreshActiveGitStatusAfterMutation,
       refreshBranchCompareRef,
       refreshGitHistoryRef,
-      remoteActionErrorSequenceByWorktreeRef,
-      setRemoteActionErrors,
       syncBranch,
       worktreePath
     ]
   )
 
-  // Why: commit first and run the follow-up remote op only if handleCommit succeeded, so we never push a commit the user didn't land.
+  // Run remote follow-ups only after commit succeeds.
   const runCompoundCommitAction = useCallback(
     async (remoteKind: 'push' | 'sync'): Promise<void> => {
       const ok = await handleCommit()
       if (!ok) {
         return
       }
-      // Why: "Commit & Force Push" maps to remoteKind 'push', so route to force_push when the upstream shape requires lease force (kind 'push' no longer auto-upgrades).
+      // Commit & Force Push retains remoteKind push; select the explicit lease-force path.
       if (
         remoteKind === 'push' &&
         shouldForcePushWithLeaseForUpstream(remoteStatusForActions ?? remoteStatus)

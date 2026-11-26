@@ -1,23 +1,29 @@
+import { workspaceEditorFiles } from '@/store/slices/editor/tabs/workspace-editor-files'
 import type { AppState } from '../../types'
-import { toVisibleTabType } from '../../../../../shared/tab-types'
-import type { WorkspaceVisibleTabType } from '../../../../../shared/tab-types'
+import { toVisibleTabType } from '../../../../../shared/workspace-layout/tab-groups/tab-types'
+import type { WorkspaceVisibleTabType } from '../../../../../shared/workspace-layout/tab-groups/tab-types'
+import { isEditorTabContentType } from '../editor/tabs/editor-tab-content-type'
+
+export type ActiveSurfaceSourceState = Pick<
+  AppState,
+  | 'activeBrowserTabIdByWorktree'
+  | 'activeFileIdByWorktree'
+  | 'activeGroupIdByWorktree'
+  | 'activeTabIdByWorktree'
+  | 'activeTabTypeByWorktree'
+  | 'browserTabsByWorktree'
+  | 'groupsByWorktree'
+  | 'layoutByWorktree'
+  | 'openFiles'
+  | 'tabsByWorktree'
+  | 'unifiedTabsByWorktree'
+>
 
 export function deriveActiveSurfaceForWorktree(
-  state: Pick<
-    AppState,
-    | 'activeBrowserTabIdByWorktree'
-    | 'activeFileIdByWorktree'
-    | 'activeGroupIdByWorktree'
-    | 'activeTabIdByWorktree'
-    | 'browserTabsByWorktree'
-    | 'groupsByWorktree'
-    | 'layoutByWorktree'
-    | 'openFiles'
-    | 'tabsByWorktree'
-    | 'unifiedTabsByWorktree'
-  >,
+  state: ActiveSurfaceSourceState,
   worktreeId: string,
-  preferredGroupId?: string | null
+  preferredGroupId?: string | null,
+  options?: { preferredTabId?: string; legacySelection?: 'remembered-type' }
 ): {
   activeBrowserTabId: string | null
   activeFileId: string | null
@@ -28,10 +34,12 @@ export function deriveActiveSurfaceForWorktree(
   const activeGroupId = preferredGroupId ?? state.activeGroupIdByWorktree[worktreeId] ?? null
   const activeGroup =
     (activeGroupId ? groups.find((group) => group.id === activeGroupId) : null) ?? groups[0] ?? null
+  const activeUnifiedTabId = options?.preferredTabId ?? activeGroup?.activeTabId
   const activeUnifiedTab =
-    activeGroup?.activeTabId != null
+    activeUnifiedTabId != null
       ? ((state.unifiedTabsByWorktree[worktreeId] ?? []).find(
-          (tab) => tab.id === activeGroup.activeTabId && tab.groupId === activeGroup.id
+          (tab) =>
+            tab.id === activeUnifiedTabId && activeGroup != null && tab.groupId === activeGroup.id
         ) ?? null)
       : null
   const restoredFileId = state.activeFileIdByWorktree[worktreeId] ?? null
@@ -40,7 +48,9 @@ export function deriveActiveSurfaceForWorktree(
   const browserTabs = state.browserTabsByWorktree[worktreeId] ?? []
   const terminalTabs = state.tabsByWorktree[worktreeId] ?? []
   const fileStillOpen = restoredFileId
-    ? state.openFiles.some((file) => file.id === restoredFileId && file.worktreeId === worktreeId)
+    ? workspaceEditorFiles(state.openFiles, state.unifiedTabsByWorktree[worktreeId]).some(
+        (file) => file.id === restoredFileId
+      )
     : false
   const browserTabStillOpen = restoredBrowserTabId
     ? browserTabs.some((tab) => tab.id === restoredBrowserTabId)
@@ -50,20 +60,23 @@ export function deriveActiveSurfaceForWorktree(
     : false
   const hasGroupOwnedSurface = groups.length > 0 || Boolean(state.layoutByWorktree[worktreeId])
 
+  const restoreLegacyType = options?.legacySelection === 'remembered-type'
+  const restoredTabType = restoreLegacyType
+    ? (state.activeTabTypeByWorktree[worktreeId] ?? 'terminal')
+    : null
+  // Browser/group focus may retain a remembered file; stale chat/simulator fallback must clear it.
+  const keepRememberedFileUnderBrowser = restoredTabType === null || restoredTabType === 'browser'
+
   let activeFileId: string | null
   let activeBrowserTabId: string | null
   let activeTabType: WorkspaceVisibleTabType
 
   if (activeUnifiedTab) {
-    activeFileId =
-      activeUnifiedTab.contentType === 'editor' ||
-      activeUnifiedTab.contentType === 'diff' ||
-      activeUnifiedTab.contentType === 'conflict-review' ||
-      activeUnifiedTab.contentType === 'check-details'
-        ? activeUnifiedTab.entityId
-        : fileStillOpen
-          ? restoredFileId
-          : null
+    activeFileId = isEditorTabContentType(activeUnifiedTab.contentType)
+      ? activeUnifiedTab.entityId
+      : fileStillOpen
+        ? restoredFileId
+        : null
     activeBrowserTabId =
       activeUnifiedTab.contentType === 'browser'
         ? activeUnifiedTab.entityId
@@ -76,8 +89,16 @@ export function deriveActiveSurfaceForWorktree(
     activeBrowserTabId = browserTabStillOpen ? restoredBrowserTabId : (browserTabs[0]?.id ?? null)
     // Why: focusing an empty split should target its default terminal area, not the previously active browser/editor in another group.
     activeTabType = 'terminal'
-  } else if (browserTabStillOpen) {
+  } else if (restoredTabType === 'terminal') {
     activeFileId = fileStillOpen ? restoredFileId : null
+    activeBrowserTabId = browserTabStillOpen ? restoredBrowserTabId : (browserTabs[0]?.id ?? null)
+    activeTabType = 'terminal'
+  } else if (restoredTabType === 'editor' && fileStillOpen) {
+    activeFileId = restoredFileId
+    activeBrowserTabId = browserTabStillOpen ? restoredBrowserTabId : (browserTabs[0]?.id ?? null)
+    activeTabType = 'editor'
+  } else if (browserTabStillOpen) {
+    activeFileId = keepRememberedFileUnderBrowser && fileStillOpen ? restoredFileId : null
     activeBrowserTabId = restoredBrowserTabId
     activeTabType = 'browser'
   } else if (fileStillOpen) {
@@ -85,7 +106,8 @@ export function deriveActiveSurfaceForWorktree(
     activeBrowserTabId = browserTabs[0]?.id ?? null
     activeTabType = 'editor'
   } else {
-    const fallbackFile = state.openFiles.find((file) => file.worktreeId === worktreeId) ?? null
+    const fallbackFile =
+      workspaceEditorFiles(state.openFiles, state.unifiedTabsByWorktree[worktreeId])[0] ?? null
     const fallbackBrowserTab = browserTabs[0] ?? null
     activeFileId = fallbackFile?.id ?? null
     activeBrowserTabId = fallbackBrowserTab?.id ?? null
@@ -106,20 +128,7 @@ export function deriveActiveSurfaceForWorktree(
 }
 
 export function buildActiveSurfacePatch(
-  state: Pick<
-    AppState,
-    | 'activeBrowserTabIdByWorktree'
-    | 'activeFileIdByWorktree'
-    | 'activeGroupIdByWorktree'
-    | 'activeTabIdByWorktree'
-    | 'activeTabTypeByWorktree'
-    | 'browserTabsByWorktree'
-    | 'groupsByWorktree'
-    | 'layoutByWorktree'
-    | 'openFiles'
-    | 'tabsByWorktree'
-    | 'unifiedTabsByWorktree'
-  >,
+  state: ActiveSurfaceSourceState,
   worktreeId: string,
   preferredGroupId?: string | null
 ): Pick<

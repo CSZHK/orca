@@ -1,8 +1,25 @@
-import { CURRENT_CONTRACT_VERSION, LEGACY_RUN_ID } from '../contract-constants'
+import { ORCHESTRATION_CONTRACT_VERSION as CURRENT_CONTRACT_VERSION } from '../../../../../shared/orchestration/orchestration-runtime-capabilities'
+import { ORCHESTRATION_LEGACY_RUN_ID as LEGACY_RUN_ID } from '../../../../../shared/orchestration/orchestration-rpc-contract'
 import {
   REMOTE_ATTACHMENT_PANE_KEY_MATCH_SUFFIX_SQL,
   RUN_PANE_KEY_MATCH_SUFFIX_SQL
 } from '../pane-key-match'
+import { potentiallyLiveRemoteAttachmentSql } from '../federation/remote-attachment-liveness'
+
+// Additive tables outlive v30 writers, so legacy parent deletes must clean their rows too.
+export const ADDITIVE_LIFECYCLE_DELETE_TRIGGERS_SQL = `
+CREATE TRIGGER IF NOT EXISTS trg_tasks_delete_additive_lifecycle
+AFTER DELETE ON tasks
+BEGIN
+  DELETE FROM attempt_observation_facts WHERE task_id = OLD.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_dispatches_delete_additive_lifecycle
+AFTER DELETE ON dispatch_contexts
+BEGIN
+  DELETE FROM attempt_observation_facts WHERE dispatch_id = OLD.id;
+END;
+`
 
 export function createGraphTablesSql(): string {
   return `
@@ -17,11 +34,15 @@ CREATE TABLE IF NOT EXISTS federated_dispatches (
   remote_terminal_handle  TEXT,
   to_home_imported_sequence INTEGER NOT NULL DEFAULT 0,
   to_home_acknowledged_sequence INTEGER NOT NULL DEFAULT 0,
+  home_auto_release_at    TEXT,
+  home_auto_release_state TEXT,
   created_at              TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at              TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS remote_dispatch_attachments (
+  -- DEFAULT: a rolled-back v1.4.198 host still inserts here without a home Run.
+  home_run_id             TEXT NOT NULL DEFAULT '',
   dispatch_id             TEXT PRIMARY KEY,
   task_id                 TEXT NOT NULL,
   home_peer_fingerprint   TEXT NOT NULL,
@@ -45,6 +66,8 @@ CREATE TABLE IF NOT EXISTS remote_dispatch_attachments (
   -- Nesting depth of the worker this attachment represents. Propagated from the
   -- Run home; absent from an old client means 1, which fails closed.
   depth                   INTEGER NOT NULL DEFAULT 1,
+  -- Its own counter: a federated worker host has no dispatch_contexts row to borrow one from.
+  consumer_generation     INTEGER NOT NULL DEFAULT 0,
   last_error              TEXT,
   created_at              TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at              TEXT NOT NULL DEFAULT (datetime('now'))
@@ -55,10 +78,10 @@ CREATE TABLE IF NOT EXISTS remote_dispatch_attachments (
 -- nesting parent. See docs/reference/ssh-execution-boundary.md.
 CREATE INDEX IF NOT EXISTS idx_remote_dispatch_attachments_active_pane
   ON remote_dispatch_attachments(pane_key)
-  WHERE state IN ('starting', 'ready', 'start_unknown', 'stopping', 'stop_unknown');
+  WHERE ${potentiallyLiveRemoteAttachmentSql()};
 CREATE INDEX IF NOT EXISTS idx_remote_dispatch_attachments_active_pane_suffix
   ON remote_dispatch_attachments(${REMOTE_ATTACHMENT_PANE_KEY_MATCH_SUFFIX_SQL})
-  WHERE state IN ('starting', 'ready', 'start_unknown', 'stopping', 'stop_unknown')
+  WHERE ${potentiallyLiveRemoteAttachmentSql()}
     AND pane_key IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS federation_relay_items (
@@ -78,6 +101,10 @@ CREATE TABLE IF NOT EXISTS federation_relay_items (
 CREATE INDEX IF NOT EXISTS idx_federation_relay_pending
   ON federation_relay_items(dispatch_id, direction, acked_at, sequence);
 
+-- Holds only what is still unacknowledged, so a paired Orca's mail pull costs what is pending, not every conversation it ever had.
+CREATE INDEX IF NOT EXISTS idx_federation_relay_unacked
+  ON federation_relay_items(direction, dispatch_id) WHERE acked_at IS NULL;
+
 CREATE TABLE IF NOT EXISTS remote_questions (
   message_id        TEXT PRIMARY KEY,
   dispatch_id       TEXT NOT NULL,
@@ -92,6 +119,36 @@ CREATE TABLE IF NOT EXISTS remote_questions (
 CREATE INDEX IF NOT EXISTS idx_remote_questions_dispatch_status
   ON remote_questions(dispatch_id, status);
 
+-- Agent mail between paired Orcas. 'home': this Orca opened it for local_party and pulls replies
+-- from environment_id over the pairing credential peer_fingerprint, so a re-pair opens a new one. 'peer': the paired Orca peer_fingerprint opened it here; its replies wait in
+-- federation_relay_items under dispatch_id = conversation_id until that Orca pulls them.
+CREATE TABLE IF NOT EXISTS peer_mail_conversations (
+  conversation_id  TEXT PRIMARY KEY,
+  role             TEXT NOT NULL CHECK(role IN ('home', 'peer')),
+  environment_id   TEXT,
+  peer_fingerprint TEXT NOT NULL,
+  local_party      TEXT,
+  local_pane_key   TEXT,
+  created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_peer_mail_home_pairing
+  ON peer_mail_conversations(environment_id, local_party, peer_fingerprint) WHERE role = 'home';
+CREATE INDEX IF NOT EXISTS idx_peer_mail_peer_fingerprint
+  ON peer_mail_conversations(peer_fingerprint, role);
+
+-- A message that crossed between paired Orcas: its reply goes back over its conversation, to remote_party.
+CREATE TABLE IF NOT EXISTS peer_mail_messages (
+  message_id      TEXT PRIMARY KEY,
+  conversation_id TEXT NOT NULL,
+  sender_label    TEXT NOT NULL,
+  remote_party    TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_peer_mail_messages_sender ON peer_mail_messages(sender_label);
+
+-- Deletes from tasks, dispatch_contexts and worker tables are recorded in removed_orchestration_work
+-- (removed-orchestration-work-store.ts).
 CREATE TABLE IF NOT EXISTS tasks (
   id            TEXT PRIMARY KEY,
   run_id        TEXT NOT NULL DEFAULT '${LEGACY_RUN_ID}',
@@ -117,6 +174,7 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_id);
 
+-- Deletes are recorded in removed_orchestration_work (removed-orchestration-work-store.ts).
 CREATE TABLE IF NOT EXISTS dispatch_contexts (
   id                  TEXT PRIMARY KEY,
   run_id              TEXT NOT NULL DEFAULT '${LEGACY_RUN_ID}',
@@ -125,9 +183,26 @@ CREATE TABLE IF NOT EXISTS dispatch_contexts (
   launch_token_hash   TEXT,
   assignee_handle     TEXT,
   assignee_pane_key   TEXT,
+  -- Bare Orca session id the agent is addressed by, when it has one (today only structured
+  -- sessions); for a /clear'd chat, its lineage root's. Not its orca_session_id:<id> address.
+  assignee_orca_session_id TEXT,
   capability_hash     TEXT,
   process_incarnation TEXT,
   capability_revoked_at TEXT,
+  -- R1 identity facts; nullable when legacy provenance was never proven.
+  retry_of_dispatch_id TEXT,
+  creator_dispatch_id TEXT,
+  -- Who created this row. A row whose creator is its own assignee is bookkeeping, not delegation,
+  -- so it must not count as a nesting parent. Null on rows written before v37 and for Orca's loop.
+  creator_handle      TEXT,
+  creator_pane_key    TEXT,
+  -- Same form as assignee_orca_session_id: the id the creator is addressed by (a lineage root's).
+  creator_orca_session_id TEXT,
+  -- 'connector' when the creator chat's turn was its connector conversation's, so reports go back there.
+  creator_turn_source TEXT,
+  -- What its creator started it for, opaque here (bot items: bot-item:<uid>); retries inherit it.
+  origin_ref          TEXT,
+  host_scope          TEXT,
   status              TEXT NOT NULL DEFAULT 'pending'
     CHECK(status IN ('pending', 'dispatched', 'completed', 'failed', 'circuit_broken')),
   failure_count       INTEGER NOT NULL DEFAULT 0,
@@ -137,15 +212,24 @@ CREATE TABLE IF NOT EXISTS dispatch_contexts (
   -- Nesting depth: a root coordinator's worker is 1, its worker's worker is 2.
   -- Defaults to 1 so an unstamped row fails closed rather than reading as a root.
   depth               INTEGER NOT NULL DEFAULT 1,
+  -- Bumped whenever the Dispatch is re-pointed at a pane/process, fencing the prior consumer's
+  -- outstanding dispatch mailbox Delivery.
+  consumer_generation INTEGER NOT NULL DEFAULT 0,
   dispatched_at       TEXT,
   completed_at        TEXT,
   created_at          TEXT NOT NULL DEFAULT (datetime('now')),
-  last_heartbeat_at   TEXT
+  last_heartbeat_at   TEXT,
+  -- The settled Dispatch whose worker this one continues (a follow-up sent to it).
+  follow_up_of_dispatch_id TEXT,
+  -- Set when the worker reported with coordinator mail unread; cleared once that mail continues it.
+  follow_up_mail_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_dispatch_task ON dispatch_contexts(task_id);
 CREATE INDEX IF NOT EXISTS idx_dispatch_status ON dispatch_contexts(status);
 CREATE INDEX IF NOT EXISTS idx_dispatch_assignee_handle ON dispatch_contexts(assignee_handle);
+
+${ADDITIVE_LIFECYCLE_DELETE_TRIGGERS_SQL}
 
 CREATE TABLE IF NOT EXISTS decision_gates (
   id            TEXT PRIMARY KEY,

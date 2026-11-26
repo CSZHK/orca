@@ -1,5 +1,12 @@
-import type { RunRow } from '../../types'
-import { ORCHESTRATION_RUN_PAGE_LIMIT } from '../../../../../shared/orchestration-run-pagination'
+import { dropReaderlessRunQuestions } from '../questions/readerless-run-questions'
+import type { RunRow } from '../orchestration-records'
+import {
+  mailboxAddressOf,
+  runBoundToCoordinator,
+  runCoordinatorKey,
+  type OrchestrationCoordinatorKey
+} from '../../addressing/orchestration-caller-identity'
+import { ORCHESTRATION_RUN_PAGE_LIMIT } from '../../../../../shared/orchestration/orchestration-run-pagination'
 import {
   isEquivalentPaneKey,
   RUN_PANE_KEY_MATCH_SUFFIX_SQL,
@@ -10,21 +17,49 @@ import { encodeRunListCursor, decodeRunListCursor } from '../run-list-cursor'
 import type { RunListPage } from '../run-list-page'
 import type { OrchestrationDb } from '../orchestration-db'
 import { RUN_COLUMN_LIST } from '../row-column-lists'
+import { parsePaneKey } from '../../../../../shared/workspace-layout/stable-pane-id'
+import { workerSeatGrabSql } from './run-coordinator-mail-routing'
 
 export type LegacyAdoptedMailboxOwner = {
   runId: string
   terminalHandle: string
 }
 
-// Why: hoisted and wildcard-free so the per-publish run lookups hit the SyncDatabase statement cache.
+// Hoist explicit projections so per-publish queries hit the statement cache.
 const RUN_BY_ID_SQL = `SELECT ${RUN_COLUMN_LIST} FROM runs WHERE id = ?`
 const RUNS_BOUND_TO_PANE_SQL = `SELECT ${RUN_COLUMN_LIST} FROM runs
          WHERE coordinator_pane_key IS NOT NULL AND legacy = 0
            AND ${RUN_PANE_KEY_MATCH_SUFFIX_SQL} = ?
-         ORDER BY rowid`
+         ORDER BY rowid DESC`
+// Only Runs whose mailbox has unread mail undelivered or held by a pointer reservation (getMailboxesWithPointerWork).
+const RUNS_WITH_POINTER_WORK_BOUND_TO_PANE_SQL = `SELECT id, coordinator_pane_key FROM runs
+         WHERE coordinator_pane_key IS NOT NULL AND legacy = 0
+           AND ${RUN_PANE_KEY_MATCH_SUFFIX_SQL} = ?
+           AND EXISTS (SELECT 1 FROM messages
+             WHERE to_handle = 'run:' || runs.id AND read = 0
+               AND delivery_contract = 'current_delivery'
+               AND (delivered_at IS NULL OR pointer_enter_pending > 0))
+         ORDER BY rowid DESC`
+// Predicates match the partial indexes idx_runs_current_pane_exact/_leaf (created on every open).
+const CURRENT_RUN_FOR_EXACT_PANE_SQL = `SELECT ${RUN_COLUMN_LIST} FROM runs
+         WHERE legacy = 0 AND coordinator_pane_key IS NOT NULL AND coordinator_pane_key = ?
+         ORDER BY rowid DESC LIMIT 1`
+const CURRENT_RUN_FOR_PANE_LEAF_SQL = `SELECT ${RUN_COLUMN_LIST} FROM runs
+         WHERE legacy = 0 AND coordinator_pane_key IS NOT NULL
+           AND instr(coordinator_pane_key, ':') > 1
+           AND ${RUN_PANE_KEY_MATCH_SUFFIX_SQL} = ?
+         ORDER BY rowid DESC LIMIT 1`
+// Use one query to preserve newest-first rowid order across pane and session matches; filter identity in JavaScript.
+const RUNS_BOUND_TO_COORDINATOR_SQL = `SELECT ${RUN_COLUMN_LIST} FROM runs
+         WHERE legacy = 0 AND (
+           (coordinator_pane_key IS NOT NULL AND ${RUN_PANE_KEY_MATCH_SUFFIX_SQL} = ?)
+           OR coordinator_orca_session_id = ?
+         )
+         ORDER BY rowid DESC`
 
 export function getRun(this: OrchestrationDb, id: string): RunRow | undefined {
   const run = this.getRunRaw(id)
+  this.workerDockSources?.rememberRun(run)
   return run ? exposeRunTimestamps(run) : undefined
 }
 
@@ -44,17 +79,20 @@ export function getRunMailboxOwnerIdsForHandle(
   terminalHandle: string,
   legacyAdoptedMailboxOwner?: LegacyAdoptedMailboxOwner | null
 ): string[] {
-  const runIds = (
-    this.db
-      .prepare(
-        `SELECT coordinator.run_id
-         FROM run_coordinator_handles AS coordinator
-         JOIN runs ON runs.id = coordinator.run_id AND runs.legacy = 0
-         WHERE coordinator.terminal_handle = ?
-         ORDER BY coordinator.run_id`
-      )
-      .all(terminalHandle) as { run_id: string }[]
-  ).map((row) => row.run_id)
+  const runIds = this.db
+    .prepare(
+      `SELECT coordinator.run_id
+       FROM run_coordinator_handles AS coordinator
+       JOIN runs ON runs.id = coordinator.run_id AND runs.legacy = 0
+       WHERE coordinator.terminal_handle = ? AND NOT ${workerSeatGrabSql('coordinator')}
+       ORDER BY coordinator.run_id`
+    )
+    .all(terminalHandle)
+    .flatMap((row) =>
+      typeof row === 'object' && row !== null && 'run_id' in row && typeof row.run_id === 'string'
+        ? [row.run_id]
+        : []
+    )
   const adoptedOwner =
     legacyAdoptedMailboxOwner === undefined
       ? this.getLegacyAdoptedRunMailboxOwner()
@@ -102,13 +140,17 @@ export function listRuns(
   }
 }
 
+// One indexed seek for the newest equivalent Run: an unparseable key is equivalent only to itself,
+// and a valid pane to any key with a nonempty tab prefix and the same leaf UUID.
 export function getCurrentRunForPane(this: OrchestrationDb, paneKey: string): RunRow | undefined {
-  const run = this.runsBoundToPane(paneKey)[0]
+  const leaf = parsePaneKey(paneKey)?.leafId
+  const sql = leaf ? CURRENT_RUN_FOR_PANE_LEAF_SQL : CURRENT_RUN_FOR_EXACT_PANE_SQL
+  // oxlint-disable-next-line typescript/consistent-type-assertions -- SAFETY: RUN_COLUMN_LIST projects the schema-owned Run row; the adapter exposes unknown.
+  const run = this.db.prepare(sql).get(leaf ?? paneKey) as RunRow | undefined
   return run ? exposeRunTimestamps(run) : undefined
 }
 
-// Why: the indexed suffix only narrows candidates; isEquivalentPaneKey still decides, so
-// reminted tab halves keep matching and unparseable keys keep requiring an exact match.
+// The indexed suffix narrows candidates; pane equivalence still checks remints and exact legacy keys.
 export function runsBoundToPane(this: OrchestrationDb, paneKey: string): RunRow[] {
   return (
     this.db.prepare(RUNS_BOUND_TO_PANE_SQL).all(paneKeyMatchSuffix(paneKey)) as RunRow[]
@@ -118,44 +160,107 @@ export function runsBoundToPane(this: OrchestrationDb, paneKey: string): RunRow[
   )
 }
 
+/** The newest Run `runsBoundToPane` returns, read row by row so older Runs are not loaded. */
+export function firstRunBoundToPane(this: OrchestrationDb, paneKey: string): RunRow | undefined {
+  // oxlint-disable-next-line typescript/consistent-type-assertions -- SAFETY: RUN_COLUMN_LIST projects the schema-owned Run row.
+  const rows = this.db
+    .prepare(RUNS_BOUND_TO_PANE_SQL)
+    .iterate(paneKeyMatchSuffix(paneKey)) as Iterable<RunRow>
+  for (const run of rows) {
+    if (
+      run.coordinator_pane_key !== null &&
+      isEquivalentPaneKey(run.coordinator_pane_key, paneKey)
+    ) {
+      return run
+    }
+  }
+  return undefined
+}
+
+/** Ids of the Runs bound to the pane whose mailbox has pointer work, newest first; Runs without mail are not read. */
+export function runIdsWithPointerWorkBoundToPane(this: OrchestrationDb, paneKey: string): string[] {
+  // oxlint-disable-next-line typescript/consistent-type-assertions -- SAFETY: the query projects these two run columns.
+  const rows = this.db
+    .prepare(RUNS_WITH_POINTER_WORK_BOUND_TO_PANE_SQL)
+    .all(paneKeyMatchSuffix(paneKey)) as { id: string; coordinator_pane_key: string | null }[]
+  return rows
+    .filter(
+      (run) =>
+        run.coordinator_pane_key !== null && isEquivalentPaneKey(run.coordinator_pane_key, paneKey)
+    )
+    .map((run) => run.id)
+}
+
 export function getRunRaw(this: OrchestrationDb, id: string): RunRow | undefined {
   return this.db.prepare(RUN_BY_ID_SQL).get(id) as RunRow | undefined
 }
 
-export function unbindOtherRunsForPane(
+export function getCurrentRunForCoordinator(
   this: OrchestrationDb,
-  paneKey: string,
-  exceptRunId?: string
-): void {
-  for (const run of this.runsBoundToPane(paneKey)) {
+  caller: OrchestrationCoordinatorKey
+): RunRow | undefined {
+  const run = this.runsBoundToCoordinator(caller)[0]
+  return run ? exposeRunTimestamps(run) : undefined
+}
+
+/** The named Run when this caller still coordinates it; a coordinator keeps every Run it created. */
+export function getCoordinatedRun(
+  this: OrchestrationDb,
+  caller: OrchestrationCoordinatorKey,
+  runId: string
+): RunRow | undefined {
+  const run = this.runsBoundToCoordinator(caller).find((bound) => bound.id === runId)
+  return run ? exposeRunTimestamps(run) : undefined
+}
+
+/** Runs bound to this caller by pane or by Orca session id, newest (current) first; a caller without one matches as before. */
+export function runsBoundToCoordinator(
+  this: OrchestrationDb,
+  caller: OrchestrationCoordinatorKey
+): RunRow[] {
+  if (caller.orcaSessionId === null) {
+    return caller.paneKey === null ? [] : this.runsBoundToPane(caller.paneKey)
+  }
+  const suffix = caller.paneKey === null ? null : paneKeyMatchSuffix(caller.paneKey)
+  const rows = this.db.prepare(RUNS_BOUND_TO_COORDINATOR_SQL).all(suffix, caller.orcaSessionId)
+  // oxlint-disable-next-line typescript/consistent-type-assertions -- SAFETY: SELECT * over this table returns the row shape its schema and row type define, like every row cast in db/.
+  return (rows as RunRow[]).filter((run) => runBoundToCoordinator(run, caller))
+}
+
+export function unbindOtherRunsForCoordinator(
+  this: OrchestrationDb,
+  caller: OrchestrationCoordinatorKey,
+  exceptRunId: string
+): string[] {
+  const changed: string[] = []
+  for (const run of this.runsBoundToCoordinator(caller)) {
     if (run.id !== exceptRunId) {
-      if (run.coordinator_handle) {
-        this.routeAllUnreadDirectMessagesToRunMailbox(run.id, run.coordinator_handle)
+      const address = mailboxAddressOf(runCoordinatorKey(run))
+      if (address !== null && this.routeAllUnreadDirectMessagesToRunMailbox(run.id, address) > 0) {
+        changed.push(address)
       }
+      changed.push(`run:${run.id}`)
       this.db
         .prepare(
           `UPDATE runs
-           SET coordinator_handle = NULL, coordinator_pane_key = NULL,
+           SET coordinator_handle = NULL, coordinator_pane_key = NULL, coordinator_orca_session_id = NULL,
+               coordinator_orca_session_id_generation = NULL,
                consumer_generation = consumer_generation + 1,
                updated_at = datetime('now')
            WHERE id = ?`
         )
         .run(run.id)
-      this.fenceOutstandingDelivery(run.id)
+      this.fenceUnacknowledgedMailboxDeliveries(`run:${run.id}`)
+      dropReaderlessRunQuestions(this, run.id)
     }
   }
+  return changed
 }
 
 export function requireRun(this: OrchestrationDb, runId: string): void {
   if (!this.getRunRaw(runId)) {
     throw new Error(`Run not found: ${runId}`)
   }
-}
-
-export function fenceOutstandingDelivery(this: OrchestrationDb, runId: string): void {
-  this.db
-    .prepare("UPDATE deliveries SET status = 'fenced' WHERE run_id = ? AND status = 'outstanding'")
-    .run(runId)
 }
 
 export type RunLookupMethods = {
@@ -165,10 +270,14 @@ export type RunLookupMethods = {
   listRuns: typeof listRuns
   getCurrentRunForPane: typeof getCurrentRunForPane
   runsBoundToPane: typeof runsBoundToPane
+  firstRunBoundToPane: typeof firstRunBoundToPane
+  runIdsWithPointerWorkBoundToPane: typeof runIdsWithPointerWorkBoundToPane
+  getCurrentRunForCoordinator: typeof getCurrentRunForCoordinator
+  getCoordinatedRun: typeof getCoordinatedRun
+  runsBoundToCoordinator: typeof runsBoundToCoordinator
   getRunRaw: typeof getRunRaw
-  unbindOtherRunsForPane: typeof unbindOtherRunsForPane
+  unbindOtherRunsForCoordinator: typeof unbindOtherRunsForCoordinator
   requireRun: typeof requireRun
-  fenceOutstandingDelivery: typeof fenceOutstandingDelivery
 }
 
 export function attachRunLookup(ctor: { prototype: object }): void {
@@ -179,9 +288,13 @@ export function attachRunLookup(ctor: { prototype: object }): void {
     listRuns,
     getCurrentRunForPane,
     runsBoundToPane,
+    firstRunBoundToPane,
+    runIdsWithPointerWorkBoundToPane,
+    getCurrentRunForCoordinator,
+    getCoordinatedRun,
+    runsBoundToCoordinator,
     getRunRaw,
-    unbindOtherRunsForPane,
-    requireRun,
-    fenceOutstandingDelivery
+    unbindOtherRunsForCoordinator,
+    requireRun
   })
 }

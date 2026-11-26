@@ -1,22 +1,20 @@
-import { getActiveRuntimeTarget } from '../../../../runtime/runtime-rpc-client'
-import { getEnvironmentSshStateGeneration } from '../../runtime-environment-ssh'
-import { getRuntimeEnvironmentConnectionGeneration } from '../../runtime-status'
+import { getEnvironmentSshStateGeneration } from '../../ssh/runtime-environment-ssh'
+import { getRuntimeEnvironmentConnectionGeneration } from '../../runtime-status/runtime-status-connection-generation'
 import {
   createDetectedWorktreeRefreshLeaseRegistry,
   type DetectedWorktreeRefreshLease
-} from '../../detected-worktree-refresh-leases'
+} from './detected-worktree-refresh-leases'
 import {
   LOCAL_EXECUTION_HOST_ID,
   parseExecutionHostId,
   type ExecutionHostId
-} from '../../../../../../shared/execution-host'
-import type { AppState } from '../../../types'
+} from '../../../../../../shared/execution-host/execution-host'
 import type { DetectedWorktreeListResult } from '../../../../../../shared/worktree/types'
 import type {
   HostQualifiedDetectedWorktreeResult,
   ProviderRequestId,
   SshExecutionHostId
-} from '../../../../../../shared/detected-worktree-provider-contract'
+} from '../../../../../../shared/worktree/catalog/detected-worktree-provider-contract'
 import type {
   DetectedWorktreeRefreshOptions,
   DetectedWorktreeRefreshOutcome
@@ -25,6 +23,7 @@ import { teardownMissingWorktreeTerminalsBestEffort } from '../teardown/missing-
 import { directSshAuthorityIsComplete } from './direct-ssh-authority'
 import {
   detectedWorktreeRefreshKey,
+  detectedWorktreeTarget,
   isDetectedWorktreeListResult,
   listDetectedWorktreesForRepo,
   startDetectedWorktreeProviderRequest
@@ -34,6 +33,14 @@ const runtimeDetectedWorktreeRefreshesInFlight = new Map<
   string,
   Promise<DetectedWorktreeListResult>
 >()
+
+const STALE_RUNTIME_GENERATION_ERROR = 'runtime_environment_generation_changed'
+// Retry one stale generation; a second signals ongoing churn and must fail visibly instead of stalling.
+const STALE_RUNTIME_GENERATION_RETRIES = 1
+
+export function isStaleRuntimeGenerationError(error: unknown): boolean {
+  return error instanceof Error && error.message === STALE_RUNTIME_GENERATION_ERROR
+}
 
 export const detectedWorktreeRefreshLeaseRegistry = createDetectedWorktreeRefreshLeaseRegistry({
   startProviderRequest: startDetectedWorktreeProviderRequest,
@@ -45,7 +52,6 @@ export const detectedWorktreeRefreshLeaseRegistry = createDetectedWorktreeRefres
 })
 
 export function acquireDetectedWorktreeRefreshLeaseForRepo(
-  settings: AppState['settings'],
   repoId: string,
   options: DetectedWorktreeRefreshOptions
 ): DetectedWorktreeRefreshLease {
@@ -53,12 +59,13 @@ export function acquireDetectedWorktreeRefreshLeaseForRepo(
   if (!parsedHost || parsedHost.kind === 'runtime') {
     throw new Error('Provider leases require a local or direct SSH execution host')
   }
-  const publicKey = detectedWorktreeRefreshKey(settings, repoId, options)
+  const publicKey = detectedWorktreeRefreshKey(repoId, options)
   if (parsedHost.kind === 'local') {
-    return detectedWorktreeRefreshLeaseRegistry.acquire(publicKey, {
-      repoId,
-      executionHostId: LOCAL_EXECUTION_HOST_ID
-    })
+    return detectedWorktreeRefreshLeaseRegistry.acquire(
+      publicKey,
+      { repoId, executionHostId: LOCAL_EXECUTION_HOST_ID },
+      options.forceFresh
+    )
   }
   if (
     !options.directSshAuthority ||
@@ -66,11 +73,15 @@ export function acquireDetectedWorktreeRefreshLeaseForRepo(
   ) {
     throw new Error('Direct SSH provider leases require exact target authority')
   }
-  return detectedWorktreeRefreshLeaseRegistry.acquire(publicKey, {
-    repoId,
-    executionHostId: options.executionHostId as SshExecutionHostId,
-    expectedAuthority: { ...options.directSshAuthority }
-  })
+  return detectedWorktreeRefreshLeaseRegistry.acquire(
+    publicKey,
+    {
+      repoId,
+      executionHostId: options.executionHostId as SshExecutionHostId,
+      expectedAuthority: { ...options.directSshAuthority }
+    },
+    options.forceFresh
+  )
 }
 
 export function qualifiedProviderResultIsAdmitted(
@@ -133,62 +144,76 @@ export function normalizeNotAdmittedProviderResult(
   }
 }
 
-export async function listDetectedWorktreesForRepoCoalesced(
-  settings: AppState['settings'],
+async function listDetectedWorktreesForRuntimeRepoOnce(
   repoId: string,
-  options: DetectedWorktreeRefreshOptions
+  options: DetectedWorktreeRefreshOptions,
+  environmentId: string
 ): Promise<DetectedWorktreeRefreshOutcome> {
-  const key = detectedWorktreeRefreshKey(settings, repoId, options)
-  const target = getActiveRuntimeTarget(settings)
-  if (target.kind === 'environment') {
-    const connectionGeneration = getEnvironmentSshStateGeneration(target.environmentId)
-    const runtimeConnectionGeneration = getRuntimeEnvironmentConnectionGeneration(
-      target.environmentId
-    )
-    let refresh = runtimeDetectedWorktreeRefreshesInFlight.get(key)
-    if (!refresh) {
-      refresh = listDetectedWorktreesForRepo(settings, repoId, {
-        reuseRecentCompatibilityFailure: options.reuseRecentCompatibilityFailure
-      })
-      runtimeDetectedWorktreeRefreshesInFlight.set(key, refresh)
+  // Recompute generation-keyed coalescing key on retry so reconnect cannot join superseded scans.
+  const key = detectedWorktreeRefreshKey(repoId, options)
+  const connectionGeneration = getEnvironmentSshStateGeneration(environmentId)
+  const runtimeConnectionGeneration = getRuntimeEnvironmentConnectionGeneration(environmentId)
+  let refresh = options.forceFresh ? undefined : runtimeDetectedWorktreeRefreshesInFlight.get(key)
+  if (!refresh) {
+    refresh = listDetectedWorktreesForRepo({ kind: 'environment', environmentId }, repoId, {
+      reuseRecentCompatibilityFailure: options.reuseRecentCompatibilityFailure
+    })
+    runtimeDetectedWorktreeRefreshesInFlight.set(key, refresh)
+  }
+  try {
+    const result = await refresh
+    if (
+      getEnvironmentSshStateGeneration(environmentId) !== connectionGeneration ||
+      getRuntimeEnvironmentConnectionGeneration(environmentId) !== runtimeConnectionGeneration
+    ) {
+      throw new Error(STALE_RUNTIME_GENERATION_ERROR)
     }
-    try {
-      const result = await refresh
-      if (
-        getEnvironmentSshStateGeneration(target.environmentId) !== connectionGeneration ||
-        getRuntimeEnvironmentConnectionGeneration(target.environmentId) !==
-          runtimeConnectionGeneration
-      ) {
-        throw new Error('runtime_environment_generation_changed')
-      }
-      // Why (#10562): the scan coalesces, but teardown must not — each caller carries
-      // its own known-id snapshot and purges its own state, so a caller that joined
-      // an in-flight scan would otherwise purge without ever stopping those terminals.
+    // Each joined caller needs teardown for its own known IDs (#10562); stale catalog publications may neither merge nor stop terminals.
+    if (!options.isStaleCatalogPublication?.(result)) {
       await teardownMissingWorktreeTerminalsBestEffort(
-        settings,
+        { kind: 'environment', environmentId },
         repoId,
         options.connectionId,
         options.knownWorktreeIds,
         result
       )
-      return {
-        status: 'admitted',
-        result,
-        executionHostId: options.executionHostId,
-        runtimeAuthority: {
-          environmentId: target.environmentId,
-          connectionGeneration,
-          runtimeConnectionGeneration
-        }
+    }
+    return {
+      status: 'admitted',
+      result,
+      executionHostId: options.executionHostId,
+      runtimeAuthority: {
+        environmentId,
+        connectionGeneration,
+        runtimeConnectionGeneration
       }
-    } finally {
-      if (runtimeDetectedWorktreeRefreshesInFlight.get(key) === refresh) {
-        runtimeDetectedWorktreeRefreshesInFlight.delete(key)
+    }
+  } finally {
+    if (runtimeDetectedWorktreeRefreshesInFlight.get(key) === refresh) {
+      runtimeDetectedWorktreeRefreshesInFlight.delete(key)
+    }
+  }
+}
+
+export async function listDetectedWorktreesForRepoCoalesced(
+  repoId: string,
+  options: DetectedWorktreeRefreshOptions
+): Promise<DetectedWorktreeRefreshOutcome> {
+  const target = detectedWorktreeTarget(options.executionHostId)
+  if (target.kind === 'environment') {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await listDetectedWorktreesForRuntimeRepoOnce(repoId, options, target.environmentId)
+      } catch (err) {
+        // Retry fenced replies: they prove old connection, not empty repo; throwing immediately strands missing sidebar rows (#19241).
+        if (attempt >= STALE_RUNTIME_GENERATION_RETRIES || !isStaleRuntimeGenerationError(err)) {
+          throw err
+        }
       }
     }
   }
 
-  const lease = acquireDetectedWorktreeRefreshLeaseForRepo(settings, repoId, options)
+  const lease = acquireDetectedWorktreeRefreshLeaseForRepo(repoId, options)
   let providerResult: HostQualifiedDetectedWorktreeResult
   try {
     providerResult = await lease.result
@@ -218,13 +243,15 @@ export async function listDetectedWorktreesForRepoCoalesced(
       directSshAuthority: options.directSshAuthority
     }
   }
-  await teardownMissingWorktreeTerminalsBestEffort(
-    settings,
-    repoId,
-    options.connectionId,
-    options.knownWorktreeIds,
-    providerResult.result
-  )
+  if (!options.isStaleCatalogPublication?.(providerResult.result)) {
+    await teardownMissingWorktreeTerminalsBestEffort(
+      target,
+      repoId,
+      options.connectionId,
+      options.knownWorktreeIds,
+      providerResult.result
+    )
+  }
   return {
     status: 'admitted',
     result: providerResult.result,

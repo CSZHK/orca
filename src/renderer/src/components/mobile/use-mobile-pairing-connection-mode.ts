@@ -1,26 +1,30 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { useAppStore } from '@/store'
+import { useOrcaTeamFeatureBlocked } from '@/lib/orca-team-policy'
+import { ORCA_CLOUD_TEAM_POLICY_FLAGS } from '../../../../shared/orca-profiles/orca-cloud-team-policy'
 import {
   resolveMobilePairingConnectionMode,
   type MobilePairingConnectionMode
-} from '../../../../shared/mobile-pairing-connection-mode'
+} from '../../../../shared/remote-runtime/pairing/mobile-pairing-connection-mode'
 
-/**
- * Selected pairing path, seeded from the persisted preference and re-synced
- * when it changes. Anywhere is the default; an explicit saved `local-only`
- * means the user already chose same-network only. Shared by MobilePage and
- * MobilePane so the two surfaces cannot resolve the saved value differently.
- */
+/** Resolve persisted mode and sign-in consistently across MobilePage and MobilePane. */
 export function useMobilePairingConnectionMode(): [
   MobilePairingConnectionMode,
   React.Dispatch<React.SetStateAction<MobilePairingConnectionMode>>
 ] {
   const savedConnectionMode = useAppStore((s) => s.settings?.mobilePairingConnectionMode)
+  const signedIn = useAppStore((s) => s.orcaProfileAuthStatus?.state === 'connected')
+  const relayBlocked = useOrcaTeamFeatureBlocked(ORCA_CLOUD_TEAM_POLICY_FLAGS.mobileRelay)
   const [connectionMode, setConnectionMode] = useState<MobilePairingConnectionMode>(() =>
-    resolveMobilePairingConnectionMode(savedConnectionMode)
+    resolveMobilePairingConnectionMode(savedConnectionMode, { signedIn })
   )
-  useEffect(() => {
-    setConnectionMode(resolveMobilePairingConnectionMode(savedConnectionMode))
-  }, [savedConnectionMode])
-  return [connectionMode, setConnectionMode]
+  const [resolvedFrom, setResolvedFrom] = useState({ savedConnectionMode, signedIn })
+  if (
+    resolvedFrom.savedConnectionMode !== savedConnectionMode ||
+    resolvedFrom.signedIn !== signedIn
+  ) {
+    setResolvedFrom({ savedConnectionMode, signedIn })
+    setConnectionMode(resolveMobilePairingConnectionMode(savedConnectionMode, { signedIn }))
+  }
+  return [relayBlocked ? 'local-only' : connectionMode, setConnectionMode]
 }

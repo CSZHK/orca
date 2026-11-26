@@ -1,40 +1,29 @@
 ---
 name: orca-cli
 description: >-
-  Use the public `orca` CLI to operate Orca-managed worktrees, folder contexts,
-  terminals, repos, automations, artifacts, skill sharing, worktree comments, and the browser
-  embedded inside the Orca app. Use when the user says "$orca-cli", "use orca cli",
-  "Orca worktree", "child worktree", "cardStatus", "spawn codex/claude in a worktree",
-  "read/wait/send Orca terminal", "terminal send", "full handoff", "handover",
-  "give this to another agent", "another worktree", "Orca browser", "orca artifacts",
-  "share HTML/Markdown", "public artifact link", "share skills", or "control the browser inside
-  Orca". Prefer this over raw `git worktree`, ad hoc
-  PTYs, Playwright, or Computer Use when the task touches Orca-managed state.
-  Use Computer Use for external browser windows, webviews, or desktop UI only
-  when the task requires OS/window-level control such as focus, menus, dialogs,
-  coordinates, or screenshots. Use `orca-cli` for Orca's embedded pages and a
-  page-automation tool such as Playwright or CDP for external pages.
+  Operate Orca-managed worktrees, folder contexts, terminals, repos, automations, worktree
+  comments, and Orca's embedded browser through the `orca` CLI. Use when the user says
+  "$orca-cli", "Orca worktree", "child worktree", "spawn codex/claude in a worktree",
+  "read/wait/send Orca terminal", "handoff" / "handover" / "give this to another agent",
+  "ask/tell/message another agent" (including an agent on a paired Orca server), or
+  "Orca browser". Also use for opening, testing, screenshotting, or checking how a local or
+  external web page renders while working in Orca, unless the user or project names another
+  browser tool; plain HTTP or API calls (curl, fetch) do not need it. Prefer it over raw git
+  worktree, ad hoc PTYs, or Computer Use when Orca state is involved. Use Computer Use only
+  when a visible window needs GUI control that a CLI, filesystem, or API cannot do.
 ---
 
 # Orca CLI
 
-This file is a discovery stub, not the usage guide. The full, version-matched Orca CLI
-reference is served by the `orca` binary itself — kept out of this file on purpose so it
-can never drift from the binary that will actually run your commands.
-
-Engage Orca whenever its running editor/runtime is the source of truth: Orca-managed
-worktrees, folder contexts, terminals, repos, automations, worktree comments, and the
-browser embedded inside the Orca app. Triggers include "$orca-cli", "Orca worktree",
-"child worktree", "spawn codex/claude in a worktree", "read/wait/send Orca terminal",
-"full handoff" / "handover" / "give this to another agent", and "control the browser
-inside Orca". Use plain shell tools when Orca state does not matter.
+This discovery stub loads the version-matched guide from the Orca executable used for this session.
 
 ## Resolve the CLI for this session
 
 Choose the executable once and reuse it for every later command:
 
-- If the `ORCA_CLI_COMMAND` environment variable is set, use its value. Orca exports this
-  for managed WSL sessions.
+- If the `ORCA_CLI_COMMAND` environment variable is set, use its value. Orca exports it
+  in sessions it starts when it knows their executable, such as WSL terminals and agent
+  chats.
 - Otherwise, in a dev checkout whose session exposes `ORCA_DEV_REPO_ROOT`, use `orca-dev`.
 - Otherwise, on Linux outside an Orca-managed terminal, use `orca-ide`. Never run bare
   `orca` there — outside Orca's terminals it normally resolves to the
@@ -46,36 +35,27 @@ running anything; do not create a shell variable or run `ORCA` literally. This w
 same way in POSIX shells, PowerShell, and cmd.exe.
 
 If the selected executable cannot run, report its exact error and stop. Do not fall through
-to another executable, which could silently target a different Orca build.
+to another executable, which could silently target a different Orca build. Exception: on
+Windows, when `ORCA_CLI_COMMAND` or `ORCA_TERMINAL_HANDLE` is set (Orca supplied the
+executable), a sandboxed shell that reports it as not recognized or access denied before
+Orca itself runs cannot read Orca's install. Re-run that command, and later Orca commands,
+with escalated permissions before giving up.
 
-## Load the full guide before running Orca commands
+## Load the version-matched guide before running Orca commands
 
 ```text
 ORCA skills get orca-cli
 ```
 
-That prints the complete, version-matched guide for the exact binary that will handle your
-next commands — worktrees, handoffs, terminals, automations, and the built-in browser.
-Read it first, then run the specific command you need.
-
-Don't guess subcommands or flags from memory or from a cached copy of this stub. They
-change between Orca releases, and this file deliberately no longer lists them. Confirm the
-app is up with `ORCA status --json` (start it with `ORCA open --json` if needed), and
-prefer `--json` for agent-driven calls.
-
-## If an older Orca does not recognize `skills get`
-
-Use this fallback only when the selected binary explicitly reports that `skills get` is an
-unknown command. Another failure is not proof of an older binary; report it rather than
-guessing or changing executables. For a confirmed pre-guide binary, use only this bounded,
-read-only bootstrap to orient. Do not dead-end and do not invent commands:
-
-```text
-ORCA status --json
-ORCA worktree ps --json
-ORCA terminal list --json
-```
-
-Then tell the user that updating Orca restores the full, version-matched guide via
-`ORCA skills get orca-cli`. Beyond these commands, ask the user rather than guessing a
-command surface this older binary may not support.
+Prefer `--json`. Use the selected executable's `--help` for commands or flags the guide does
+not cover. A `runtime_unavailable` error is usually transient while Orca is busy or
+restarting: wait a few seconds and retry the command. Before retrying a command that changes
+something, check whether it already took effect, and reuse any request ID the error names.
+`ORCA open` can bring Orca's window to the front over the user's work, so never run it to
+retry a failed command. Run it only when the user asks, or when Orca is really not running:
+`ORCA status --json` reports `result.app.running: false`, or every command, `ORCA status`
+included, still cannot connect after about 30 seconds of retries. If a command fails with
+`runtime_access_denied`, your sandbox blocked the connection: re-run it with escalated
+permissions, and do not run `ORCA open` or restart Orca. If `skills get` is unknown, explain
+that updating Orca restores the guide; use `--help` for read-only discovery and do not guess
+unsupported commands.

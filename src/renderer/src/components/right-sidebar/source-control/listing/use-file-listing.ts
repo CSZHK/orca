@@ -11,30 +11,34 @@ import type { SourceControlStatusRefresh } from '../sync/use-status-refresh'
 import { useSourceControlFileProjection } from './use-file-projection'
 import { useSourceControlRowOpening } from './use-row-opening'
 import type { SourceControlWorktreeContext } from './use-worktree-context'
+import {
+  changeScopeKey,
+  type SourceControlChangeScope,
+  type SourceControlCommitScopeFiles
+} from '../panel/change-scope'
 
-/**
- * Projects git status and branch compare into the rows the panel renders, and layers the
- * interactions that operate on those rows: submodule expansion, diff opening, selection, bulk
- * staging and the git history feed.
- */
 export function useSourceControlFileListing({
   activeRemoteActionSequence,
-  activeRepoSettings,
+  activeRepoTarget,
   activeWorktreeId,
   branchEntries,
   branchName,
   branchSummary,
+  changeScope,
   collapsedSections,
   collapsedTreeDirs,
+  commitScopeFiles,
   compareBaseRef,
   entries,
   filterQuery,
+  headOid,
   isBranchVisible,
   isFolder,
-  isGitHistoryExpanded,
+  isGitHistoryNeeded,
   isMac,
   refreshActiveGitStatusAfterMutation,
   remoteActionError,
+  repositoryHuge,
   rightSidebarTab,
   sourceControlGroupOrder,
   sourceControlRef,
@@ -43,22 +47,26 @@ export function useSourceControlFileListing({
   worktreePath
 }: {
   activeRemoteActionSequence: number | null
-  activeRepoSettings: SourceControlWorktreeContext['activeRepoSettings']
+  activeRepoTarget: SourceControlWorktreeContext['activeRepoTarget']
   activeWorktreeId: string | null
   branchEntries: SourceControlWorktreeContext['branchEntries']
   branchName: string
   branchSummary: SourceControlWorktreeContext['branchSummary']
+  changeScope: SourceControlChangeScope
   collapsedSections: Set<string>
   collapsedTreeDirs: Set<string>
+  commitScopeFiles: SourceControlCommitScopeFiles | null
   compareBaseRef: string | null
   entries: SourceControlWorktreeContext['entries']
   filterQuery: string
+  headOid: string | null | undefined
   isBranchVisible: boolean
   isFolder: boolean
-  isGitHistoryExpanded: boolean
+  isGitHistoryNeeded: boolean
   isMac: boolean
   refreshActiveGitStatusAfterMutation: SourceControlStatusRefresh['refreshActiveGitStatusAfterMutation']
   remoteActionError: SourceControlActionError | null
+  repositoryHuge: SourceControlWorktreeContext['repositoryHuge']
   rightSidebarTab: SourceControlWorktreeContext['rightSidebarTab']
   sourceControlGroupOrder: SourceControlPanelViewState['sourceControlGroupOrder']
   sourceControlRef: SourceControlPanelViewState['sourceControlRef']
@@ -70,7 +78,7 @@ export function useSourceControlFileListing({
     useSourceControlSubmoduleStatus({
       activeWorktreeId,
       worktreePath,
-      activeRepoSettings,
+      activeRepoTarget,
       entries
     })
   const {
@@ -78,7 +86,6 @@ export function useSourceControlFileListing({
     fileFilterState,
     normalizedFilter,
     isGitHistoryVisible,
-    filteredGrouped,
     displaySections,
     unfilteredDisplaySectionsById,
     filteredBranchEntries,
@@ -89,6 +96,13 @@ export function useSourceControlFileListing({
   } = useSourceControlFileProjection({
     entries,
     branchEntries,
+    changeScopeKind: changeScope.kind,
+    commitScopeEntries:
+      changeScope.kind === 'commit' &&
+      commitScopeFiles?.status === 'ready' &&
+      commitScopeFiles.commitId === changeScope.commit.id
+        ? commitScopeFiles.entries
+        : null,
     filterQuery,
     sourceControlGroupOrder,
     activeWorktreeId,
@@ -100,25 +114,50 @@ export function useSourceControlFileListing({
     sourceControlViewMode,
     collapsedSections
   })
-  const { gitHistoryState, refreshGitHistory, refreshGitHistoryRef } = useSourceControlGitHistory({
-    activeRepoSettings,
-    activeWorktreeId,
-    worktreePath,
-    compareBaseRef,
-    isFolder,
-    isBranchVisible,
-    isGitHistoryExpanded,
-    isGitHistoryVisible,
-    worktreeMap
-  })
+  const { gitHistoryContextKey, gitHistoryState, refreshGitHistory, refreshGitHistoryRef } =
+    useSourceControlGitHistory({
+      activeRepoTarget,
+      activeWorktreeId,
+      worktreePath,
+      branchName,
+      compareBaseRef,
+      // Unknown while compare loads; null when it settled without a base OID.
+      compareBaseOid: !compareBaseRef
+        ? null
+        : !branchSummary || branchSummary.status === 'loading'
+          ? undefined
+          : (branchSummary.baseOid ?? null),
+      headOid,
+      isFolder,
+      isBranchVisible,
+      isGitHistoryNeeded,
+      isGitHistoryVisible,
+      worktreeMap
+    })
 
-  // Why: modifier-click keeps the current pane intact by opening the file in a fresh split to the right.
+  const visibleBranchRowKeys = useMemo(() => {
+    if (collapsedSections.has('branch') || changeScope.kind === 'commit') {
+      return []
+    }
+    return sourceControlViewMode === 'tree'
+      ? visibleBranchTreeRows.filter((node) => node.type === 'file').map((node) => node.key)
+      : filteredBranchEntries.map((entry) => `branch::${entry.path}`)
+  }, [
+    changeScope.kind,
+    collapsedSections,
+    sourceControlViewMode,
+    visibleBranchTreeRows,
+    filteredBranchEntries
+  ])
+
+  // Modifier-click opens a right split to preserve the current pane.
   const { resolveSplitTargetGroupId, activeOpenRowKeys, handleOpenDiff, openCommittedDiff } =
     useSourceControlRowOpening({
       isMac,
       activeWorktreeId,
       worktreePath,
       visibleSelectionEntries,
+      visibleBranchRowKeys,
       branchSummary
     })
 
@@ -134,12 +173,16 @@ export function useSourceControlFileListing({
       containerRef: sourceControlRef
     })
 
-  // clear selection on list/tree presentation change
   useEffect(() => {
     clearSelection()
   }, [sourceControlViewMode, clearSelection])
 
-  // Clear selection on worktree or tab change
+  // A scope can hide selected rows; bulk actions must never act on rows the user cannot see.
+  const scopeKey = changeScopeKey(changeScope)
+  useEffect(() => {
+    clearSelection()
+  }, [scopeKey, clearSelection])
+
   useEffect(() => {
     clearSelection()
   }, [activeWorktreeId, rightSidebarTab, clearSelection])
@@ -157,15 +200,18 @@ export function useSourceControlFileListing({
     handleBulkStage,
     handleBulkUnstage,
     handleStageAllPaths,
+    handleStageSectionPaths,
     handleUnstagePaths,
-    handleStageAllPrimary
+    handleStageAllPrimary,
+    handleStageWorktreeChanges
   } = useSourceControlBulkActions({
     selectedKeys,
     flatEntriesByKey,
-    activeRepoSettings,
+    activeRepoTarget,
     activeWorktreeId,
     worktreePath,
     grouped,
+    isStatusTruncated: repositoryHuge !== undefined,
     clearSelection,
     refreshActiveGitStatusAfterMutation
   })
@@ -200,8 +246,8 @@ export function useSourceControlFileListing({
     expandedSubmoduleKeys,
     fileFilterState,
     filteredBranchEntries,
-    filteredGrouped,
     flatEntriesByKey,
+    gitHistoryContextKey,
     gitHistoryState,
     grouped,
     handleBulkStage,
@@ -211,6 +257,8 @@ export function useSourceControlFileListing({
     handleSelect,
     handleStageAllPaths,
     handleStageAllPrimary,
+    handleStageSectionPaths,
+    handleStageWorktreeChanges,
     handleUnstagePaths,
     isExecutingBulk,
     isGitHistoryVisible,

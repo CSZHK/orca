@@ -1,21 +1,31 @@
-import { getRepoExecutionHostId, LOCAL_EXECUTION_HOST_ID } from '../../shared/execution-host'
-import { throwIfSignalAborted, waitForPromiseWithSignal } from '../../shared/abort-signal-reason'
-import { mapSettledWithConcurrency } from '../../shared/map-with-concurrency'
-import { parsePtySessionId } from '../../shared/pty-session-id-format'
-import { isFolderRepo } from '../../shared/repo-kind'
-import type { Repo } from '../../shared/repo-types'
-import { splitWorktreeId, worktreeIdComparisonKey } from '../../shared/worktree/id'
-import { getDaemonProvider } from '../daemon/daemon-init'
-import type { DaemonPtyAdapter } from '../daemon/daemon-pty-adapter'
-import type { DaemonPtyRouter } from '../daemon/daemon-pty-router'
-import type { DegradedDaemonPtyProvider } from '../daemon/degraded-daemon-pty-provider'
-import type { SessionInfo } from '../daemon/types'
+import {
+  getRepoExecutionHostId,
+  LOCAL_EXECUTION_HOST_ID
+} from '../../shared/execution-host/execution-host'
+import {
+  throwIfSignalAborted,
+  waitForPromiseWithSignal
+} from '../../shared/concurrency/abort-signal-reason'
+import { mapSettledWithConcurrency } from '../../shared/concurrency/map-with-concurrency'
+import { parsePtySessionId } from '../../shared/terminal/pty/lifecycle/pty-session-id-format'
+import { parsePaneKey } from '../../shared/workspace-layout/stable-pane-id'
+import { isFolderRepo } from '../../shared/repository/repo-kind'
+import type { Repo } from '../../shared/repository/repo-types'
+import { splitWorktreeId, worktreeIdentityKey } from '../../shared/worktree/id'
+import { getDaemonProvider } from '../daemon/providers/lifecycle/daemon-provider-state'
+import {
+  getAllDaemonAdapters,
+  type DaemonProvider
+} from '../daemon/providers/lifecycle/daemon-provider-routing'
+import type { SessionInfo } from '../daemon/protocol/daemon-session-info'
 import { isFolderWorkspaceIdForRepo } from '../ipc/worktrees/folder-workspace-model'
-import type { Store } from '../persistence'
+import type { Store } from '../persistence/loading-store/store'
 import { readAllWorktreeMetaForHost } from '../persistence/host-qualified-worktree-meta'
-import { getLocalProjectWorktreeGitOptions } from '../project-runtime-git-options'
-import { listLocalRepoWorktreesStrict } from '../repo-worktrees'
+import { getLocalProjectWorktreeGitOptions } from '../workspaces/execution-host/project-runtime-git-options'
+import { listLocalRepoWorktreesStrict } from '../workspaces/catalog/repo-worktrees'
 import { listRegisteredPtys, registerPty } from './pty-registry'
+import { getVerifiedLocalFolderWorkspaceKeys } from './verified-local-folder-workspaces'
+import { errorMessage } from '../../shared/errors/error-message'
 
 type HydrationStore = Store
 
@@ -29,7 +39,7 @@ type LocalRepoCatalog = {
   ownerCountById: Map<string, number>
 }
 
-// Why: matches existing local Git/read startup budgets while allowing for Defender-heavy repos.
+// Match local startup budgets while allowing for Defender-heavy repositories.
 export const LOCAL_PTY_REGISTRY_BOOT_HYDRATION_DEADLINE_MS = 5_000
 export const LOCAL_PTY_REGISTRY_GIT_ENUMERATION_CONCURRENCY = 4
 
@@ -59,10 +69,7 @@ export function hydrateLocalPtyRegistryAtBoot(store: HydrationStore): Promise<vo
       }
     })
     .catch((error) => {
-      console.warn(
-        '[memory] Boot-time pty-registry hydration failed:',
-        error instanceof Error ? error.message : String(error)
-      )
+      console.warn('[memory] Boot-time pty-registry hydration failed:', errorMessage(error))
     })
     .finally(() => {
       clearTimeout(deadline)
@@ -140,21 +147,19 @@ async function hydrateLocalPtyRegistry(
         complete = false
         console.warn(
           '[memory] Worktree enumeration failed during pty-registry hydration:',
-          result.reason instanceof Error ? result.reason.message : String(result.reason)
+          errorMessage(result.reason)
         )
         continue
       }
       const { repo, worktrees } = result.value
       for (const worktree of worktrees) {
         const worktreeId = `${repo.id}::${worktree.path}`
-        const key = worktreeIdComparisonKey(worktreeId)
-        if (key) {
-          const existing = liveGitWorktreeIdsByKey.get(key)
-          liveGitWorktreeIdsByKey.set(
-            key,
-            existing === undefined || existing === worktreeId ? worktreeId : null
-          )
-        }
+        const key = worktreeIdentityKey(worktreeId)
+        const existing = liveGitWorktreeIdsByKey.get(key)
+        liveGitWorktreeIdsByKey.set(
+          key,
+          existing === undefined || existing === worktreeId ? worktreeId : null
+        )
       }
     }
 
@@ -164,6 +169,11 @@ async function hydrateLocalPtyRegistry(
   }
 
   throwIfSignalAborted(signal)
+  const verifiedLocalFolderKeys = getVerifiedLocalFolderWorkspaceKeys({
+    folderWorkspaces: store.getFolderWorkspaces(),
+    projectGroups: store.getProjectGroups(),
+    repos: store.getRepos()
+  })
   for (const info of inventory.sessions) {
     throwIfSignalAborted(signal)
     if (alreadyRegistered.has(info.sessionId)) {
@@ -177,7 +187,10 @@ async function hydrateLocalPtyRegistry(
       ptyId: info.sessionId,
       worktreeId,
       sessionId: info.sessionId,
+      // Unmounted, so no pane owns it yet: pane-matching consumers keep seeing null.
       paneKey: null,
+      // Lets the Resource Manager name the row by its tab and classify it before the pane mounts.
+      ...(info.paneKey && parsePaneKey(info.paneKey) ? { restoredPaneKey: info.paneKey } : {}),
       pid:
         typeof info.pid === 'number' && Number.isFinite(info.pid) && info.pid > 0 ? info.pid : null
     })
@@ -185,11 +198,10 @@ async function hydrateLocalPtyRegistry(
   return complete
 
   function isVerifiedLocalWorktree(worktreeId: string): boolean {
-    if (verifiedFolderWorktreeIds.has(worktreeId)) {
+    if (verifiedLocalFolderKeys.has(worktreeId) || verifiedFolderWorktreeIds.has(worktreeId)) {
       return true
     }
-    const key = worktreeIdComparisonKey(worktreeId)
-    return key !== null && typeof liveGitWorktreeIdsByKey.get(key) === 'string'
+    return typeof liveGitWorktreeIdsByKey.get(worktreeIdentityKey(worktreeId)) === 'string'
   }
 }
 
@@ -239,15 +251,11 @@ function getVerifiedFolderWorktreeIds(
 }
 
 async function collectSessionInfos(
-  provider: DaemonPtyRouter | DaemonPtyAdapter | DegradedDaemonPtyProvider,
+  provider: DaemonProvider,
   signal: AbortSignal
 ): Promise<DaemonInventory> {
-  const adapters =
-    'getAllAdapters' in provider && typeof provider.getAllAdapters === 'function'
-      ? provider.getAllAdapters()
-      : [provider]
   const results = await Promise.all(
-    adapters.map(async (adapter) => {
+    getAllDaemonAdapters(provider).map(async (adapter) => {
       try {
         throwIfSignalAborted(signal)
         const sessions = await waitForPromiseWithSignal<SessionInfo[]>(
@@ -260,7 +268,7 @@ async function collectSessionInfos(
         throwIfSignalAborted(signal)
         console.warn(
           '[memory] listSessions failed for one adapter during hydration:',
-          error instanceof Error ? error.message : String(error)
+          errorMessage(error)
         )
         return { complete: false, sessions: [] }
       }

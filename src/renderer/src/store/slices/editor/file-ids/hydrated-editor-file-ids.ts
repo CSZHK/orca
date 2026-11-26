@@ -1,15 +1,11 @@
 import type { AppState } from '../../../types'
-import type { Tab, TabGroup } from '../../../../../../shared/tab-types'
-import type { PersistedOpenFile } from '../../../../../../shared/workspace-session-state-types'
-import { FLOATING_TERMINAL_WORKTREE_ID } from '../../../../../../shared/constants'
+import type { Tab, TabGroup } from '../../../../../../shared/workspace-layout/tab-groups/tab-types'
+import type { PersistedOpenFile } from '../../../../../../shared/workspace-session/workspace-session-state-types'
+import { FLOATING_TERMINAL_WORKTREE_ID } from '../../../../../../shared/workspace/identity/floating-workspace-id'
 import type { OpenFile } from '../types/open-file'
 import { isEditorTabContentType } from '../tabs/editor-tab-content-type'
-import {
-  buildOwnedEditorFileId,
-  isEditorFileIdOccupiedByOtherOwner,
-  isSameEditorOwner,
-  runtimeOwnerKey
-} from './editor-file-ids'
+import { buildOwnedEditorFileId, runtimeOwnerKey } from './editor-file-ids'
+import { recordDraft, tabBucketDraft } from '../../../record-transitions/keyed-record-transitions'
 
 export function shouldHydrateWithOwnedEditorFileId(
   worktreeId: string,
@@ -39,29 +35,58 @@ export type LegacyHydratedEditorFile = Pick<
   'id' | 'filePath' | 'worktreeId' | 'runtimeEnvironmentId' | 'markdownPreviewSourceFileId'
 >
 
-export function resolveLegacyHydratedEditorFileId(
-  files: readonly LegacyHydratedEditorFile[],
-  persistedFile: PersistedOpenFile,
-  worktreeId: string
-): string {
-  const existing = files.find(
-    (file) =>
-      file.filePath === persistedFile.filePath &&
-      isSameEditorOwner(file, worktreeId, persistedFile.runtimeEnvironmentId)
-  )
-  if (existing) {
-    return existing.id
+export class LegacyHydratedEditorFileIndex {
+  private readonly filesByPath = new Map<string, Map<string, string>>()
+  private readonly ownersById = new Map<string, Set<string>>()
+
+  private ownerKey(worktreeId: string, runtimeEnvironmentId: string | null | undefined): string {
+    return JSON.stringify([worktreeId, runtimeOwnerKey(runtimeEnvironmentId)])
   }
-  return files.some((file) =>
-    isEditorFileIdOccupiedByOtherOwner(
-      file,
-      persistedFile.filePath,
-      worktreeId,
-      persistedFile.runtimeEnvironmentId
+
+  hasOwner(file: PersistedOpenFile, worktreeId: string): boolean {
+    return (
+      this.filesByPath
+        .get(file.filePath)
+        ?.has(this.ownerKey(worktreeId, file.runtimeEnvironmentId)) ?? false
     )
-  )
-    ? buildOwnedEditorFileId(persistedFile.filePath, worktreeId, persistedFile.runtimeEnvironmentId)
-    : persistedFile.filePath
+  }
+
+  resolve(file: PersistedOpenFile, worktreeId: string): string {
+    const owner = this.ownerKey(worktreeId, file.runtimeEnvironmentId)
+    const existing = this.filesByPath.get(file.filePath)?.get(owner)
+    if (existing !== undefined) {
+      return existing
+    }
+    const occupied = this.ownersById.get(file.filePath)
+    return occupied && (occupied.size > 1 || !occupied.has(owner))
+      ? buildOwnedEditorFileId(file.filePath, worktreeId, file.runtimeEnvironmentId)
+      : file.filePath
+  }
+
+  add(file: LegacyHydratedEditorFile): void {
+    const owner = this.ownerKey(file.worktreeId, file.runtimeEnvironmentId)
+    let files = this.filesByPath.get(file.filePath)
+    if (!files) {
+      files = new Map()
+      this.filesByPath.set(file.filePath, files)
+    }
+    if (!files.has(owner)) {
+      files.set(owner, file.id)
+    }
+    this.addIdOwner(file.id, owner)
+    if (file.markdownPreviewSourceFileId !== undefined) {
+      this.addIdOwner(file.markdownPreviewSourceFileId, owner)
+    }
+  }
+
+  private addIdOwner(id: string, owner: string): void {
+    let owners = this.ownersById.get(id)
+    if (!owners) {
+      owners = new Set()
+      this.ownersById.set(id, owners)
+    }
+    owners.add(owner)
+  }
 }
 
 export function migrateEditorFileId(
@@ -105,9 +130,7 @@ export function migrateHydratedEditorTabsAndGroups(
   state: Pick<AppState, 'unifiedTabsByWorktree' | 'groupsByWorktree'>,
   migrationsByWorktree: Record<string, Map<string, string>>
 ): Partial<Pick<AppState, 'unifiedTabsByWorktree' | 'groupsByWorktree'>> {
-  let tabsChanged = false
-  let groupsChanged = false
-  const nextUnifiedTabsByWorktree: Record<string, Tab[]> = { ...state.unifiedTabsByWorktree }
+  const tabsDraft = tabBucketDraft<Tab>(state.unifiedTabsByWorktree)
   const tabIdMigrationsByWorktree: Record<string, Map<string, string>> = {}
 
   for (const [worktreeId, idMigrations] of Object.entries(migrationsByWorktree)) {
@@ -116,8 +139,9 @@ export function migrateHydratedEditorTabsAndGroups(
       continue
     }
     const tabIdMigrations = new Map<string, string>()
+    let bucketChanged = false
     const nextTabs = tabs.map((tab) => {
-      // Why: widened for the shared live-move rekey — a move retargets every editor-family tab (diff/conflict-review/check-details), not only plain 'editor'.
+      // Live-move rekey covers all editor-family tabs, including diff/conflict/check-details.
       if (!isEditorTabContentType(tab.contentType)) {
         return tab
       }
@@ -126,7 +150,7 @@ export function migrateHydratedEditorTabsAndGroups(
       if (nextId === tab.id && nextEntityId === tab.entityId) {
         return tab
       }
-      tabsChanged = true
+      bucketChanged = true
       if (nextId !== tab.id) {
         tabIdMigrations.set(tab.id, nextId)
       }
@@ -135,17 +159,20 @@ export function migrateHydratedEditorTabsAndGroups(
     if (tabIdMigrations.size > 0) {
       tabIdMigrationsByWorktree[worktreeId] = tabIdMigrations
     }
-    nextUnifiedTabsByWorktree[worktreeId] = nextTabs
+    if (bucketChanged) {
+      tabsDraft.set(worktreeId, nextTabs)
+    }
   }
 
-  const nextGroupsByWorktree: Record<string, TabGroup[]> = { ...state.groupsByWorktree }
+  const groupsDraft = recordDraft<TabGroup[]>(state.groupsByWorktree)
   for (const [worktreeId, tabIdMigrations] of Object.entries(tabIdMigrationsByWorktree)) {
     const groups = state.groupsByWorktree[worktreeId]
     if (!groups) {
       continue
     }
-    const validTabIds = new Set((nextUnifiedTabsByWorktree[worktreeId] ?? []).map((tab) => tab.id))
-    nextGroupsByWorktree[worktreeId] = groups.map((group) => {
+    const validTabIds = new Set((tabsDraft.get(worktreeId) ?? []).map((tab) => tab.id))
+    let bucketChanged = false
+    const nextGroups = groups.map((group) => {
       const tabOrder = dedupeEditorTabOrder(
         group.tabOrder.map((tabId) => tabIdMigrations.get(tabId) ?? tabId),
         validTabIds
@@ -167,7 +194,7 @@ export function migrateHydratedEditorTabsAndGroups(
       ) {
         return group
       }
-      groupsChanged = true
+      bucketChanged = true
       return {
         ...group,
         activeTabId: validActiveTabId,
@@ -175,10 +202,15 @@ export function migrateHydratedEditorTabsAndGroups(
         recentTabIds
       }
     })
+    if (bucketChanged) {
+      groupsDraft.set(worktreeId, nextGroups)
+    }
   }
 
+  const unifiedTabsByWorktree = tabsDraft.finish()
+  const groupsByWorktree = groupsDraft.finish()
   return {
-    ...(tabsChanged ? { unifiedTabsByWorktree: nextUnifiedTabsByWorktree } : {}),
-    ...(groupsChanged ? { groupsByWorktree: nextGroupsByWorktree } : {})
+    ...(unifiedTabsByWorktree !== state.unifiedTabsByWorktree ? { unifiedTabsByWorktree } : {}),
+    ...(groupsByWorktree !== state.groupsByWorktree ? { groupsByWorktree } : {})
   }
 }

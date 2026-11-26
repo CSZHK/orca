@@ -1,4 +1,5 @@
-import { normalizeProxyUrl } from '../../shared/network-proxy'
+import { normalizeProxyUrl } from '../../shared/network/network-proxy'
+import type { ProxySession } from './electron-default-proxy-session'
 
 export type ElectronProxyCredentials = {
   host: string
@@ -20,7 +21,7 @@ const DEFAULT_PROXY_PORTS: Record<string, number> = {
   'socks5:': 1080
 }
 
-let proxyCredentialsBySession = new WeakMap<object, ElectronProxyCredentials>()
+let proxyCredentialsBySession = new WeakMap<ProxySession, ElectronProxyCredentials>()
 
 function decodeProxyCredential(value: string): string {
   try {
@@ -64,7 +65,7 @@ export function haveSameElectronProxyCredentials(
 }
 
 export function setElectronProxyCredentialsForSession(
-  proxySession: object,
+  proxySession: ProxySession,
   credentials: ElectronProxyCredentials | null
 ): void {
   if (credentials) {
@@ -74,25 +75,33 @@ export function setElectronProxyCredentialsForSession(
   }
 }
 
-export function clearElectronProxyCredentialsForSession(proxySession: object): void {
+export function clearElectronProxyCredentialsForSession(proxySession: ProxySession): void {
   proxyCredentialsBySession.delete(proxySession)
 }
 
-export function resetElectronProxyCredentialsForTests(proxySession?: object): void {
-  if (proxySession) {
-    clearElectronProxyCredentialsForSession(proxySession)
-  } else {
-    proxyCredentialsBySession = new WeakMap()
-  }
+export function hasElectronProxyCredentialsForSession(proxySession: ProxySession): boolean {
+  return proxyCredentialsBySession.has(proxySession)
+}
+
+export function getElectronProxyCredentialsForChallenge(
+  proxySession: ProxySession,
+  authInfo: { isProxy: boolean; host: string; port: number }
+): ElectronProxyCredentials | null {
+  const credentials = proxyCredentialsBySession.get(proxySession)
+  return authInfo.isProxy &&
+    credentials?.host === normalizeProxyHost(authInfo.host) &&
+    credentials.port === authInfo.port
+    ? credentials
+    : null
 }
 
 export function handleElectronProxyLogin(
   event: { preventDefault(): void },
-  webContents: { session: object } | null,
+  webContents: { session: ProxySession } | null,
   _authenticationResponseDetails: unknown,
   authInfo: { isProxy: boolean; host: string; port: number; scheme?: string; realm?: string },
   callback: (username?: string, password?: string) => void,
-  defaultProxySession?: object
+  defaultProxySession?: ProxySession
 ): void {
   if (!authInfo.isProxy) {
     return
@@ -101,12 +110,8 @@ export function handleElectronProxyLogin(
   if (!proxySession) {
     return
   }
-  const credentials = proxyCredentialsBySession.get(proxySession)
-  if (
-    !credentials ||
-    credentials.host !== normalizeProxyHost(authInfo.host) ||
-    credentials.port !== authInfo.port
-  ) {
+  const credentials = getElectronProxyCredentialsForChallenge(proxySession, authInfo)
+  if (!credentials) {
     return
   }
   event.preventDefault()

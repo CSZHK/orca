@@ -1,12 +1,15 @@
 import type {
   WorkerTerminalResourceRow,
   WorkerTerminalOwnershipState
-} from '../../worker-terminal-ownership'
+} from '../../terminal-authority/release/worker-terminal-ownership'
+import { WORKER_SETTLED_STATES } from '../../terminal-authority/release/worker-terminal-ownership'
 import { OrchestrationError } from '../../orchestration-error'
 import { generateId } from '../generated-id'
-import type { OrchestrationDb } from '../orchestration-db'
+import type { OrchestrationDb, OrchestrationDbConnection } from '../orchestration-db'
+import { WORKER_TERMINAL_RESOURCE_COLUMN_LIST } from '../row-column-lists'
+import { formerlyOwnedResourceIdSql } from './worker-terminal-prior-owner-index'
 
-// --- Worker terminal resources (schema v23) ---------------------------------------------------
+// Pre-v23 input and reuse cannot be proven; historical terminals remain external.
 
 // Historical renderer input and reuse cannot be proven, so pre-v23 terminals stay external.
 export function backfillWorkerTerminalResources(this: OrchestrationDb): void {
@@ -60,6 +63,8 @@ export function createWorkerTerminalResourceStatement(
     terminalHandle: string
     paneKey: string | null
     processIncarnation: string | null
+    endpointId?: string | null
+    endpointIncarnation?: string | null
     hostScope?: string | null
     ownership: Extract<WorkerTerminalOwnershipState, 'owned' | 'external'>
   }
@@ -69,9 +74,9 @@ export function createWorkerTerminalResourceStatement(
     .prepare(
       `INSERT INTO worker_terminal_resources (
          id, origin_dispatch_id, owner_dispatch_id, worktree_id, terminal_handle,
-         pane_key, process_incarnation, host_scope, ownership_state, release_state,
+         pane_key, process_incarnation, endpoint_id, endpoint_incarnation, host_scope, ownership_state, release_state,
          retained_reason
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'not_requested', ?)`
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'not_requested', ?)`
     )
     .run(
       id,
@@ -81,6 +86,8 @@ export function createWorkerTerminalResourceStatement(
       params.terminalHandle,
       params.paneKey,
       params.processIncarnation,
+      params.endpointId ?? null,
+      params.endpointIncarnation ?? params.processIncarnation,
       params.hostScope ?? null,
       params.ownership,
       params.ownership === 'external' ? 'external_terminal' : null
@@ -101,26 +108,80 @@ export function getWorkerTerminalResourceByOwner(
   this: OrchestrationDb,
   dispatchId: string
 ): WorkerTerminalResourceRow | undefined {
+  // Explicit projection so SyncDatabase caches this per-lineage-step statement; `SELECT *` never is.
+  // oxlint-disable-next-line typescript/consistent-type-assertions -- SAFETY: the column list names every column of the row type, and a missing one fails compilation.
   return this.db
-    .prepare('SELECT * FROM worker_terminal_resources WHERE owner_dispatch_id = ?')
+    .prepare(
+      `SELECT ${WORKER_TERMINAL_RESOURCE_COLUMN_LIST} FROM worker_terminal_resources WHERE owner_dispatch_id = ?`
+    )
     .get(dispatchId) as WorkerTerminalResourceRow | undefined
+}
+
+export function getWorkerTerminalResourceByHandle(
+  this: OrchestrationDb,
+  terminalHandle: string
+): WorkerTerminalResourceRow | undefined {
+  return this.db
+    .prepare(
+      `SELECT * FROM worker_terminal_resources
+        WHERE terminal_handle = ? ORDER BY updated_at DESC LIMIT 1`
+    )
+    .get(terminalHandle) as WorkerTerminalResourceRow | undefined
+}
+
+export function getWorkerTerminalResourceByProcessIncarnation(
+  this: OrchestrationDbConnection,
+  processIncarnation: string
+): WorkerTerminalResourceRow | undefined {
+  // An explicit projection, so SyncDatabase keeps this hot statement compiled; `SELECT *` is never cached.
+  const row = this.db
+    .prepare(
+      `SELECT ${WORKER_TERMINAL_RESOURCE_COLUMN_LIST} FROM worker_terminal_resources
+        WHERE process_incarnation = ? ORDER BY updated_at DESC LIMIT 1`
+    )
+    .get(processIncarnation)
+  // oxlint-disable-next-line typescript/consistent-type-assertions -- SAFETY: the column list is checked against WorkerTerminalResourceRow, and projected-row-getters.test.ts verifies the returned row.
+  return row as WorkerTerminalResourceRow | undefined
 }
 
 export function getWorkerTerminalResourceFormerlyOwnedBy(
   this: OrchestrationDb,
   dispatchId: string
 ): WorkerTerminalResourceRow | undefined {
-  return this.db
+  const row = this.db
     .prepare(
-      `SELECT * FROM worker_terminal_resources
-        WHERE prior_owner_dispatch_ids LIKE ?
-        ORDER BY updated_at DESC LIMIT 1`
+      `SELECT ${WORKER_TERMINAL_RESOURCE_COLUMN_LIST} FROM worker_terminal_resources
+        WHERE id = ${formerlyOwnedResourceIdSql('?')}`
     )
-    .get(`%"${dispatchId}"%`) as WorkerTerminalResourceRow | undefined
+    .get(dispatchId)
+  // oxlint-disable-next-line typescript/consistent-type-assertions -- SAFETY: the column list names every column of the row type, and a missing one fails compilation.
+  return row as WorkerTerminalResourceRow | undefined
 }
 
-// Reusable exact settled terminal: transfers cleanup ownership to the new Dispatch and fences
-// release through the old owner. No transaction: composes inside the authority transaction.
+/**
+ * Records bounded recovery bookkeeping without changing ownership or release intent. `owner`, when given,
+ * charges the attempt only to that dispatch's custody: a row transferred meanwhile is left alone.
+ */
+export function recordWorkerTerminalRecoveryAttempt(
+  this: OrchestrationDb,
+  resourceId: string,
+  owner?: string
+): WorkerTerminalResourceRow | undefined {
+  this.db
+    .prepare(
+      `UPDATE worker_terminal_resources
+          SET recovery_attempt_count = MIN(recovery_attempt_count + 1, 32),
+              last_recovery_at = datetime('now'), updated_at = datetime('now')
+        WHERE id = ? AND (? IS NULL OR owner_dispatch_id = ?)`
+    )
+    .run(resourceId, owner ?? null, owner ?? null)
+  return this.getWorkerTerminalResource(resourceId)
+}
+
+const KEPT_OPEN_SQL =
+  "release_state = 'retained' AND retained_reason IN ('user_kept', 'user_requested')"
+
+// Transfer an exact settled resource and fence the prior owner; caller owns the transaction.
 export function transferWorkerTerminalResourceStatement(
   this: OrchestrationDb,
   params: {
@@ -129,6 +190,8 @@ export function transferWorkerTerminalResourceStatement(
     terminalHandle: string
     paneKey: string
     processIncarnation: string
+    endpointId?: string | null
+    endpointIncarnation?: string | null
     hostScope: string | null
   }
 ): WorkerTerminalResourceRow {
@@ -141,12 +204,19 @@ export function transferWorkerTerminalResourceStatement(
   }
   const priorOwners = JSON.parse(resource.prior_owner_dispatch_ids) as string[]
   priorOwners.push(resource.owner_dispatch_id)
+  // Keep open, from the user or the coordinator, belongs to the worker until it is released.
   this.db
     .prepare(
       `UPDATE worker_terminal_resources
-       SET owner_dispatch_id = ?, prior_owner_dispatch_ids = ?, release_state = 'not_requested',
-           retained_reason = NULL, release_requested_at = NULL, release_completed_at = NULL,
-           release_error = NULL, terminal_handle = ?, pane_key = ?, process_incarnation = ?,
+       SET owner_dispatch_id = ?, prior_owner_dispatch_ids = ?,
+           release_state = CASE WHEN ${KEPT_OPEN_SQL}
+             THEN release_state ELSE 'not_requested' END,
+           retained_reason = CASE WHEN ${KEPT_OPEN_SQL}
+             THEN retained_reason END,
+           release_requested_at = NULL, release_completed_at = NULL,
+           release_error = NULL, auto_release_at = NULL, auto_release_dispatch_id = NULL,
+           terminal_handle = ?, pane_key = ?, process_incarnation = ?,
+           endpoint_id = COALESCE(?, endpoint_id), endpoint_incarnation = ?,
            host_scope = ?, updated_at = datetime('now')
        WHERE id = ? AND ownership_state = 'owned'`
     )
@@ -156,30 +226,86 @@ export function transferWorkerTerminalResourceStatement(
       params.terminalHandle,
       params.paneKey,
       params.processIncarnation,
+      params.endpointId ?? null,
+      params.endpointIncarnation ?? params.processIncarnation,
       params.hostScope,
       params.resourceId
     )
   return this.getWorkerTerminalResource(params.resourceId) as WorkerTerminalResourceRow
 }
 
-// Finds an owned, settled, exact-match resource for an explicitly reused terminal.
+// A new process in the same pane is ordinary user work, not the settled Dispatch's resource.
+export function retainReplacedWorkerTerminalResources(
+  this: OrchestrationDb,
+  params: { paneKey: string; worktreeId: string; hostScope: string; processIncarnation: string }
+): number {
+  return Number(
+    this.db
+      .prepare(
+        `UPDATE worker_terminal_resources
+          SET release_state = 'retained', retained_reason = 'identity_unproven',
+              updated_at = datetime('now')
+        WHERE pane_key = ? AND worktree_id = ? AND host_scope = ?
+          AND process_incarnation IS NOT NULL AND process_incarnation != ?
+          AND ownership_state = 'owned' AND release_state = 'not_requested'
+          AND EXISTS (
+            SELECT 1 FROM worker_dispatches w
+             WHERE w.dispatch_id = worker_terminal_resources.owner_dispatch_id
+               AND w.state IN (${WORKER_SETTLED_STATES.map(() => '?').join(', ')})
+          )`
+      )
+      .run(
+        params.paneKey,
+        params.worktreeId,
+        params.hostScope,
+        params.processIncarnation,
+        ...WORKER_SETTLED_STATES
+      ).changes
+  )
+}
+
+/** A detached pane keeps its process, so the resources it owns follow its new pane key. */
+export function rekeyWorkerTerminalResourcePaneKey(
+  this: OrchestrationDb,
+  params: { fromPaneKey: string; toPaneKey: string }
+): number {
+  return Number(
+    this.db
+      .prepare(
+        `UPDATE worker_terminal_resources
+            SET pane_key = ?, updated_at = datetime('now')
+          WHERE pane_key = ? AND release_state != 'released'`
+      )
+      .run(params.toPaneKey, params.fromPaneKey).changes
+  )
+}
 
 export type WorkerTerminalResourceStoreMethods = {
+  retainReplacedWorkerTerminalResources: typeof retainReplacedWorkerTerminalResources
+  rekeyWorkerTerminalResourcePaneKey: typeof rekeyWorkerTerminalResourcePaneKey
   backfillWorkerTerminalResources: typeof backfillWorkerTerminalResources
   createWorkerTerminalResourceStatement: typeof createWorkerTerminalResourceStatement
   getWorkerTerminalResource: typeof getWorkerTerminalResource
+  getWorkerTerminalResourceByHandle: typeof getWorkerTerminalResourceByHandle
+  getWorkerTerminalResourceByProcessIncarnation: typeof getWorkerTerminalResourceByProcessIncarnation
   getWorkerTerminalResourceByOwner: typeof getWorkerTerminalResourceByOwner
   getWorkerTerminalResourceFormerlyOwnedBy: typeof getWorkerTerminalResourceFormerlyOwnedBy
+  recordWorkerTerminalRecoveryAttempt: typeof recordWorkerTerminalRecoveryAttempt
   transferWorkerTerminalResourceStatement: typeof transferWorkerTerminalResourceStatement
 }
 
 export function attachWorkerTerminalResourceStore(ctor: { prototype: object }): void {
   Object.assign(ctor.prototype, {
+    retainReplacedWorkerTerminalResources,
+    rekeyWorkerTerminalResourcePaneKey,
     backfillWorkerTerminalResources,
     createWorkerTerminalResourceStatement,
     getWorkerTerminalResource,
+    getWorkerTerminalResourceByHandle,
+    getWorkerTerminalResourceByProcessIncarnation,
     getWorkerTerminalResourceByOwner,
     getWorkerTerminalResourceFormerlyOwnedBy,
+    recordWorkerTerminalRecoveryAttempt,
     transferWorkerTerminalResourceStatement
   })
 }

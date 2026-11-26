@@ -1,21 +1,33 @@
 import type { UISlice, UISliceGet, UISliceSet } from './ui-slice-contract'
+import { reconcileRetainedUpdateTarget } from './retained-update-target'
 import {
   DEFAULT_BROWSER_PAGE_ZOOM_LEVEL,
   normalizeBrowserPageZoomLevel
-} from '../../../../../shared/browser-page-zoom'
-import { normalizeKagiSessionLink } from '../../../../../shared/browser-url'
+} from '../../../../../shared/browser/site-settings/browser-page-zoom'
+import { normalizeKagiSessionLink } from '../../../../../shared/browser/navigation/browser-url'
+import { DEFAULT_BROWSER_DEVTOOLS_DOCK_LAYOUT } from '../../../../../shared/browser/devtools/browser-devtools-dock'
+import {
+  DEFAULT_BROWSER_EXTENSION_SIDE_PANEL_WIDTH,
+  normalizeBrowserExtensionSidePanelWidth
+} from '../../../../../shared/browser/extensions/browser-extension-side-panel-types'
 export function createUiUpdateActions(set: UISliceSet, get: UISliceGet): Partial<UISlice> {
   return {
     updateStatus: { state: 'idle' },
+    retainedUpdateTarget: null,
     setUpdateStatus: (status) => {
-      const prevState = get().updateStatus.state
+      const { updateStatus: previousStatus, retainedUpdateTarget, updateUserInitiatedCycle } = get()
       const update: Partial<
         Pick<
           UISlice,
-          'updateStatus' | 'updateChangelog' | 'updateCardCollapsed' | 'updateUserInitiatedCycle'
+          | 'updateStatus'
+          | 'retainedUpdateTarget'
+          | 'updateChangelog'
+          | 'updateCardCollapsed'
+          | 'updateUserInitiatedCycle'
         >
       > = {
-        updateStatus: status
+        updateStatus: status,
+        retainedUpdateTarget: reconcileRetainedUpdateTarget(retainedUpdateTarget, status)
       }
       if (status.state === 'checking') {
         update.updateUserInitiatedCycle = status.userInitiated === true
@@ -34,15 +46,48 @@ export function createUiUpdateActions(set: UISliceSet, get: UISliceGet): Partial
         update.updateChangelog = null
       }
       // 'downloading'/'downloaded'/'error': leave updateChangelog untouched to keep the original 'available' content.
-      if (status.state !== prevState) {
-        // Why: re-surface the card on each phase transition so a collapsed `downloading` doesn't bury `downloaded`/`error`.
-        update.updateCardCollapsed = false
+      const errorBecameActionable =
+        status.state === 'error' &&
+        previousStatus.state === 'error' &&
+        ((status.userInitiated === true && !previousStatus.userInitiated) ||
+          (status.version !== undefined && previousStatus.version === undefined) ||
+          (status.recovery?.kind === 'linux-package-install' &&
+            previousStatus.recovery?.kind !== 'linux-package-install'))
+      const installStateChanged =
+        status.state === 'downloaded' &&
+        previousStatus.state === 'downloaded' &&
+        Boolean(status.installing) !== Boolean(previousStatus.installing)
+      if (status.state !== previousStatus.state || errorBecameActionable || installStateChanged) {
+        // Quiet check failures start collapsed so the status bar can still disclose them.
+        update.updateCardCollapsed =
+          (status.automaticDownload === true &&
+            (status.state === 'downloading' ||
+              (status.state === 'downloaded' && status.installing === true) ||
+              (status.state === 'error' && status.retryAction !== 'install'))) ||
+          (status.state === 'error' &&
+            !status.userInitiated &&
+            !updateUserInitiatedCycle &&
+            status.version === undefined &&
+            status.recovery?.kind !== 'linux-package-install' &&
+            !('version' in previousStatus && previousStatus.version !== undefined))
       }
       set(update)
     },
     updateChangelog: null,
     updateUserInitiatedCycle: false,
     dismissedUpdateVersion: null,
+    dismissedUnexpectedSignoutVersion: null,
+    unexpectedSignoutDismissedVersions: [],
+    dismissUnexpectedSignoutCard: (version) => {
+      if (get().unexpectedSignoutDismissedVersions.includes(version)) {
+        return
+      }
+      set({
+        dismissedUnexpectedSignoutVersion: version,
+        unexpectedSignoutDismissedVersions: [...get().unexpectedSignoutDismissedVersions, version]
+      })
+      void window.api.ui.set({ dismissedUnexpectedSignoutVersion: version }).catch(console.error)
+    },
     clearDismissedUpdateVersion: () => {
       set({ dismissedUpdateVersion: null })
     },
@@ -75,10 +120,16 @@ export function createUiUpdateActions(set: UISliceSet, get: UISliceGet): Partial
       void window.api.ui.set({ updateReassuranceSeen: true }).catch(console.error)
       set({ updateReassuranceSeen: true })
     },
+    seenMacosUpdateRequirement: null,
+    markMacosUpdateRequirementSeen: (minimumMacosVersion) => {
+      void window.api.ui
+        .set({ seenMacosUpdateRequirement: minimumMacosVersion })
+        .catch(console.error)
+      set({ seenMacosUpdateRequirement: minimumMacosVersion })
+    },
     osc52ClipboardDefaultOnNoticePending: false,
     clearOsc52ClipboardDefaultOnNotice: () => {
-      // Why clear locally first: a failed persist must not re-toast this session. It will
-      // re-arm on the next launch, which is the safe direction for a one-shot notice.
+      // Clear locally before persisting to prevent repeat toasts on failure; next launch may re-arm the notice.
       set({ osc52ClipboardDefaultOnNoticePending: false })
       void window.api.ui.set({ osc52ClipboardDefaultOnNoticePending: false }).catch(console.error)
     },
@@ -105,6 +156,17 @@ export function createUiUpdateActions(set: UISliceSet, get: UISliceGet): Partial
       const normalized = link ? normalizeKagiSessionLink(link) : null
       void window.api.ui.set({ browserKagiSessionLink: normalized }).catch(console.error)
       set({ browserKagiSessionLink: normalized })
+    },
+    browserDevToolsDock: DEFAULT_BROWSER_DEVTOOLS_DOCK_LAYOUT,
+    setBrowserDevToolsDock: (layout) => {
+      void window.api.ui.set({ browserDevToolsDock: layout }).catch(console.error)
+      set({ browserDevToolsDock: layout })
+    },
+    browserExtensionSidePanelWidth: DEFAULT_BROWSER_EXTENSION_SIDE_PANEL_WIDTH,
+    setBrowserExtensionSidePanelWidth: (width) => {
+      const normalized = normalizeBrowserExtensionSidePanelWidth(width)
+      void window.api.ui.set({ browserExtensionSidePanelWidth: normalized }).catch(console.error)
+      set({ browserExtensionSidePanelWidth: normalized })
     }
   }
 }

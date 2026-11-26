@@ -1,3 +1,4 @@
+import { highestUsageKey } from '../usage/rollups/highest-usage-key'
 import type {
   OpenCodeUsageBreakdownKind,
   OpenCodeUsageBreakdownRow,
@@ -6,7 +7,7 @@ import type {
   OpenCodeUsageScope,
   OpenCodeUsageSessionRow,
   OpenCodeUsageSummary
-} from '../../shared/opencode-usage-types'
+} from '../../shared/agent-usage/analytics/opencode-usage-types'
 import type { OpenCodeUsageDailyAggregate, OpenCodeUsageSession } from './types'
 
 function addCost(left: number | null, right: number | null): number | null {
@@ -47,9 +48,8 @@ export function buildOpenCodeUsageSummary(
     byProject.set(row.projectLabel, (byProject.get(row.projectLabel) ?? 0) + row.totalTokens)
   }
 
-  const topModel = [...byModel.entries()].sort((left, right) => right[1] - left[1])[0]?.[0] ?? null
-  const topProject =
-    [...byProject.entries()].sort((left, right) => right[1] - left[1])[0]?.[0] ?? null
+  const topModel = highestUsageKey(byModel)
+  const topProject = highestUsageKey(byProject)
 
   return {
     scope,

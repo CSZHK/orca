@@ -1,42 +1,78 @@
-import type { MobileConnectionPath } from '../transport/stable-logical-rpc-client'
+import type { RelayHostReachability } from '../transport/relay/relay-host-reachability'
+import type { MobileConnectionPath } from '../transport/connection/stable-logical-rpc-client'
+import {
+  classifyConnection,
+  isConnectionDialing,
+  type ConnectionVerdict
+} from '../transport/connection/connection-health'
+import type { ConnectionState } from '../transport/connection/connection-state'
+import { resolveHomeHostConnectionState } from '../transport/hosts/home-host-auto-connect'
 
 export type HomeHostConnectionProjectionEntry = {
   hostId: string
   path: MobileConnectionPath
   pendingPath: MobileConnectionPath | null
   pairingRejected: boolean
-  hostSignedOut: boolean
+  relayHostReachability: RelayHostReachability
 }
 
-export type HomeHostConnectionProjection = {
-  hostPaths: Record<string, MobileConnectionPath>
-  hostPendingPaths: Record<string, MobileConnectionPath | null>
-  hostPairingRejected: Record<string, boolean>
-  hostSignedOut: Record<string, boolean>
-}
+export type HomeHostConnections = Record<string, HomeHostConnectionProjectionEntry>
 
-/** Build all host lookup maps while reading each connection entry once. */
 export function projectHomeHostConnections(
   entries: readonly HomeHostConnectionProjectionEntry[]
-): HomeHostConnectionProjection {
-  // Null-prototype records avoid the __proto__ setter; restore the usual prototype for parity
-  // with Object.fromEntries once the projection is complete.
-  const hostPaths = Object.create(null) as Record<string, MobileConnectionPath>
-  const hostPendingPaths = Object.create(null) as Record<string, MobileConnectionPath | null>
-  const hostPairingRejected = Object.create(null) as Record<string, boolean>
-  const hostSignedOut = Object.create(null) as Record<string, boolean>
-
-  for (const { hostId, path, pendingPath, pairingRejected, hostSignedOut: signedOut } of entries) {
-    hostPaths[hostId] = path
-    hostPendingPaths[hostId] = pendingPath
-    hostPairingRejected[hostId] = pairingRejected
-    hostSignedOut[hostId] = signedOut
+): HomeHostConnections {
+  // Why: a host named `__proto__` must land as an own key, not mutate the prototype.
+  const byHostId: HomeHostConnections = Object.create(null)
+  for (const entry of entries) {
+    byHostId[entry.hostId] = entry
   }
+  Object.setPrototypeOf(byHostId, Object.prototype)
+  return byHostId
+}
 
-  Object.setPrototypeOf(hostPaths, Object.prototype)
-  Object.setPrototypeOf(hostPendingPaths, Object.prototype)
-  Object.setPrototypeOf(hostPairingRejected, Object.prototype)
-  Object.setPrototypeOf(hostSignedOut, Object.prototype)
+export type HomeHostConnectionInputs = {
+  autoConnectHostIds: readonly string[]
+  hostAttempts: Readonly<Record<string, number>>
+  hostConnections: HomeHostConnections
+  hostLastConnected: Readonly<Record<string, number | null>>
+  hostStates: Readonly<Record<string, ConnectionState>>
+}
 
-  return { hostPaths, hostPendingPaths, hostPairingRejected, hostSignedOut }
+/** A paired desktop's connection as its Home row shows it. */
+export function classifyHomeHostConnection(
+  host: { id: string; name: string; endpoint: string },
+  inputs: HomeHostConnectionInputs,
+  nowMs?: number
+): { state: ConnectionState; verdict: ConnectionVerdict } {
+  const state = resolveHomeHostConnectionState(
+    host.id,
+    inputs.hostStates[host.id],
+    inputs.autoConnectHostIds
+  )
+  const connection = inputs.hostConnections[host.id]
+  const verdict = classifyConnection({
+    state,
+    reconnectAttempts: inputs.hostAttempts[host.id] ?? 0,
+    lastConnectedAt: inputs.hostLastConnected[host.id] ?? null,
+    endpoint: host.endpoint,
+    pendingPath: connection?.pendingPath ?? null,
+    pairingRejected: connection?.pairingRejected ?? false,
+    relayHostReachability: connection?.relayHostReachability ?? 'connecting',
+    hostName: host.name,
+    nowMs
+  })
+  return { state, verdict }
+}
+
+/** Paired desktops that answer nothing until something changes: not connected and not dialing, as
+ *  their Home rows say (Disconnected, Can't connect, Can't reach, re-pair). */
+export function homeUnreachableHostIds(
+  hosts: readonly { id: string; name: string; endpoint: string }[],
+  inputs: HomeHostConnectionInputs,
+  nowMs: number
+): string[] {
+  return hosts.flatMap((host) => {
+    const { state, verdict } = classifyHomeHostConnection(host, inputs, nowMs)
+    return state !== 'connected' && !isConnectionDialing(verdict) ? [host.id] : []
+  })
 }

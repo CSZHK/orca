@@ -1,32 +1,29 @@
 ---
 name: orca-emulator
-description: >
-  Control a mobile (iOS) emulator / simulator stream from inside Orca using the `orca` CLI.
-  Use for taps, gestures, typing, hardware buttons, camera injection, permissions, accessibility tree, and more — all while seeing the live view in Orca's emulator pane.
-  Prefer this over raw `npx serve-sim` or direct simctl when running agents inside Orca (the orca surface handles device scoping, helper lifecycle, and worktree context).
-  Complements the orca-cli skill for terminals, worktrees, and the built-in browser.
+description: >-
+  iOS Simulator control from inside Orca, with the live device view in Orca's
+  emulator pane. Use when driving a booted Apple Simulator on macOS: taps,
+  gestures, typing, hardware buttons, rotation, and the accessibility tree, or
+  when an iOS change needs simulator evidence. For an Android device or emulator
+  use the Android emulator skill; build and install the app with xcodebuild or
+  simctl first.
 license: Apache-2.0
 ---
 
 # Orca Emulator
 
-This file is a discovery stub, not the usage guide. The full, version-matched Orca emulator
-reference is served by the `orca` binary itself — kept out of this file on purpose so it can
-never drift from the binary that will actually run your commands.
+This discovery stub loads the version-matched guide from the Orca executable used for this session.
 
-Engage Orca whenever you drive a mobile (iOS) emulator / simulator stream from inside the
-Orca app: taps, gestures, typing, hardware buttons, camera injection, runtime permissions,
-the accessibility tree, and more — all while the live view stays in Orca's emulator pane.
-Prefer this over raw `serve-sim` or direct `simctl` when running agents inside Orca, which
-handles device scoping, helper lifecycle, and worktree context for you. It complements the
-orca-cli skill for terminals, worktrees, and the built-in browser.
+Prefer Orca over raw `serve-sim` or direct `simctl` for simulator control inside Orca; it
+handles device scoping, helper lifecycle, and worktree context.
 
 ## Resolve the CLI for this session
 
 Choose the executable once and reuse it for every later command:
 
-- If the `ORCA_CLI_COMMAND` environment variable is set, use its value. Orca exports this
-  for managed WSL sessions.
+- If the `ORCA_CLI_COMMAND` environment variable is set, use its value. Orca exports it
+  in sessions it starts when it knows their executable, such as WSL terminals and agent
+  chats.
 - Otherwise, in a dev checkout whose session exposes `ORCA_DEV_REPO_ROOT`, use `orca-dev`.
 - Otherwise, on Linux outside an Orca-managed terminal, use `orca-ide`. Never run bare
   `orca` there — outside Orca's terminals it normally resolves to the
@@ -38,36 +35,27 @@ running anything; do not create a shell variable or run `ORCA` literally. This w
 same way in POSIX shells, PowerShell, and cmd.exe.
 
 If the selected executable cannot run, report its exact error and stop. Do not fall through
-to another executable, which could silently target a different Orca build.
+to another executable, which could silently target a different Orca build. Exception: on
+Windows, when `ORCA_CLI_COMMAND` or `ORCA_TERMINAL_HANDLE` is set (Orca supplied the
+executable), a sandboxed shell that reports it as not recognized or access denied before
+Orca itself runs cannot read Orca's install. Re-run that command, and later Orca commands,
+with escalated permissions before giving up.
 
-## Load the full guide before running Orca commands
+## Load the version-matched guide before running Orca commands
 
 ```text
 ORCA skills get orca-emulator
 ```
 
-That prints the complete, version-matched guide for the exact binary that will handle your
-next commands — booting devices, taps and gestures, typing, hardware buttons, camera
-injection, permissions, and the accessibility tree. Read it first, then run the specific
-command you need.
-
-Don't guess subcommands or flags from memory or from a cached copy of this stub. They
-change between Orca releases, and this file deliberately no longer lists them. Confirm the
-app is up with `ORCA status --json` (start it with `ORCA open --json` if needed), and
-prefer `--json` for agent-driven calls.
-
-## If an older Orca does not recognize `skills get`
-
-Use this fallback only when the selected binary explicitly reports that `skills get` is an
-unknown command. Another failure is not proof of an older binary; report it rather than
-guessing or changing executables. For a confirmed pre-guide binary, use only this bounded,
-read-only bootstrap to orient. Do not dead-end and do not invent commands:
-
-```text
-ORCA status --json
-ORCA emulator list --json
-```
-
-Then tell the user that updating Orca restores the full, version-matched guide via
-`ORCA skills get orca-emulator`. Beyond these commands, ask the user rather than guessing a
-command surface this older binary may not support.
+Prefer `--json`. Use the selected executable's `--help` for commands or flags the guide does
+not cover. A `runtime_unavailable` error is usually transient while Orca is busy or
+restarting: wait a few seconds and retry the command. Before retrying a command that changes
+something, check whether it already took effect, and reuse any request ID the error names.
+`ORCA open` can bring Orca's window to the front over the user's work, so never run it to
+retry a failed command. Run it only when the user asks, or when Orca is really not running:
+`ORCA status --json` reports `result.app.running: false`, or every command, `ORCA status`
+included, still cannot connect after about 30 seconds of retries. If a command fails with
+`runtime_access_denied`, your sandbox blocked the connection: re-run it with escalated
+permissions, and do not run `ORCA open` or restart Orca. If `skills get` is unknown, explain
+that updating Orca restores the guide; use `--help` for read-only discovery and do not guess
+unsupported commands.

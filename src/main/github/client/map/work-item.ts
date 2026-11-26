@@ -1,6 +1,7 @@
-import type { OwnerRepo } from '../../gh-utils'
+import type { GitHubRepositoryIdentity as OwnerRepo } from '../../../../shared/github/repositories/repository-identity'
 import {
   authorFieldsFromUnknown,
+  createdAtFromUnknown,
   extractHeadOwnerLogin,
   usersFromUnknown,
   latestReviewsFromUnknown,
@@ -29,7 +30,9 @@ export function mapIssueWorkItem(item: Record<string, unknown>): MainWorkItem {
           .filter(Boolean)
       : [],
     updatedAt: String(item.updated_at ?? item.updatedAt ?? ''),
+    ...createdAtFromUnknown(item),
     ...authorFieldsFromUnknown(item),
+    ...(typeof item.comments === 'number' ? { commentCount: item.comments } : {}),
     ...(item.assignees !== undefined ? { assignees: usersFromUnknown(item.assignees) } : {})
   }
 }
@@ -38,9 +41,8 @@ export function mapPullRequestWorkItem(
   item: Record<string, unknown>,
   baseOwnerRepo: OwnerRepo | null = null
 ): MainWorkItem {
-  // Why: fork PRs are disabled in the Start-from picker; compare head owner to the selected repo's owner.
   const headOwnerLogin = extractHeadOwnerLogin(item)
-  // Why: leave isCrossRepository undefined when the head owner is unknown, rather than falsely claiming "not a fork".
+  // Unknown head ownership must not be presented as proven same-repository.
   const isCrossRepository =
     headOwnerLogin !== null && baseOwnerRepo !== null
       ? headOwnerLogin !== baseOwnerRepo.owner
@@ -86,6 +88,7 @@ export function mapPullRequestWorkItem(
           .filter(Boolean)
       : [],
     updatedAt: String(item.updated_at ?? item.updatedAt ?? ''),
+    ...createdAtFromUnknown(item),
     ...authorFieldsFromUnknown(item),
     branchName:
       typeof item.head === 'object' && item.head !== null && 'ref' in item.head
@@ -122,12 +125,17 @@ export function mapPullRequestWorkItem(
       ? { checksSummary: deriveWorkItemCheckSummary(item.statusCheckRollup) }
       : {}),
     ...(mergeable ? { mergeable } : {}),
-    ...('autoMergeRequest' in item
-      ? { autoMergeEnabled: isAutoMergeEnabled(item.autoMergeRequest) }
+    ...('autoMergeRequest' in item || 'auto_merge' in item
+      ? { autoMergeEnabled: isAutoMergeEnabled(item.autoMergeRequest ?? item.auto_merge) }
       : {}),
-    ...('mergeStateStatus' in item
+    ...('mergeStateStatus' in item || 'mergeable_state' in item
       ? {
-          mergeStateStatus: typeof item.mergeStateStatus === 'string' ? item.mergeStateStatus : null
+          mergeStateStatus:
+            typeof item.mergeStateStatus === 'string'
+              ? item.mergeStateStatus
+              : typeof item.mergeable_state === 'string'
+                ? item.mergeable_state.toUpperCase()
+                : null
         }
       : {}),
     ...(typeof item.maintainerCanModify === 'boolean'

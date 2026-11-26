@@ -1,7 +1,13 @@
 {
   "$schema": "./node_modules/oxlint/configuration_schema.json",
   "extends": ["../.oxlintrc.json"],
-  "ignorePatterns": ["src/terminal/terminal-webview-engine.generated.ts"],
+  "ignorePatterns": [
+    "src/components/markdown/mobile-markdown-mdast-nodes.d.ts",
+    "src/terminal/document/terminal-webview-engine.generated.ts",
+    "src/terminal/document/terminal-bundled-font-css.generated.ts",
+    "src/components/mermaid/mermaid-page-engine.generated.ts",
+    "src/components/markdown/math/katex-page-style.generated.ts"
+  ],
   "rules": {
     "react-hooks/exhaustive-deps": "off",
     "react/no-unescaped-entities": "off",
@@ -16,39 +22,16 @@
   },
   "overrides": [
     {
-      "files": ["src/terminal/TerminalWebView.tsx"],
+      "files": ["src/terminal/webview/TerminalWebView.tsx"],
       "rules": {
-        "max-lines": ["error", { "max": 379, "skipBlankLines": true, "skipComments": true }]
-      }
-    },
-    {
-      "files": ["app/h/*/source-control/*.tsx"],
-      "rules": {
-        "max-lines": ["error", { "max": 2152, "skipBlankLines": true, "skipComments": true }]
-      }
-    },
-    {
-      "files": ["app/index.tsx"],
-      "rules": {
-        "max-lines": ["error", { "max": 1422, "skipBlankLines": true, "skipComments": true }]
-      }
-    },
-    {
-      "files": ["src/transport/rpc-client.ts"],
-      "rules": {
-        "max-lines": ["error", { "max": 1074, "skipBlankLines": true, "skipComments": true }]
-      }
-    },
-    {
-      "files": ["scripts/mock-server.ts"],
-      "rules": {
-        "max-lines": ["error", { "max": 407, "skipBlankLines": true, "skipComments": true }]
-      }
-    },
-    {
-      "files": ["app/h/*/files/*.tsx"],
-      "rules": {
-        "max-lines": ["error", { "max": 402, "skipBlankLines": true, "skipComments": true }]
+        "max-lines": [
+          "error",
+          {
+            "max": 379,
+            "skipBlankLines": true,
+            "skipComments": true
+          }
+        ]
       }
     }
   ]
