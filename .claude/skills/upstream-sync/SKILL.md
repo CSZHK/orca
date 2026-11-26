@@ -9,7 +9,7 @@ description: >
 
 # upstream-sync — 上游同步 runbook
 
-源头：2026-11-26 同步 14,650 提交实操（进度笔记 `.claude/working/merge-upstream-2026-11-26.md`，事故与教训详见 auto-memory `merge-sync-lint-staged` / `fork-proxy-architecture` / `windows-packaging-gotchas`）。
+源头：2026-11-26 同步 14,650 提交实操。事故与教训详见用户目录记忆（非仓内）`merge-sync-lint-staged` / `fork-proxy-architecture` / `windows-packaging-gotchas`；进度笔记 `.claude/working/merge-upstream-2026-11-26.md` 可能已被治理 hook 清理，仅为可失链的原始出处。
 
 ## 0. 前置
 
