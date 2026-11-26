@@ -322,6 +322,9 @@ module.exports = {
     // would otherwise be swept into app.asar — a leftover dist-new/ once
     // inflated the asar to ~4.5GB and exceeded NSIS's 32-bit mmap limit.
     '!dist-new{,/**/*}',
+    // Same sweep risk as dist-new/: dist-merged/ holds previous redirected-output
+    // win-unpacked trees; without this exclude they inflate app.asar GB-scale.
+    '!dist-merged{,/**/*}',
     // Why: dist/ is the default electron-builder output dir and may hold a
     // previous win-unpacked (incl. a locked app.asar) when the output is
     // redirected to dist-merged/. Without this exclude that stale tree gets
@@ -331,6 +334,7 @@ module.exports = {
     '!tmp-cli-deploy{,/**/*}',
     '!.locked-watcher-bak{,/**/*}',
     '!orca-cli-deploy.tar.gz',
+    '!test-e2e.txt',
     '!.claude{,/**/*}',
     '!{dist-new-build,dist-new,build-win,build-dist-new}.log',
     '!{AGENTS.md,CLAUDE.md,DEVELOPING.md,bundle-size-progress.md,ORCHESTRATION_IMPLEMENTATION_CHECKLIST.md,ORCHESTRATION_STRUCTURED_OUTPUT_DESIGN.md}',
