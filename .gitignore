@@ -130,7 +130,9 @@ playwright-report/
 **/.claude/settings.local.json
 
 # Agent skills are installed per machine.
-/.claude/skills/
+/.claude/skills/*
+# Fork-authored runbook skills are source, not machine-local installs.
+!/.claude/skills/upstream-sync/
 /.agents/skills/
 /skills-lock.json
 
