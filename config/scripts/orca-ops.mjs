@@ -14,13 +14,16 @@ import {
 } from 'node:fs'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { createDraftRelease } from './create-draft-release.mjs'
-import { fetchReleases, latestStableDesktopReleaseTag } from './latest-stable-release.mjs'
+import { createDraftRelease } from './release/publication/create-draft-release.mjs'
+import {
+  fetchReleases,
+  latestStableDesktopReleaseTag
+} from './release/versioning/latest-stable-release.mjs'
 import {
   publishCompleteDraftReleases,
   writeGithubOutputs
-} from './publish-complete-draft-releases.mjs'
-import { verifyRequiredReleaseAssets } from './verify-release-required-assets.mjs'
+} from './release/publication/publish-complete-draft-releases.mjs'
+import { verifyRequiredReleaseAssets } from './release/publication/verify-release-required-assets.mjs'
 
 const DEFAULT_REPO = 'stablyai/orca'
 const DEFAULT_CLI_DEPLOY_DIR = 'tmp-cli-deploy'

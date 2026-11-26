@@ -17,7 +17,7 @@ import type { CodexAccountSelectionTarget } from '../../shared/agent-accounts/co
 import { CodexAccountIdentity } from './credentials/codex-account-identity'
 import type { CodexAuthIdentity as ResolvedCodexIdentity } from './credentials/codex-auth-identity'
 import { CodexConfigMirror } from './managed-homes/codex-config-mirror'
-import { runCodexLoginSession, type CodexLoginChild } from './login/codex-login-session'
+import { runProxiedLoginSession, type CodexLoginChild } from './login/codex-login-session-proxy'
 import { CodexManagedHomePath } from './managed-homes/codex-managed-home-path'
 import { CodexManagedHomeLifecycle } from './managed-homes/codex-managed-home-lifecycle'
 import { CodexResetCreditCoordinator } from './reset-credits/codex-reset-credit-coordinator'
@@ -314,7 +314,7 @@ export class CodexAccountService {
     }
     deviceChannel?.signal.addEventListener('abort', cancelForChannel, { once: true })
     try {
-      await runCodexLoginSession(managedHomePath, {
+      await runProxiedLoginSession(managedHomePath, {
         wslCommand: windowsSystem32Binary('wsl.exe'),
         spawn: ({ command, args, env, stdio }) => {
           assertWslDistroAllowed(command, args)

@@ -25,9 +25,10 @@ import { configuredProxyEnv } from '../../../network/configured-proxy-env'
 
 // WSL-routed commands can't receive the proxy via the spawn env (Windows-side env
 // does not cross into the distro without WSLENV), so ride the command string the
-// same way the locale does. Values are proxy URLs / host lists — shell-safe unquoted.
-function wslProxyEnvAssignments(): string[] {
-  return Object.entries(configuredProxyEnv()).map(([key, value]) => `${key}=${value}`)
+// same way the locale does. Bypass rules / proxy URLs are user config — shell-quote
+// the command-string form; the direct-argv form passes entries unquoted.
+function wslProxyEnvEntries(): [string, string][] {
+  return Object.entries(configuredProxyEnv())
 }
 
 /** Git settings direct WSL reads pass on the command line, so they need no login shell to reach the distro. */
@@ -157,8 +158,10 @@ export function resolveCommand(
       ? `GIT_EDITOR=${quotePosixShell(options.env.GIT_EDITOR)} `
       : ''
   // Ride the configured proxy on the command so WSL git/gh/glab honors it (empty when unset).
-  const proxyAssignments = wslProxyEnvAssignments()
-  const proxyPrefix = proxyAssignments.length ? `${proxyAssignments.join(' ')} ` : ''
+  const proxyEntries = wslProxyEnvEntries()
+  const proxyPrefix = proxyEntries.length
+    ? `${proxyEntries.map(([key, value]) => `${key}=${quotePosixShell(value)}`).join(' ')} `
+    : ''
   const escapedCommand = options.wslShellCommand ?? quotePosixShell(command)
   const invocation = `${proxyPrefix}${localePrefix}${editorPrefix}${escapedCommand} ${escapedArgs.join(' ')}`
   const enterCwd = cwdWord
@@ -174,7 +177,7 @@ export function resolveCommand(
       `PATH=${options.wslGitReadEnvironment.path}`,
       `HOME=${options.wslGitReadEnvironment.home}`,
       ...GIT_OUTPUT_LOCALE_ENV_ARGS,
-      ...proxyAssignments,
+      ...proxyEntries.map(([key, value]) => `${key}=${value}`),
       ...(options.env?.GIT_EDITOR !== undefined ? [`GIT_EDITOR=${options.env.GIT_EDITOR}`] : []),
       ...WSL_DIRECT_GIT_FORWARDED_ENV.flatMap((key) =>
         options.env?.[key] !== undefined ? [`${key}=${options.env[key]}`] : []
